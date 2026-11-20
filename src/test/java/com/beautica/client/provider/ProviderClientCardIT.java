@@ -64,11 +64,7 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
 
     private void clientReview(UUID bookingId, UUID clientId, UUID authorMasterId, UUID salonId, int rating,
                               String moderation) {
-        jdbcTemplate.update(
-                "INSERT INTO client_reviews (id, booking_id, subject_client_id, author_master_id, salon_id, rating, "
-                        + "comment, moderation_status, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, 'Запізнився', ?, NOW(), NOW())",
-                UUID.randomUUID(), bookingId, clientId, authorMasterId, salonId, rating, moderation);
+        fx.clientReview(bookingId, clientId, authorMasterId, salonId, rating, "Запізнився", moderation);
     }
 
     // ── HTTP ─────────────────────────────────────────────────────────────────
@@ -399,7 +395,7 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("14: rating = average of other providers' VISIBLE reviews; no count / comment key anywhere")
+    @DisplayName("14: rating = average + count of other providers' VISIBLE reviews; no reviewCount / comment key")
     void should_exposeRatingNumberOnly_when_otherProvidersReviewedTheClient() throws Exception {
         Salon s = fx.salon();
         Salon other = fx.salon();
@@ -418,7 +414,8 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
         JsonNode data = ok(resp);
         assertThat(data.path("ratingAvg").decimalValue()).isEqualByComparingTo("4.00");
         assertThat(data.path("stats").path("totalVisits").asInt()).as("own scope only").isEqualTo(1);
-        assertThat(resp.getBody()).doesNotContain("ratingCount").doesNotContain("reviewCount")
+        assertThat(data.path("ratingCount").asInt()).as("B526: cross-provider VISIBLE count").isEqualTo(2);
+        assertThat(resp.getBody()).doesNotContain("reviewCount")
                 .doesNotContain("comment").doesNotContain("Запізнився");
     }
 

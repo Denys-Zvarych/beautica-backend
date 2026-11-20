@@ -1,7 +1,6 @@
 package com.beautica.user;
 
 import com.beautica.auth.Role;
-import com.beautica.common.RatingBucket;
 import com.beautica.common.cache.MasterProfileCacheEvictor;
 import com.beautica.common.cache.SalonBookingInfoCacheEvictor;
 import com.beautica.common.cache.UserProfileCacheEvictor;
@@ -19,8 +18,8 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.search.service.SearchCacheNames;
 import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.service.LocationQueryService;
-import com.beautica.review.repository.ClientReviewRepository;
-import com.beautica.review.repository.RatingCountProjection;
+import com.beautica.review.service.ClientRatingSummary;
+import com.beautica.review.service.ClientRatingSummaryService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
@@ -34,15 +33,11 @@ import com.beautica.user.phone.PhoneChangeGuard;
 import com.beautica.user.phone.PhoneRequirementPolicy;
 
 import java.time.LocalDate;
-import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 @Slf4j
 @Service
@@ -65,10 +60,10 @@ public class UserService {
     private final CityDistrictRepository cityDistrictRepository;
     private final LocationQueryService locationQueryService;
     private final CacheManager cacheManager;
-    private final ClientReviewRepository clientReviewRepository;
     private final MasterRepository masterRepository;
     private final SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
     private final PhoneRequirementPolicy phoneRequirementPolicy;
+    private final ClientRatingSummaryService clientRatingSummaryService;
 
     public UserService(UserRepository userRepository,
                        LocalityWriteValidator localityWriteValidator,
@@ -76,20 +71,20 @@ public class UserService {
                        CityDistrictRepository cityDistrictRepository,
                        LocationQueryService locationQueryService,
                        CacheManager cacheManager,
-                       ClientReviewRepository clientReviewRepository,
                        MasterRepository masterRepository,
                        SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor,
-                       PhoneRequirementPolicy phoneRequirementPolicy) {
+                       PhoneRequirementPolicy phoneRequirementPolicy,
+                       ClientRatingSummaryService clientRatingSummaryService) {
         this.userRepository = userRepository;
         this.localityWriteValidator = localityWriteValidator;
         this.settlementDisplayNameResolver = settlementDisplayNameResolver;
         this.cityDistrictRepository = cityDistrictRepository;
         this.locationQueryService = locationQueryService;
         this.cacheManager = cacheManager;
-        this.clientReviewRepository = clientReviewRepository;
         this.masterRepository = masterRepository;
         this.salonBookingInfoCacheEvictor = salonBookingInfoCacheEvictor;
         this.phoneRequirementPolicy = phoneRequirementPolicy;
+        this.clientRatingSummaryService = clientRatingSummaryService;
     }
 
     /**
@@ -103,23 +98,8 @@ public class UserService {
      */
     @Transactional(readOnly = true)
     public UserRatingResponse getMyRating(UUID userId) {
-        UserRatingProjection projection = userRepository.findRatingById(userId)
-                .orElseThrow(() -> new NotFoundException("User not found"));
-
-        List<RatingCountProjection> rows = clientReviewRepository.countBySubjectClientIdGroupByRating(userId);
-        Map<Integer, Long> countsByRating = rows.stream()
-                .collect(Collectors.toMap(RatingCountProjection::getRating, RatingCountProjection::getCount));
-
-        // Zero-fill every bucket from 5 down to 1 — a rating with zero reviews must still
-        // appear in the response, never be silently omitted (mirrors ReviewService's
-        // getMasterReviewSummary/getSalonReviewSummary zero-fill exactly).
-        List<RatingBucket> distribution = IntStream.rangeClosed(1, 5)
-                .boxed()
-                .sorted(Comparator.reverseOrder())
-                .map(rating -> new RatingBucket(rating, countsByRating.getOrDefault(rating, 0L)))
-                .toList();
-
-        return UserRatingResponse.from(projection, distribution);
+        ClientRatingSummary summary = clientRatingSummaryService.summaryFor(userId);
+        return new UserRatingResponse(summary.avg(), summary.count(), summary.distribution());
     }
 
     /**

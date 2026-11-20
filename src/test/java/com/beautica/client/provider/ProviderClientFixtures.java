@@ -235,6 +235,32 @@ final class ProviderClientFixtures {
         return id;
     }
 
+    /**
+     * Inserts one provider-to-client review row only. {@code users.avg_rating} / {@code review_count} are NOT touched:
+     * callers that read them run the production {@code ClientReviewRepository#recalculateClientRating} afterwards.
+     */
+    void clientReview(UUID bookingId, UUID clientId, UUID authorMasterId, UUID salonId, int rating, String comment,
+                      String moderation) {
+        jdbcTemplate.update(
+                "INSERT INTO client_reviews (id, booking_id, subject_client_id, author_master_id, salon_id, rating, "
+                        + "comment, moderation_status, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), bookingId, clientId, authorMasterId, salonId, rating, comment, moderation);
+    }
+
+    /** The service name a booking was made for (booking -> master_service -> service_definition). */
+    String serviceNameOf(UUID bookingId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT sd.name FROM bookings b JOIN master_services ms ON ms.id = b.master_service_id "
+                        + "JOIN service_definitions sd ON sd.id = ms.service_def_id WHERE b.id = ?",
+                String.class, bookingId);
+    }
+
+    /** The user id behind a login email. */
+    UUID userIdOf(String email) {
+        return jdbcTemplate.queryForObject("SELECT id FROM users WHERE email = ?", UUID.class, email);
+    }
+
     void blockGuestInSalon(UUID salonId, String phone) {
         PhoneHasher.HashedPhone hashed = phoneHasher.hash(phone);
         jdbcTemplate.update("INSERT INTO client_blocks (id, blocker_salon_id, phone_hash, phone_last4, display_name) "

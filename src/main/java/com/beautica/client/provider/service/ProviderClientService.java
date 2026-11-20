@@ -4,6 +4,10 @@ import com.beautica.booking.enums.BookingStatus;
 import com.beautica.client.provider.dto.ClientCardResponse;
 import com.beautica.client.provider.dto.ClientKind;
 import com.beautica.client.provider.dto.ClientListItemResponse;
+import com.beautica.client.provider.dto.ClientOwnRatingResponse;
+import com.beautica.client.provider.repository.ClientOwnRatingProjection;
+import com.beautica.common.RatingBucket;
+import com.beautica.review.service.ClientRatingSummaryService;
 import com.beautica.client.provider.dto.ClientVisitResponse;
 import com.beautica.client.provider.repository.ClientCardRowProjection;
 import com.beautica.client.provider.repository.ClientListRowProjection;
@@ -56,6 +60,7 @@ public class ProviderClientService {
     private final ClientBlockService clientBlockService;
     private final PhoneHasher phoneHasher;
     private final ClientPhonePolicy phonePolicy;
+    private final ClientRatingSummaryService ratingSummaryService;
     private final Clock clock;
 
     /** The row as the service reads it; {@code guestPhone} never leaves this class. */
@@ -189,10 +194,15 @@ public class ProviderClientService {
                 boolean blocked = clientBlockService.blockedAmong(scope.blockScope(), List.of(userId), List.of())
                         .isUserBlocked(userId);
                 int ratingCount = row.getReviewCount() == null ? 0 : row.getReviewCount();
+                // B526: distribution = one grouped query, only when there is something to count (D2 shared compute)
+                List<RatingBucket> distribution = ratingCount > 0
+                        ? ratingSummaryService.distributionFor(userId)
+                        : ClientRatingSummaryService.zeroDistribution();
                 yield new ClientCardResponse(ClientKind.REGISTERED, userId, null,
                         joinName(row.getFirstName(), row.getLastName()), row.getAvatarUrl(),
                         phonePolicy.phoneFor(row.getVerifiedPhone()), blocked,
-                        ratingCount > 0 ? row.getAvgRating() : null, utc(row.getFirstVisitAt()),
+                        ratingCount > 0 ? row.getAvgRating() : null, ratingCount, distribution,
+                        utc(row.getFirstVisitAt()),
                         utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats);
             }
             case GuestAnchor ignored -> {
@@ -202,7 +212,8 @@ public class ProviderClientService {
                         .blockedAmong(scope.blockScope(), List.of(), List.of(hashed)).isPhoneBlocked(hashed);
                 yield new ClientCardResponse(ClientKind.GUEST, null, row.getAnchorBookingId(),
                         joinName(row.getGuestName(), row.getGuestSurname()), null,
-                        phonePolicy.phoneFor(guestPhone), blocked, null,
+                        phonePolicy.phoneFor(guestPhone), blocked, null, 0,
+                        ClientRatingSummaryService.zeroDistribution(),
                         utc(row.getFirstVisitAt()), utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats);
             }
         };
@@ -240,6 +251,65 @@ public class ProviderClientService {
                     items.stream().map(ProviderClientService::toItem).toList()));
         }
         return new PageImpl<>(visits, pageable, total);
+    }
+
+    /**
+     * B526 (CLI-59) — the viewer's own visible ratings of a registered client, newest visit first. A cheap EXISTS
+     * runs first (identical 404 for unknown / out-of-scope / anonymised, D6, same scope + anchor rules as the card);
+     * a guest is never rateable (REV-D04), so a resolved guest always gets an empty page with no further statement.
+     * Registered: exists, page, count — three statements whatever the page size.
+     */
+    @Transactional(readOnly = true)
+    public Page<ClientOwnRatingResponse> getOwnRatings(ClientScope scope, ClientRef ref, Pageable pageable) {
+        if (!clientInScope(scope, ref)) {
+            throw clientNotFound();
+        }
+        if (!(ref instanceof Registered(UUID userId))) {
+            return new PageImpl<>(List.of(), pageable, 0);
+        }
+        int limit = pageable.getPageSize();
+        long offset = pageable.getOffset();
+        List<ClientOwnRatingProjection> rows;
+        long total;
+        switch (scope) {
+            case SalonScope(UUID salonId, UUID masterId) when masterId == null -> {
+                rows = repository.ratingsBySalon(salonId, userId, limit, offset);
+                total = repository.countRatingsBySalon(salonId, userId);
+            }
+            case SalonScope(UUID salonId, UUID masterId) -> {
+                rows = repository.ratingsBySalonAndMaster(salonId, masterId, userId, limit, offset);
+                total = repository.countRatingsBySalonAndMaster(salonId, masterId, userId);
+            }
+            case MasterScope(UUID masterId, UUID ignoredSalonId) -> {
+                rows = repository.ratingsByMaster(masterId, userId, limit, offset);
+                total = repository.countRatingsByMaster(masterId, userId);
+            }
+        }
+        List<ClientOwnRatingResponse> items = rows.stream()
+                .map(p -> new ClientOwnRatingResponse(p.getBookingId(), utc(p.getVisitAt()), p.getServiceName(),
+                        p.getStars()))
+                .toList();
+        return new PageImpl<>(items, pageable, total);
+    }
+
+    private boolean clientInScope(ClientScope scope, ClientRef ref) {
+        return switch (ref) {
+            case Registered(UUID userId) -> switch (scope) {
+                case SalonScope(UUID salonId, UUID masterId) when masterId == null ->
+                        repository.existsUserBySalon(salonId, userId);
+                case SalonScope(UUID salonId, UUID masterId) ->
+                        repository.existsUserBySalonAndMaster(salonId, masterId, userId);
+                case MasterScope(UUID masterId, UUID ignoredSalonId) -> repository.existsUserByMaster(masterId, userId);
+            };
+            case GuestAnchor(UUID bookingId) -> switch (scope) {
+                case SalonScope(UUID salonId, UUID masterId) when masterId == null ->
+                        repository.existsGuestBySalon(salonId, bookingId);
+                case SalonScope(UUID salonId, UUID masterId) ->
+                        repository.existsGuestBySalonAndMaster(salonId, masterId, bookingId);
+                case MasterScope(UUID masterId, UUID ignoredSalonId) ->
+                        repository.existsGuestByMaster(masterId, bookingId);
+            };
+        };
     }
 
     private ClientCardRowProjection loadCard(ClientScope scope, ClientRef ref, OffsetDateTime now) {

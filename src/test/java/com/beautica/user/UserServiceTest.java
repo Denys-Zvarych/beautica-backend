@@ -87,8 +87,9 @@ class UserServiceTest {
         userService = new UserService(
                 userRepository, localityWriteValidator,
                 new com.beautica.location.SettlementDisplayNameResolver(cityRepository), cityDistrictRepository,
-                locationQueryService, cacheManager, clientReviewRepository, masterRepository,
-                salonBookingInfoCacheEvictor, phoneRequirementPolicy);
+                locationQueryService, cacheManager, masterRepository,
+                salonBookingInfoCacheEvictor, phoneRequirementPolicy,
+                new com.beautica.review.service.ClientRatingSummaryService(userRepository, clientReviewRepository));
     }
 
     @Test

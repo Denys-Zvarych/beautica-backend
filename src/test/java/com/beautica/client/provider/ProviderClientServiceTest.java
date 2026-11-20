@@ -65,6 +65,7 @@ class ProviderClientServiceTest {
     @Mock private ClientBlockService clientBlockService;
     @Mock private PhoneHasher phoneHasher;
     @Mock private AuthorizationService authz;
+    @Mock private com.beautica.review.service.ClientRatingSummaryService ratingSummaryService;
 
     private ProviderClientService service;
 
@@ -76,7 +77,7 @@ class ProviderClientServiceTest {
     @BeforeEach
     void setUp() {
         service = new ProviderClientService(repository, clientBlockService, phoneHasher,
-                new ClientPhonePolicy(authz), Clock.fixed(NOW, ZoneOffset.UTC));
+                new ClientPhonePolicy(authz), ratingSummaryService, Clock.fixed(NOW, ZoneOffset.UTC));
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────
@@ -381,6 +382,171 @@ class ProviderClientServiceTest {
                 new SalonScope(salonId, null), new ClientRef.GuestAnchor(bookingId), PageRequest.of(0, 20)))
                 .isInstanceOf(NotFoundException.class);
         verify(repository, never()).visitItemsBySalon(any(), anyCollection());
+    }
+
+    // ── B526: getOwnRatings dispatch (CLI-59) ────────────────────────────────
+
+    private com.beautica.client.provider.repository.ClientOwnRatingProjection ratingRow(UUID booking, int stars) {
+        com.beautica.client.provider.repository.ClientOwnRatingProjection p =
+                mock(com.beautica.client.provider.repository.ClientOwnRatingProjection.class);
+        when(p.getBookingId()).thenReturn(booking);
+        when(p.getVisitAt()).thenReturn(NOW.minusSeconds(500));
+        when(p.getServiceName()).thenReturn("Манікюр");
+        when(p.getStars()).thenReturn(stars);
+        return p;
+    }
+
+    private void assertSingleRow(Page<com.beautica.client.provider.dto.ClientOwnRatingResponse> page, UUID booking,
+                                 int stars) {
+        assertThat(page.getTotalElements()).isEqualTo(1);
+        assertThat(page.getContent()).extracting(
+                        com.beautica.client.provider.dto.ClientOwnRatingResponse::bookingId,
+                        com.beautica.client.provider.dto.ClientOwnRatingResponse::visitAt,
+                        com.beautica.client.provider.dto.ClientOwnRatingResponse::serviceName,
+                        com.beautica.client.provider.dto.ClientOwnRatingResponse::stars)
+                .containsExactly(org.assertj.core.groups.Tuple.tuple(booking,
+                        NOW.minusSeconds(500).atOffset(ZoneOffset.UTC), "Манікюр", stars));
+    }
+
+    @Test
+    @DisplayName("should_useSalonQueries_when_registeredClientInSalonScope")
+    void should_useSalonQueries_when_registeredClientInSalonScope() {
+        var row = ratingRow(bookingId, 5);
+        when(repository.existsUserBySalon(salonId, userId)).thenReturn(true);
+        when(repository.ratingsBySalon(salonId, userId, 20, 0L)).thenReturn(List.of(row));
+        when(repository.countRatingsBySalon(salonId, userId)).thenReturn(1L);
+
+        Page<com.beautica.client.provider.dto.ClientOwnRatingResponse> page = service.getOwnRatings(
+                new SalonScope(salonId, null), new ClientRef.Registered(userId), PageRequest.of(0, 20));
+
+        assertSingleRow(page, bookingId, 5);
+        verify(repository, never()).existsUserBySalonAndMaster(any(), any(), any());
+        verify(repository, never()).existsUserByMaster(any(), any());
+        verify(repository, never()).existsGuestBySalon(any(), any());
+    }
+
+    @Test
+    @DisplayName("should_useSalonAndMasterQueries_when_registeredClientInSalonMasterScope")
+    void should_useSalonAndMasterQueries_when_registeredClientInSalonMasterScope() {
+        var row = ratingRow(bookingId, 3);
+        when(repository.existsUserBySalonAndMaster(salonId, masterId, userId)).thenReturn(true);
+        when(repository.ratingsBySalonAndMaster(salonId, masterId, userId, 10, 0L)).thenReturn(List.of(row));
+        when(repository.countRatingsBySalonAndMaster(salonId, masterId, userId)).thenReturn(1L);
+
+        Page<com.beautica.client.provider.dto.ClientOwnRatingResponse> page = service.getOwnRatings(
+                new SalonScope(salonId, masterId), new ClientRef.Registered(userId), PageRequest.of(0, 10));
+
+        assertSingleRow(page, bookingId, 3);
+        verify(repository, never()).existsUserBySalon(any(), any());
+        verify(repository, never()).ratingsBySalon(any(), any(), anyInt(), anyLong());
+    }
+
+    @Test
+    @DisplayName("should_useMasterQueries_when_registeredClientInMasterScope")
+    void should_useMasterQueries_when_registeredClientInMasterScope() {
+        var row = ratingRow(bookingId, 4);
+        when(repository.existsUserByMaster(masterId, userId)).thenReturn(true);
+        when(repository.ratingsByMaster(masterId, userId, 20, 0L)).thenReturn(List.of(row));
+        when(repository.countRatingsByMaster(masterId, userId)).thenReturn(1L);
+
+        Page<com.beautica.client.provider.dto.ClientOwnRatingResponse> page = service.getOwnRatings(
+                new MasterScope(masterId, salonId), new ClientRef.Registered(userId), PageRequest.of(0, 20));
+
+        assertSingleRow(page, bookingId, 4);
+        verify(repository, never()).existsUserBySalon(any(), any());
+        verify(repository, never()).ratingsBySalon(any(), any(), anyInt(), anyLong());
+    }
+
+    @Test
+    @DisplayName("should_returnEmptyPageWithoutPageQuery_when_guestAnchorInSalonScope")
+    void should_returnEmptyPageWithoutPageQuery_when_guestAnchorInSalonScope() {
+        when(repository.existsGuestBySalon(salonId, bookingId)).thenReturn(true);
+
+        Page<com.beautica.client.provider.dto.ClientOwnRatingResponse> page = service.getOwnRatings(
+                new SalonScope(salonId, null), new ClientRef.GuestAnchor(bookingId), PageRequest.of(0, 20));
+
+        assertThat(page.getContent()).isEmpty();
+        assertThat(page.getTotalElements()).isZero();
+        verify(repository, never()).existsUserBySalon(any(), any());
+        verifyNoMoreInteractions(repository);
+    }
+
+    @Test
+    @DisplayName("should_returnEmptyPageWithoutPageQuery_when_guestAnchorInSalonMasterScope")
+    void should_returnEmptyPageWithoutPageQuery_when_guestAnchorInSalonMasterScope() {
+        when(repository.existsGuestBySalonAndMaster(salonId, masterId, bookingId)).thenReturn(true);
+
+        Page<com.beautica.client.provider.dto.ClientOwnRatingResponse> page = service.getOwnRatings(
+                new SalonScope(salonId, masterId), new ClientRef.GuestAnchor(bookingId), PageRequest.of(0, 20));
+
+        assertThat(page.getContent()).isEmpty();
+        assertThat(page.getTotalElements()).isZero();
+        verify(repository, never()).existsGuestBySalon(any(), any());
+        verifyNoMoreInteractions(repository);
+    }
+
+    @Test
+    @DisplayName("should_returnEmptyPageWithoutPageQuery_when_guestAnchorInMasterScope")
+    void should_returnEmptyPageWithoutPageQuery_when_guestAnchorInMasterScope() {
+        when(repository.existsGuestByMaster(masterId, bookingId)).thenReturn(true);
+
+        Page<com.beautica.client.provider.dto.ClientOwnRatingResponse> page = service.getOwnRatings(
+                new MasterScope(masterId, salonId), new ClientRef.GuestAnchor(bookingId), PageRequest.of(0, 20));
+
+        assertThat(page.getContent()).isEmpty();
+        assertThat(page.getTotalElements()).isZero();
+        verify(repository, never()).existsGuestBySalon(any(), any());
+        verifyNoMoreInteractions(repository);
+    }
+
+    @Test
+    @DisplayName("should_throwClientNotFound_when_registeredClientNotInSalonScope")
+    void should_throwClientNotFound_when_registeredClientNotInSalonScope() {
+        when(repository.existsUserBySalon(salonId, userId)).thenReturn(false);
+
+        assertThatThrownBy(() -> service.getOwnRatings(
+                new SalonScope(salonId, null), new ClientRef.Registered(userId), PageRequest.of(0, 20)))
+                .isInstanceOf(NotFoundException.class);
+        verify(repository, never()).ratingsBySalon(any(), any(), anyInt(), anyLong());
+        verify(repository, never()).countRatingsBySalon(any(), any());
+    }
+
+    @Test
+    @DisplayName("should_throwClientNotFound_when_registeredClientNotInSalonMasterScope")
+    void should_throwClientNotFound_when_registeredClientNotInSalonMasterScope() {
+        when(repository.existsUserBySalonAndMaster(salonId, masterId, userId)).thenReturn(false);
+
+        assertThatThrownBy(() -> service.getOwnRatings(
+                new SalonScope(salonId, masterId), new ClientRef.Registered(userId), PageRequest.of(0, 20)))
+                .isInstanceOf(NotFoundException.class);
+        verify(repository, never()).ratingsBySalonAndMaster(any(), any(), any(), anyInt(), anyLong());
+    }
+
+    @Test
+    @DisplayName("should_throwClientNotFound_when_registeredClientNotInMasterScope")
+    void should_throwClientNotFound_when_registeredClientNotInMasterScope() {
+        when(repository.existsUserByMaster(masterId, userId)).thenReturn(false);
+
+        assertThatThrownBy(() -> service.getOwnRatings(
+                new MasterScope(masterId, salonId), new ClientRef.Registered(userId), PageRequest.of(0, 20)))
+                .isInstanceOf(NotFoundException.class);
+        verify(repository, never()).ratingsByMaster(any(), any(), anyInt(), anyLong());
+    }
+
+    @Test
+    @DisplayName("should_throwClientNotFound_when_guestAnchorNotInScope")
+    void should_throwClientNotFound_when_guestAnchorNotInScope() {
+        when(repository.existsGuestBySalon(salonId, bookingId)).thenReturn(false);
+        when(repository.existsGuestBySalonAndMaster(salonId, masterId, bookingId)).thenReturn(false);
+        when(repository.existsGuestByMaster(masterId, bookingId)).thenReturn(false);
+
+        assertThatThrownBy(() -> service.getOwnRatings(new SalonScope(salonId, null),
+                new ClientRef.GuestAnchor(bookingId), PageRequest.of(0, 20))).isInstanceOf(NotFoundException.class);
+        assertThatThrownBy(() -> service.getOwnRatings(new SalonScope(salonId, masterId),
+                new ClientRef.GuestAnchor(bookingId), PageRequest.of(0, 20))).isInstanceOf(NotFoundException.class);
+        assertThatThrownBy(() -> service.getOwnRatings(new MasterScope(masterId, salonId),
+                new ClientRef.GuestAnchor(bookingId), PageRequest.of(0, 20))).isInstanceOf(NotFoundException.class);
+        verifyNoMoreInteractions(repository);
     }
 
     // ── phone policy seam ────────────────────────────────────────────────────

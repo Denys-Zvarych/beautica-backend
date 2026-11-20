@@ -118,4 +118,53 @@ public interface ProviderClientRepository extends Repository<Booking, UUID> {
     @Query(value = ClientCardSql.ITEMS_MASTER, nativeQuery = true)
     List<ClientVisitItemProjection> visitItemsByMaster(
             @Param("masterId") UUID masterId, @Param("visitKeys") Collection<UUID> visitKeys);
+
+    // ── B526: the viewer's own visible ratings of a registered client (page + count) ──
+
+    @Query(value = ClientRatingSql.PAGE_SALON, nativeQuery = true)
+    List<ClientOwnRatingProjection> ratingsBySalon(
+            @Param("salonId") UUID salonId, @Param("userId") UUID userId, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientRatingSql.PAGE_SALON_MASTER, nativeQuery = true)
+    List<ClientOwnRatingProjection> ratingsBySalonAndMaster(
+            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("userId") UUID userId,
+            @Param("limit") int limit, @Param("offset") long offset);
+
+    @Query(value = ClientRatingSql.PAGE_MASTER, nativeQuery = true)
+    List<ClientOwnRatingProjection> ratingsByMaster(
+            @Param("masterId") UUID masterId, @Param("userId") UUID userId, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientRatingSql.COUNT_SALON, nativeQuery = true)
+    long countRatingsBySalon(@Param("salonId") UUID salonId, @Param("userId") UUID userId);
+
+    @Query(value = ClientRatingSql.COUNT_SALON_MASTER, nativeQuery = true)
+    long countRatingsBySalonAndMaster(
+            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("userId") UUID userId);
+
+    @Query(value = ClientRatingSql.COUNT_MASTER, nativeQuery = true)
+    long countRatingsByMaster(@Param("masterId") UUID masterId, @Param("userId") UUID userId);
+
+    // B526 existence checks (the uniform 404 gate) — registered by client_id, guest by a valid anchor booking
+
+    @Query(value = ClientRatingSql.EXISTS_USER_SALON, nativeQuery = true)
+    boolean existsUserBySalon(@Param("salonId") UUID salonId, @Param("userId") UUID userId);
+
+    @Query(value = ClientRatingSql.EXISTS_USER_SALON_MASTER, nativeQuery = true)
+    boolean existsUserBySalonAndMaster(
+            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("userId") UUID userId);
+
+    @Query(value = ClientRatingSql.EXISTS_USER_MASTER, nativeQuery = true)
+    boolean existsUserByMaster(@Param("masterId") UUID masterId, @Param("userId") UUID userId);
+
+    @Query(value = ClientRatingSql.EXISTS_GUEST_SALON, nativeQuery = true)
+    boolean existsGuestBySalon(@Param("salonId") UUID salonId, @Param("bookingId") UUID bookingId);
+
+    @Query(value = ClientRatingSql.EXISTS_GUEST_SALON_MASTER, nativeQuery = true)
+    boolean existsGuestBySalonAndMaster(
+            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("bookingId") UUID bookingId);
+
+    @Query(value = ClientRatingSql.EXISTS_GUEST_MASTER, nativeQuery = true)
+    boolean existsGuestByMaster(@Param("masterId") UUID masterId, @Param("bookingId") UUID bookingId);
 }

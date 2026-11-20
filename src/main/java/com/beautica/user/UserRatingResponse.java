@@ -29,9 +29,4 @@ import java.util.List;
  *                           fixed 5-to-1 bucket layout, so it cannot be mapped back to any specific
  *                           booking or provider — never a review list or comment text.
  */
-public record UserRatingResponse(BigDecimal avgRating, int reviewCount, List<RatingBucket> ratingDistribution) {
-
-    public static UserRatingResponse from(UserRatingProjection projection, List<RatingBucket> ratingDistribution) {
-        return new UserRatingResponse(projection.getAvgRating(), projection.getReviewCount(), ratingDistribution);
-    }
-}
+public record UserRatingResponse(BigDecimal avgRating, int reviewCount, List<RatingBucket> ratingDistribution) {}

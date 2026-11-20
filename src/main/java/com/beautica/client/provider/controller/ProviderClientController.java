@@ -2,6 +2,7 @@ package com.beautica.client.provider.controller;
 
 import com.beautica.client.provider.dto.ClientCardResponse;
 import com.beautica.client.provider.dto.ClientListItemResponse;
+import com.beautica.client.provider.dto.ClientOwnRatingResponse;
 import com.beautica.client.provider.dto.ClientVisitResponse;
 import com.beautica.client.provider.service.ClientRef;
 import com.beautica.client.provider.service.ClientScope;
@@ -135,6 +136,47 @@ public class ProviderClientController {
             @PathVariable UUID bookingId, @PageableDefault(size = 20) Pageable pageable,
             Authentication authentication) {
         return visits(myScope(authentication), new ClientRef.GuestAnchor(bookingId), pageable);
+    }
+
+    // ── B526: the viewer's own ratings of a client (CLI-59) — same @PreAuthorize per family as the card ──
+
+    @GetMapping("/salons/{salonId}/clients/users/{userId}/ratings")
+    @PreAuthorize(SALON_ACCESS)
+    public ApiResponse<PageResponse<ClientOwnRatingResponse>> getSalonUserRatings(
+            @PathVariable UUID salonId, @PathVariable UUID userId, @RequestParam(required = false) UUID masterId,
+            @PageableDefault(size = 20) Pageable pageable) {
+        return ratings(scopeResolver.forSalon(salonId, masterId), new ClientRef.Registered(userId), pageable);
+    }
+
+    @GetMapping("/salons/{salonId}/clients/guests/{bookingId}/ratings")
+    @PreAuthorize(SALON_ACCESS)
+    public ApiResponse<PageResponse<ClientOwnRatingResponse>> getSalonGuestRatings(
+            @PathVariable UUID salonId, @PathVariable UUID bookingId, @RequestParam(required = false) UUID masterId,
+            @PageableDefault(size = 20) Pageable pageable) {
+        return ratings(scopeResolver.forSalon(salonId, masterId), new ClientRef.GuestAnchor(bookingId), pageable);
+    }
+
+    @GetMapping("/masters/me/clients/users/{userId}/ratings")
+    @PreAuthorize(MASTER_ACCESS)
+    public ApiResponse<PageResponse<ClientOwnRatingResponse>> getMyUserRatings(
+            @PathVariable UUID userId, @PageableDefault(size = 20) Pageable pageable, Authentication authentication) {
+        return ratings(myScope(authentication), new ClientRef.Registered(userId), pageable);
+    }
+
+    @GetMapping("/masters/me/clients/guests/{bookingId}/ratings")
+    @PreAuthorize(MASTER_ACCESS)
+    public ApiResponse<PageResponse<ClientOwnRatingResponse>> getMyGuestRatings(
+            @PathVariable UUID bookingId, @PageableDefault(size = 20) Pageable pageable,
+            Authentication authentication) {
+        return ratings(myScope(authentication), new ClientRef.GuestAnchor(bookingId), pageable);
+    }
+
+    private ApiResponse<PageResponse<ClientOwnRatingResponse>> ratings(
+            ClientScope scope, ClientRef ref, Pageable pageable) {
+        Page<ClientOwnRatingResponse> result = providerClientService.getOwnRatings(scope, ref, bound(pageable));
+        return ApiResponse.ok(PageResponse.of(
+                result.getContent(), result.getNumber(), result.getSize(), result.getTotalElements(),
+                result.getTotalPages()));
     }
 
     private ClientScope myScope(Authentication authentication) {
