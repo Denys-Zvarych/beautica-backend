@@ -84,10 +84,11 @@ import java.util.UUID;
                 @Index(name = "idx_bookings_reminder", columnList = "starts_at"),
                 // partial index (V225): 15-min 2h-reminder sweep; predicate LINK AND CONFIRMED AND reminder_2h_sent=FALSE in V225 only.
                 @Index(name = "idx_bookings_reminder_2h", columnList = "starts_at"),
-                // partial indexes (V240, phase 494): registered-client reminder sweeps; predicates
-                // APP AND CONFIRMED AND reminder_sent / reminder_2h_sent = FALSE in V240 only.
-                @Index(name = "idx_bookings_reminder_app", columnList = "starts_at"),
-                @Index(name = "idx_bookings_reminder_2h_app", columnList = "starts_at"),
+                // partial indexes (V262, phase 527; replace V240's _app + V260's _attached): registered-client
+                // reminder sweeps; predicates (APP OR client_link_reason IS NOT NULL) AND CONFIRMED AND
+                // reminder_sent / reminder_2h_sent = FALSE AND client_id IS NOT NULL in V262 only.
+                @Index(name = "idx_bookings_reminder_registered", columnList = "starts_at"),
+                @Index(name = "idx_bookings_reminder_2h_registered", columnList = "starts_at"),
                 // idx_bookings_master_client_starts_at (V93) served the per-client "latest
                 // booking" LATERAL subquery formerly in FavoriteRepository.findFavoriteMasterRows.
                 // DROPPED by V144 once the favourites category axis was reversed from "last
@@ -240,11 +241,9 @@ import java.util.UUID;
                 // partial index (V199, phase 373 audit-fix cycle 2): ended-visit header sweep. Predicate
                 // WHERE appointment_id IS NOT NULL AND guest_pii_anonymised_at IS NOT NULL lives in
                 // V199 only; documentation, not enforcement.
-                @Index(name = "idx_bookings_guest_pii_anonymised_visit", columnList = "guest_pii_anonymised_at"),
-                // partial index (V259, phase 508): provider client card guest resolution. Predicate
-                // WHERE client_id IS NULL AND guest_phone IS NOT NULL lives in V259 only;
-                // documentation, not enforcement.
-                @Index(name = "idx_bookings_guest_phone_starts_at", columnList = "guest_phone")
+                @Index(name = "idx_bookings_guest_pii_anonymised_visit", columnList = "guest_pii_anonymised_at")
+                // idx_bookings_guest_phone_starts_at (V259) was DROPPED by V263: same rows as
+                // idx_bookings_guest_phone_open above, which now also serves the provider client card guest scope.
         }
 )
 // Root-cause fix (G1, cycle-7 audit 2026-08-03) for the entity-staleness/terminal-state-

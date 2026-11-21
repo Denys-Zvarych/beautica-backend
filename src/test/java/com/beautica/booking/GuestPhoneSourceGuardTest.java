@@ -17,6 +17,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * the DTO file must not read a phone from any user/account type. This is a source scan (no ArchUnit on the
  * classpath): any {@code getPhone(} / {@code getPhoneNumber(} call in the file, or a {@code .getClient()} chained into
  * one, fails the build. It scans the CODE only (comments stripped), so the javadoc may still name the rule.
+ *
+ * <p>B518 (GST-D14 / CLI-D08) carve-out: exactly ONE method may read a registered client's phone -
+ * {@code withProviderVisibleRegisteredPhone}, and only behind an SMS-verified gate. That method body is cut out of the
+ * scan (so every other read still fails), and separate tests pin its verified-only data gate and its single,
+ * provider-audience-gated call site in {@code BookingService#getBooking}.
  */
 @DisplayName("GuestPhoneSourceGuard - BookingDetailResponse never reads a user's phone (phase 386 hard rule)")
 class GuestPhoneSourceGuardTest {
@@ -30,14 +35,43 @@ class GuestPhoneSourceGuardTest {
         return source.replaceAll("(?s)/\\*.*?\\*/", "").replaceAll("(?m)//.*$", "");
     }
 
+    private static final Path SERVICE = Path.of("src/main/java/com/beautica/booking/service/BookingService.java");
+    /** The single allow-listed registered-phone path (B518); its body is excluded from the phone-read scan. */
+    static final String REGISTERED_PHONE_SIGNATURE =
+            "public BookingDetailResponse withProviderVisibleRegisteredPhone(Booking booking) {";
+
     private static String dtoCode() throws IOException {
         return codeOnly(Files.readString(DTO));
+    }
+
+    /** Returns the body (between the outer braces) of the method whose declaration ends with {@code signature}. */
+    static String methodBody(String code, String signature) {
+        int start = code.indexOf(signature);
+        assertThat(start).as("allow-listed method %s must exist", signature).isNotNegative();
+        int open = start + signature.length() - 1;
+        int depth = 0;
+        for (int i = open; i < code.length(); i++) {
+            char c = code.charAt(i);
+            if (c == '{') {
+                depth++;
+            } else if (c == '}' && --depth == 0) {
+                return code.substring(open + 1, i);
+            }
+        }
+        throw new AssertionError("unbalanced braces after " + signature);
+    }
+
+    /** The source with the one allow-listed method removed - what the "no other phone read" scan sees. */
+    static String withoutAllowListedMethod(String code, String signature) {
+        String body = methodBody(code, signature);
+        int start = code.indexOf(signature);
+        return code.substring(0, start) + code.substring(start + signature.length() + body.length() + 1);
     }
 
     @Test
     @DisplayName("should_notReadAnyPhoneFromAUser_when_scanningBookingDetailResponse")
     void should_notReadAnyPhoneFromAUser_when_scanningBookingDetailResponse() throws IOException {
-        String code = dtoCode();
+        String code = withoutAllowListedMethod(dtoCode(), REGISTERED_PHONE_SIGNATURE);
 
         assertThat(USER_PHONE_READ.matcher(code).find())
                 .as("BookingDetailResponse must not call getPhone()/getPhoneNumber() on any user type")
@@ -66,6 +100,53 @@ class GuestPhoneSourceGuardTest {
         assertThat(USER_PHONE_READ.matcher(codeOnly(leaking)).find()).isTrue();
         assertThat(CLIENT_PHONE_CHAIN.matcher(codeOnly(leaking)).find()).isTrue();
         assertThat(USER_PHONE_READ.matcher(codeOnly(commentOnly)).find()).isFalse();
+    }
+
+    @Test
+    @DisplayName("the carve-out removes ONLY the allow-listed method - a phone read in any other method still fails")
+    void should_stillFlagPhoneReadOutsideAllowList_when_allowListedMethodIsCutOut() {
+        String source = REGISTERED_PHONE_SIGNATURE + " if (x) { return this; } return y(); }\n"
+                + "public BookingDetailResponse other(Booking b) { return z(b.getClient().getPhoneNumber()); }";
+
+        String scanned = withoutAllowListedMethod(source, REGISTERED_PHONE_SIGNATURE);
+
+        assertThat(scanned).doesNotContain("withProviderVisibleRegisteredPhone");
+        assertThat(USER_PHONE_READ.matcher(scanned).find()).isTrue();
+        assertThat(CLIENT_PHONE_CHAIN.matcher(scanned).find()).isTrue();
+    }
+
+    @Test
+    @DisplayName("should_readRegisteredPhoneOnlyBehindVerifiedGate_when_scanningTheAllowListedWither")
+    void should_readRegisteredPhoneOnlyBehindVerifiedGate_when_scanningTheAllowListedWither() throws IOException {
+        String code = dtoCode();
+
+        String body = methodBody(code, REGISTERED_PHONE_SIGNATURE).replaceAll("\\s+", " ");
+
+        assertThat(code.split("withProviderVisibleRegisteredPhone\\(", -1).length - 1)
+                .as("exactly one declaration of the allow-listed wither").isEqualTo(1);
+        int gateAt = body.indexOf("client.getPhoneVerifiedAt() == null");
+        assertThat(gateAt).as("the wither short-circuits on an unverified phone").isNotNegative();
+        assertThat(body.indexOf("return this;")).as("the verified gate returns before any phone is attached")
+                .isGreaterThan(gateAt);
+        assertThat(body).contains("User client = booking.getClient();");
+        assertThat(body.split("getPhoneNumber\\(", -1).length - 1)
+                .as("phone read only in the null check and the single assignment").isEqualTo(2);
+        assertThat(body.lastIndexOf("getPhoneNumber(")).isGreaterThan(body.indexOf("return this;"));
+    }
+
+    @Test
+    @DisplayName("should_callRegisteredPhoneWitherOnlyFromProviderAudienceGate_when_scanningBookingService")
+    void should_callRegisteredPhoneWitherOnlyFromProviderAudienceGate_when_scanningBookingService() throws IOException {
+        String code = codeOnly(Files.readString(SERVICE)).replaceAll("\\s+", " ");
+
+        assertThat(code.split("withProviderVisibleRegisteredPhone\\(", -1).length - 1)
+                .as("the registered-phone wither is called exactly once").isEqualTo(1);
+        int callAt = code.indexOf("withProviderVisibleRegisteredPhone(");
+        assertThat(callAt).isBetween(code.indexOf("public BookingDetailResponse getBooking("),
+                code.indexOf("private static ClientAuthoredReviewResponse toClientAuthoredReview"));
+        assertThat(code.substring(0, callAt)).endsWith("} else if (booking.getClient().getPhoneVerifiedAt() != null"
+                + " && authz.isGuestPhoneAudience() && !authz.isOwningClientViewer(actorUserId, booking)) {"
+                + " withPhone = detail.");
     }
 
     @Test

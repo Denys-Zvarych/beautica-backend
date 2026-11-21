@@ -10,9 +10,11 @@ import static com.beautica.client.provider.repository.ClientListSql.SALON_WHERE;
  * <ul>
  *   <li><b>user</b>: {@code client_id = :userId};</li>
  *   <li><b>guest</b>: the anchor booking ({@code :bookingId}) must itself be in scope, {@code client_id IS NULL},
- *       carry a phone and not be anonymised (GST-51) — its {@code guest_phone} (read once by the {@code anchor} CTE,
- *       served by {@code idx_bookings_guest_phone_starts_at}, V259) then selects "all scope bookings with that phone
- *       and {@code client_id IS NULL}". An invalid anchor yields an empty {@code scoped} set, which the service turns
+ *       carry a phone and not be anonymised (GST-51) — its {@code guest_phone} (read once by the {@code anchor} CTE)
+ *       then selects "all scope bookings with that phone and {@code client_id IS NULL}", served by
+ *       {@code idx_bookings_guest_phone_open} (V199; V263 dropped V259's identical copy). The
+ *       {@code client_detached_at IS NULL} term is a no-op by {@code chk_bookings_guest_fields} (a detached row has no
+ *       phone) and exists only so the predicate implies that partial index's. An invalid anchor yields an empty {@code scoped} set, which the service turns
  *       into the one uniform 404.</li>
  * </ul>
  * A visit is {@code COALESCE(appointment_id, id)} over the rows in scope (a SALON_MASTER's scope holds only their own
@@ -42,7 +44,7 @@ final class ClientCardSql {
     private static final String GUEST_CLOSE_ANCHOR = GUEST_ANCHOR_END + "scoped AS (" + SCOPED_COLS;
     private static final String GUEST_CLOSE = """
                AND b.client_id IS NULL AND b.guest_phone = (SELECT guest_phone FROM anchor)
-               AND b.guest_pii_anonymised_at IS NULL)
+               AND b.guest_pii_anonymised_at IS NULL AND b.client_detached_at IS NULL)
             """;
 
     // ── SALON scope narrowed by ?masterId= (owner/admin master mode): the identity rows are read salon-wide into

@@ -2240,7 +2240,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * guest_phone} cleared (the account's verified phone is the one number — D3). Name, surname, consent columns,
      * notes stay; the cancel token (hash + sealed) is NULLed so an old SMS link cannot cancel the account's booking. Every status; anonymised (GST-51) and detached (CLI-24) rows are excluded, so a
      * detached row — whose phone is already NULL — can never re-attach. Same predicate as V261. Served by
-     * {@code idx_bookings_guest_phone_starts_at} (V259).
+     * {@code idx_bookings_guest_phone_open} (V199; its predicate is this WHERE minus the phone and source).
      *
      * <p>Callers hold {@link #acquireWalkInPhoneLock} first (the per-phone lock every walk-in / link create takes), so
      * a create racing the verification ends attached in every interleaving. {@code flushAutomatically} so pending
@@ -2271,7 +2271,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * B527 audit cycle 3 — the retry sweep's work list: up to {@code limit} phones that are the verified phone of an active
      * CLIENT account AND still carry attachable guest / walk-in rows (same predicates as {@link #attachGuestRowsByPhone}
      * and V261). Drives from the verified CLIENT accounts ({@code ux_users_verified_phone}, V244) with an {@code EXISTS}
-     * probe into {@code idx_bookings_guest_phone_starts_at} (V259, partial on {@code client_id IS NULL}), so the normal
+     * probe into {@code idx_bookings_guest_phone_open} (V199, partial on the same open-guest predicate), so the normal
      * no-match case costs one index probe per verified client rather than a scan of every unattached guest row.
      * {@code ORDER BY random()} (applied to the already-filtered phones only) rotates the selection so phones that keep
      * failing cannot fill every run and starve the rest; the 30-minute cadence makes random fair. Phones only — the
@@ -2546,11 +2546,11 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     }
 
     /**
-     * Phase 494 (NTF-47) — registered clients' APP bookings (and, B527, guest / walk-in bookings attached to a client account — the {@code
-     * idx_bookings_reminder_attached} partial index, V260) due for the 24 h reminder: {@code CONFIRMED}, not yet
-     * reminded, with a client account, starting in {@code [from, to]} (the guest finder's inclusive window). The
-     * predicate is an OR of {@code idx_bookings_reminder_app} (V240) and {@code idx_bookings_reminder_attached}
-     * (V260), so the planner serves it with a BitmapOr of the two partial indexes. Bounded twice (Anti-Bug §E-3): the 2-hour window the
+     * Phase 494 (NTF-47) — registered clients' APP bookings (and, B527, guest / walk-in bookings attached to a client
+     * account) due for the 24 h reminder: {@code CONFIRMED}, not yet reminded, with a client account, starting in
+     * {@code [from, to]} (the guest finder's inclusive window). Served by an Index Scan on the partial index
+     * {@code idx_bookings_reminder_registered} (V262), whose predicate is this WHERE minus the window — the window is
+     * the Index Cond and no Filter remains (a BitmapOr of per-arm indexes was never chosen). Bounded twice (Anti-Bug §E-3): the 2-hour window the
      * job supplies and {@code limit} ({@link #REGISTERED_DAY_BEFORE_REMINDER_BATCH_CAP}); the overflow stays
      * unclaimed and is picked up by the next hourly tick. One row per booking — never grouped per visit (NTF-D11).
      */
@@ -2669,8 +2669,9 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * Phase 494 (NTF-47) — registered clients' APP bookings due for the 2 h reminder, over the guest 2 h finder's
-     * half-open {@code [from, to)} window, via a BitmapOr of the partial indexes {@code idx_bookings_reminder_2h_app} (V240) and
-     * {@code idx_bookings_reminder_2h_attached} (V260). Bounded
+     * half-open {@code [from, to)} window (B527: attached guest / walk-in bookings too), via an Index Scan on the
+     * partial index {@code idx_bookings_reminder_2h_registered} (V262), whose predicate is this WHERE minus the
+     * window. Bounded
      * twice like the guest finder: the 30-minute window and {@code limit}
      * ({@link #TWO_HOUR_REMINDER_BATCH_CAP}); the overflow is picked up by the next tick.
      */

@@ -9,7 +9,6 @@ import com.beautica.booking.repository.BookingRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -32,10 +31,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Contract test for {@code V240__registered_booking_reminders.sql} (phase 494): the two APP partial indexes exist with
- * the exact predicates, {@code chk_outbox_event} is re-added as a strict superset (the thirteen prior event types plus
- * {@code BOOKING_REMINDER}), and — acceptance 4 — the SQL Hibernate actually emits for both registered finders is
- * planned on the new partial indexes. Catalog text alone could pass on a typo'd literal, so the inserts and the
+ * Contract test for {@code V240__registered_booking_reminders.sql} (phase 494): {@code chk_outbox_event} is re-added
+ * as a strict superset (the thirteen prior event types plus {@code BOOKING_REMINDER}), and — acceptance 4 — the SQL
+ * Hibernate actually emits for both registered finders is planned on a partial reminder index. V240's two APP indexes
+ * were superseded by V262's {@code idx_bookings_reminder_registered} / {@code _2h_registered} once B527 widened the
+ * finders to {@code (APP OR client_link_reason IS NOT NULL)} (no BitmapOr was ever chosen); their exact predicates are
+ * pinned by {@link V262RegisteredReminderIndexesMigrationTest}. Catalog text alone could pass on a typo'd literal, so the inserts and the
  * EXPLAIN are the behavioural half.
  */
 @DisplayName("V240 migration — APP reminder partial indexes + chk_outbox_event admits BOOKING_REMINDER")
@@ -57,19 +58,15 @@ class V240RegisteredBookingRemindersMigrationTest extends AbstractIntegrationTes
     @Autowired private PlatformTransactionManager transactionManager;
 
     @ParameterizedTest(name = "{0}")
-    @CsvSource(delimiter = '|', value = {
-            "idx_bookings_reminder_app|reminder_sent = false",
-            "idx_bookings_reminder_2h_app|reminder_2h_sent = false"})
-    @DisplayName("each APP index is on (starts_at) with exactly APP + CONFIRMED + its own flag = FALSE")
-    void should_haveExactPartialPredicate_when_indexRead(String index, String flagPredicate) {
+    @ValueSource(strings = {"idx_bookings_reminder_app", "idx_bookings_reminder_2h_app"})
+    @DisplayName("each V240 APP index is superseded by V262 (dropped; its rows live in the _registered index)")
+    void should_beDroppedByV262_when_indexRead(String index) {
         // Act
-        String def = jdbcTemplate.queryForObject(
-                "SELECT indexdef FROM pg_indexes WHERE tablename = 'bookings' AND indexname = ?", String.class, index);
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM pg_indexes WHERE tablename = 'bookings' AND indexname = ?", Integer.class, index);
 
         // Assert
-        assertThat(def).isEqualTo("CREATE INDEX " + index + " ON public.bookings USING btree (starts_at) WHERE ((("
-                + "booking_source)::text = 'APP'::text) AND ((status)::text = 'CONFIRMED'::text) AND ("
-                + flagPredicate + "))");
+        assertThat(count).as("V262 drops %s", index).isZero();
     }
 
     @Test
@@ -124,7 +121,8 @@ class V240RegisteredBookingRemindersMigrationTest extends AbstractIntegrationTes
     }
 
     @Test
-    @DisplayName("acceptance 4: the 24 h registered finder's emitted SQL is planned on idx_bookings_reminder_app")
+    @DisplayName("acceptance 4: the 24 h registered finder's emitted SQL is planned on idx_bookings_reminder_registered "
+            + "(V262) with no residual Filter")
     void should_planOnAppIndex_when_dayBeforeFinderExplained() {
         // Arrange
         String sql = capturedSql(repo -> repo.findRegisteredBookingsForReminder(FROM, TO, Limit.of(500)));
@@ -134,12 +132,14 @@ class V240RegisteredBookingRemindersMigrationTest extends AbstractIntegrationTes
 
         // Assert
         assertThat(sql).contains("'APP'").contains("'CONFIRMED'");
-        assertThat(plan).as("plan for %s", sql).contains("idx_bookings_reminder_app")
-                .doesNotContain("idx_bookings_reminder_2h_app");
+        assertThat(sql).contains("client_link_reason is not null");
+        assertThat(plan).as("plan for %s", sql).contains("Index Scan using idx_bookings_reminder_registered")
+                .doesNotContain("idx_bookings_client_slot_overlap").doesNotContain("Filter:");
     }
 
     @Test
-    @DisplayName("acceptance 4: the 2 h registered finder's emitted SQL is planned on idx_bookings_reminder_2h_app")
+    @DisplayName("acceptance 4: the 2 h registered finder's emitted SQL is planned on idx_bookings_reminder_2h_registered "
+            + "(V262) with no residual Filter")
     void should_planOnAppTwoHourIndex_when_twoHourFinderExplained() {
         // Arrange
         String sql = capturedSql(repo -> repo.findRegisteredBookingsForTwoHourReminder(FROM, TO, Limit.of(500)));
@@ -149,7 +149,9 @@ class V240RegisteredBookingRemindersMigrationTest extends AbstractIntegrationTes
 
         // Assert
         assertThat(sql).contains("'APP'").contains("'CONFIRMED'");
-        assertThat(plan).as("plan for %s", sql).contains("idx_bookings_reminder_2h_app");
+        assertThat(sql).contains("client_link_reason is not null");
+        assertThat(plan).as("plan for %s", sql).contains("Index Scan using idx_bookings_reminder_2h_registered")
+                .doesNotContain("idx_bookings_client_slot_overlap").doesNotContain("Filter:");
     }
 
     /** The one SELECT Hibernate logs for {@code call} (literals inline, binds as {@code ?}). */
