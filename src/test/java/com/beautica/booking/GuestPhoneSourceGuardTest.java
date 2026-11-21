@@ -7,7 +7,11 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -29,6 +33,17 @@ class GuestPhoneSourceGuardTest {
     private static final Path DTO = Path.of("src/main/java/com/beautica/booking/dto/BookingDetailResponse.java");
     private static final Pattern USER_PHONE_READ = Pattern.compile("\\bget(Phone|PhoneNumber)\\s*\\(");
     private static final Pattern CLIENT_PHONE_CHAIN = Pattern.compile("getClient\\s*\\(\\s*\\)\\s*\\.\\s*get\\w*Phone\\w*");
+    /**
+     * Any phone-named method ({@code getPhoneVerifiedAt(}, {@code phoneNumber(}, ...) invoked on a user/client
+     * receiver - a {@code client}/{@code user}/{@code account} variable, any {@code *User}/{@code *Client} name, or a
+     * {@code getClient()}/{@code getUser()} call. Booking receivers ({@code booking.getGuestPhone()}) do not match.
+     */
+    static final Pattern USER_RECEIVER_PHONE_CALL = Pattern.compile(
+            "\\b(?:account|\\w*[Uu]ser|\\w*[Cc]lient)\\s*(?:\\(\\s*\\))?\\s*\\.\\s*\\w*[Pp]hone\\w*\\s*\\(");
+    /** A call (receiver {@code .} or method reference {@code ::}) of the allow-listed wither - not its declaration. */
+    static final Pattern REGISTERED_PHONE_WITHER_CALL =
+            Pattern.compile("(?:\\.|::)\\s*withProviderVisibleRegisteredPhone\\b");
+    private static final Path MAIN_SOURCES = Path.of("src/main/java");
 
     /** Drops block comments (javadoc) and line comments so only executable code is scanned. */
     static String codeOnly(String source) {
@@ -79,6 +94,23 @@ class GuestPhoneSourceGuardTest {
         assertThat(CLIENT_PHONE_CHAIN.matcher(code).find())
                 .as("BookingDetailResponse must not chain getClient() into a phone getter")
                 .isFalse();
+        assertThat(USER_RECEIVER_PHONE_CALL.matcher(code).find())
+                .as("BookingDetailResponse must not call any phone-named method on a user/client receiver")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("should_flagAnyPhoneMethodOnUserReceivers_when_scannerRunOnSyntheticSources")
+    void should_flagAnyPhoneMethodOnUserReceivers_when_scannerRunOnSyntheticSources() {
+        List<String> leaking = List.of(
+                "client.getPhoneVerifiedAt()", "booking.getClient().phoneNumber()", "user.getPhone()",
+                "masterUser . maskedPhone ( )", "account.getPhoneE164()", "b.getUser().hasPhone()");
+        List<String> clean = List.of(
+                "booking.getGuestPhone()", "withPhones(guestPhone, clientPhone)", "clientPhone.isBlank()",
+                "client.getFirstName()", "this.phoneLabel()");
+
+        leaking.forEach(src -> assertThat(USER_RECEIVER_PHONE_CALL.matcher(src).find()).as(src).isTrue());
+        clean.forEach(src -> assertThat(USER_RECEIVER_PHONE_CALL.matcher(src).find()).as(src).isFalse());
     }
 
     @Test
@@ -134,13 +166,68 @@ class GuestPhoneSourceGuardTest {
         assertThat(body.lastIndexOf("getPhoneNumber(")).isGreaterThan(body.indexOf("return this;"));
     }
 
+    /** Per-file count of wither calls (comments stripped); files with zero calls are omitted. */
+    static Map<String, Integer> witherCallsByFile(Map<String, String> sources) {
+        Map<String, Integer> counts = new TreeMap<>();
+        sources.forEach((file, source) -> {
+            Matcher m = REGISTERED_PHONE_WITHER_CALL.matcher(codeOnly(source));
+            int n = 0;
+            while (m.find()) {
+                n++;
+            }
+            if (n > 0) {
+                counts.put(file, n);
+            }
+        });
+        return counts;
+    }
+
+    private static Map<String, String> allMainSources() throws IOException {
+        Map<String, String> sources = new TreeMap<>();
+        try (Stream<Path> files = Files.walk(MAIN_SOURCES)) {
+            for (Path f : files.filter(p -> p.toString().endsWith(".java")).toList()) {
+                sources.put(MAIN_SOURCES.relativize(f).toString().replace('\\', '/'), Files.readString(f));
+            }
+        }
+        return sources;
+    }
+
+    @Test
+    @DisplayName("should_callRegisteredPhoneWitherExactlyOnceInAllMainSources_when_scanningEveryJavaFile")
+    void should_callRegisteredPhoneWitherExactlyOnceInAllMainSources_when_scanningEveryJavaFile() throws IOException {
+        Map<String, String> sources = allMainSources();
+
+        Map<String, Integer> calls = witherCallsByFile(sources);
+
+        assertThat(sources).hasSizeGreaterThan(100);
+        assertThat(calls)
+                .as("the registered-phone wither is called exactly once across src/main/java - in BookingService")
+                .containsExactly(Map.entry("com/beautica/booking/service/BookingService.java", 1));
+    }
+
+    @Test
+    @DisplayName("the cross-file call count flags a second call site and ignores declarations and comments")
+    void should_flagSecondCallSite_when_witherCalledFromAnotherFile() {
+        String service = "class S { void a() { withPhone = detail.withProviderVisibleRegisteredPhone(booking); } }";
+        String dto = "/** see {@code #withProviderVisibleRegisteredPhone} */ class D { "
+                + REGISTERED_PHONE_SIGNATURE + " return this; } }";
+        String leak = "class L { Object x(D d, Booking b) { return d.withProviderVisibleRegisteredPhone(b); } }";
+        String methodRef = "class M { Object y() { return list.stream().map(D::withProviderVisibleRegisteredPhone); } }";
+
+        Map<String, Integer> clean = witherCallsByFile(Map.of("S.java", service, "D.java", dto));
+        Map<String, Integer> leaking = witherCallsByFile(
+                Map.of("S.java", service, "D.java", dto, "L.java", leak, "M.java", methodRef));
+
+        assertThat(clean).containsExactly(Map.entry("S.java", 1));
+        assertThat(leaking).containsOnly(Map.entry("S.java", 1), Map.entry("L.java", 1), Map.entry("M.java", 1));
+        assertThat(leaking.values().stream().mapToInt(Integer::intValue).sum()).isNotEqualTo(1);
+    }
+
     @Test
     @DisplayName("should_callRegisteredPhoneWitherOnlyFromProviderAudienceGate_when_scanningBookingService")
     void should_callRegisteredPhoneWitherOnlyFromProviderAudienceGate_when_scanningBookingService() throws IOException {
         String code = codeOnly(Files.readString(SERVICE)).replaceAll("\\s+", " ");
 
-        assertThat(code.split("withProviderVisibleRegisteredPhone\\(", -1).length - 1)
-                .as("the registered-phone wither is called exactly once").isEqualTo(1);
         int callAt = code.indexOf("withProviderVisibleRegisteredPhone(");
         assertThat(callAt).isBetween(code.indexOf("public BookingDetailResponse getBooking("),
                 code.indexOf("private static ClientAuthoredReviewResponse toClientAuthoredReview"));
