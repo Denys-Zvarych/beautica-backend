@@ -25,7 +25,7 @@ final class ClientCardSql {
 
     private static final String SCOPED_COLS = """
             SELECT b.id, COALESCE(b.appointment_id, b.id) AS visit_key, b.status, b.starts_at,
-                   b.guest_name, b.guest_surname
+                   b.guest_name, b.guest_surname, b.master_id
               FROM bookings b
             """;
 
@@ -35,14 +35,26 @@ final class ClientCardSql {
 
     // ── identity: guest by anchor booking ──
     private static final String GUEST_OPEN_ANCHOR = "WITH anchor AS (SELECT b.guest_phone FROM bookings b\n";
-    private static final String GUEST_CLOSE_ANCHOR = """
+    private static final String GUEST_ANCHOR_END = """
                AND b.id = :bookingId AND b.client_id IS NULL AND b.guest_phone IS NOT NULL
                AND b.guest_pii_anonymised_at IS NULL),
-            scoped AS (""" + SCOPED_COLS;
+            """;
+    private static final String GUEST_CLOSE_ANCHOR = GUEST_ANCHOR_END + "scoped AS (" + SCOPED_COLS;
     private static final String GUEST_CLOSE = """
                AND b.client_id IS NULL AND b.guest_phone = (SELECT guest_phone FROM anchor)
                AND b.guest_pii_anonymised_at IS NULL)
             """;
+
+    // ── SALON scope narrowed by ?masterId= (owner/admin master mode): the identity rows are read salon-wide into
+    //    `salon_scoped` (the chip row's source) and `scoped` narrows them to the master, so the card aggregate sees
+    //    exactly the rows SALON_MASTER_WHERE selected before. The guest anchor keeps SALON_MASTER_WHERE: the anchor
+    //    must still be the master's own booking, else the uniform 404. ──
+    private static final String NARROW_TO_MASTER = """
+            , scoped AS (SELECT id, visit_key, status, starts_at, guest_name, guest_surname, master_id
+                           FROM salon_scoped WHERE master_id = :masterId)
+            """;
+    private static final String USER_OPEN_SALON_WIDE = "WITH salon_scoped AS (" + SCOPED_COLS;
+    private static final String GUEST_SALON_WIDE = GUEST_ANCHOR_END + "salon_scoped AS (" + SCOPED_COLS;
 
     // ── card ──
     private static final String CARD_AGG = """
@@ -59,35 +71,68 @@ final class ClientCardSql {
               FROM scoped
             """;
 
-    private static final String CARD_GUEST_SELECT = "SELECT a.*, (SELECT guest_phone FROM anchor) AS guestPhone, "
+    // ── served-by masters (CLI-73), one extra column of the SALON card statements (no statement of its own: it
+    //    reads the identity CTE the aggregate already reads; referenced twice, Postgres materialises it once).
+    //    Salon-wide whatever ?masterId= (source `salon_scoped` in master mode). Only masters still on this salon's
+    //    roster (m.salon_id) — the membership ProviderClientScopeResolver accepts for ?masterId=, so every chip is a
+    //    filter that resolves. Name = the visit items' rule (live account, else the V157 detach snapshot); avatar only
+    //    from a live account. Any booking status counts as "served" (the card's totalVisits rule). JSON text, most
+    //    recent booking first then master id; '[]' when none. Bounded by the roster; LIMIT is a backstop. ──
+    static final int SERVED_BY_MASTERS_LIMIT = 50;
+
+    private static final String SERVED_HEAD = """
+            (SELECT CAST(COALESCE(json_agg(json_build_object('masterId', c.master_id, 'firstName', c.first_name,
+                                                            'lastName', c.last_name, 'avatarUrl', c.avatar_url)
+                                           ORDER BY c.last_at DESC, c.master_id), '[]') AS text)
+                      FROM (SELECT m.id AS master_id, COALESCE(mu.first_name, m.detached_first_name) AS first_name,
+                                   COALESCE(mu.last_name, m.detached_last_name) AS last_name,
+                                   mu.avatar_url AS avatar_url, s.last_at
+                              FROM (SELECT master_id, MAX(starts_at) AS last_at FROM\s""";
+    private static final String SERVED_TAIL = " " + """
+             GROUP BY master_id) s
+                              JOIN masters m ON m.id = s.master_id AND m.salon_id = :salonId
+                              LEFT JOIN users mu ON mu.id = m.user_id
+                             ORDER BY s.last_at DESC, m.id
+                             LIMIT\s""" + SERVED_BY_MASTERS_LIMIT + ") c) AS servedByMasters";
+    private static final String SERVED_FROM_SCOPED = SERVED_HEAD + "scoped" + SERVED_TAIL;
+    private static final String SERVED_FROM_SALON_SCOPED = SERVED_HEAD + "salon_scoped" + SERVED_TAIL;
+    private static final String SERVED_NONE = "CAST(NULL AS text) AS servedByMasters";
+
+    private static final String CARD_GUEST_HEAD = "SELECT a.*, (SELECT guest_phone FROM anchor) AS guestPhone, "
             + """
             CAST(NULL AS text) AS verifiedPhone, CAST(NULL AS text) AS firstName,
                    CAST(NULL AS text) AS lastName, CAST(NULL AS text) AS avatarUrl,
-                   CAST(NULL AS numeric) AS avgRating, CAST(NULL AS integer) AS reviewCount
-              FROM (""" + CARD_AGG + ") a\n";
+                   CAST(NULL AS numeric) AS avgRating, CAST(NULL AS integer) AS reviewCount,
+                   """;
+    private static final String CARD_GUEST_FROM = "\n  FROM (" + CARD_AGG + ") a\n";
 
     // B518 (GST-80): the registered phone rides the existing users join (no extra statement) and is NULL unless the
     // number is SMS-verified (V244 phone_verified_at) - the unverified number never leaves the database.
-    private static final String CARD_USER_SELECT_COLS = "SELECT a.*, CAST(NULL AS text) AS guestPhone, "
+    private static final String CARD_USER_HEAD = "SELECT a.*, CAST(NULL AS text) AS guestPhone, "
             + """
             CASE WHEN u.phone_verified_at IS NOT NULL THEN u.phone_number END AS verifiedPhone,
                    u.first_name AS firstName, u.last_name AS lastName, u.avatar_url AS avatarUrl,
-                   u.avg_rating AS avgRating, u.review_count AS reviewCount
-              FROM (""" + CARD_AGG + """
+                   u.avg_rating AS avgRating, u.review_count AS reviewCount,
+                   """;
+    private static final String CARD_USER_FROM = "\n  FROM (" + CARD_AGG + """
             ) a
               LEFT JOIN users u ON u.id = :userId
             """;
 
-    static final String CARD_USER_SALON = USER_OPEN + SALON_WHERE + USER_CLOSE + CARD_USER_SELECT_COLS;
-    static final String CARD_USER_SALON_MASTER = USER_OPEN + SALON_MASTER_WHERE + USER_CLOSE + CARD_USER_SELECT_COLS;
-    static final String CARD_USER_MASTER = USER_OPEN + MASTER_WHERE + USER_CLOSE + CARD_USER_SELECT_COLS;
+    static final String CARD_USER_SALON =
+            USER_OPEN + SALON_WHERE + USER_CLOSE + CARD_USER_HEAD + SERVED_FROM_SCOPED + CARD_USER_FROM;
+    static final String CARD_USER_SALON_MASTER = USER_OPEN_SALON_WIDE + SALON_WHERE + USER_CLOSE + NARROW_TO_MASTER
+            + CARD_USER_HEAD + SERVED_FROM_SALON_SCOPED + CARD_USER_FROM;
+    static final String CARD_USER_MASTER =
+            USER_OPEN + MASTER_WHERE + USER_CLOSE + CARD_USER_HEAD + SERVED_NONE + CARD_USER_FROM;
 
-    static final String CARD_GUEST_SALON =
-            GUEST_OPEN_ANCHOR + SALON_WHERE + GUEST_CLOSE_ANCHOR + SALON_WHERE + GUEST_CLOSE + CARD_GUEST_SELECT;
-    static final String CARD_GUEST_SALON_MASTER = GUEST_OPEN_ANCHOR + SALON_MASTER_WHERE + GUEST_CLOSE_ANCHOR
-            + SALON_MASTER_WHERE + GUEST_CLOSE + CARD_GUEST_SELECT;
-    static final String CARD_GUEST_MASTER =
-            GUEST_OPEN_ANCHOR + MASTER_WHERE + GUEST_CLOSE_ANCHOR + MASTER_WHERE + GUEST_CLOSE + CARD_GUEST_SELECT;
+    static final String CARD_GUEST_SALON = GUEST_OPEN_ANCHOR + SALON_WHERE + GUEST_CLOSE_ANCHOR + SALON_WHERE
+            + GUEST_CLOSE + CARD_GUEST_HEAD + SERVED_FROM_SCOPED + CARD_GUEST_FROM;
+    static final String CARD_GUEST_SALON_MASTER = GUEST_OPEN_ANCHOR + SALON_MASTER_WHERE + GUEST_SALON_WIDE
+            + SALON_WHERE + GUEST_CLOSE + NARROW_TO_MASTER + CARD_GUEST_HEAD + SERVED_FROM_SALON_SCOPED
+            + CARD_GUEST_FROM;
+    static final String CARD_GUEST_MASTER = GUEST_OPEN_ANCHOR + MASTER_WHERE + GUEST_CLOSE_ANCHOR + MASTER_WHERE
+            + GUEST_CLOSE + CARD_GUEST_HEAD + SERVED_NONE + CARD_GUEST_FROM;
 
     // ── visits page: one row per page entry; an empty page still returns ONE row (visitKey null) carrying the total.
     //    `grouped` is MATERIALIZED (computed exactly once) and carries COUNT(*) OVER () on every row, so the total

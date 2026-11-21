@@ -24,6 +24,9 @@ import com.beautica.common.security.PhoneHasher;
 import com.beautica.common.security.PhoneHasher.HashedPhone;
 import com.beautica.moderation.service.ClientBlockService;
 import com.beautica.moderation.service.ClientBlockService.BlockedAmong;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -62,6 +65,14 @@ public class ProviderClientService {
     private final ClientPhonePolicy phonePolicy;
     private final ClientRatingSummaryService ratingSummaryService;
     private final Clock clock;
+    private final ObjectMapper objectMapper;
+
+    private static final TypeReference<List<ServedMasterJson>> SERVED_MASTERS_TYPE = new TypeReference<>() {
+    };
+
+    /** CLI-73 — one element of the card statement's {@code servedByMasters} JSON column. */
+    record ServedMasterJson(UUID masterId, String firstName, String lastName, String avatarUrl) {
+    }
 
     /** The row as the service reads it; {@code guestPhone} never leaves this class. */
     private record ClientRow(
@@ -193,6 +204,7 @@ public class ProviderClientService {
         }
         ClientCardResponse.Stats stats = new ClientCardResponse.Stats((int) total,
                 toInt(row.getCompletedVisits()), toInt(row.getUpcomingVisits()));
+        List<ClientCardResponse.ServedMaster> servedBy = parseServedByMasters(row.getServedByMasters());
         return switch (ref) {
             case Registered(UUID userId) -> {
                 // B527 D7: account row OR the hash of the account's verified phone (one blockedAmong statement).
@@ -211,7 +223,7 @@ public class ProviderClientService {
                         phonePolicy.phoneFor(row.getVerifiedPhone()), blocked,
                         ratingCount > 0 ? row.getAvgRating() : null, ratingCount, distribution,
                         utc(row.getFirstVisitAt()),
-                        utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats);
+                        utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats, servedBy);
             }
             case GuestAnchor ignored -> {
                 String guestPhone = row.getGuestPhone();
@@ -222,7 +234,8 @@ public class ProviderClientService {
                         joinName(row.getGuestName(), row.getGuestSurname()), null,
                         phonePolicy.phoneFor(guestPhone), blocked, null, 0,
                         ClientRatingSummaryService.zeroDistribution(),
-                        utc(row.getFirstVisitAt()), utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats);
+                        utc(row.getFirstVisitAt()), utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats,
+                        servedBy);
             }
         };
     }
@@ -339,6 +352,25 @@ public class ProviderClientService {
                         repository.cardGuestByMaster(masterId, bookingId, now);
             };
         };
+    }
+
+    /**
+     * CLI-73 — the master chips, read from the card statement's own JSON column (salon scope only, salon-wide whatever
+     * {@code masterId}); {@code null} — the independent-master and SALON_MASTER cards — is no chips.
+     */
+    private List<ClientCardResponse.ServedMaster> parseServedByMasters(@Nullable String json) {
+        if (json == null) {
+            return List.of();
+        }
+        try {
+            return objectMapper.readValue(json, SERVED_MASTERS_TYPE).stream()
+                    .map(m -> new ClientCardResponse.ServedMaster(m.masterId(),
+                            joinName(m.firstName(), m.lastName()), m.avatarUrl()))
+                    .toList();
+        } catch (JsonProcessingException e) {
+            // The payload carries staff names: name the failure type only.
+            throw new IllegalStateException("Malformed servedByMasters column: " + e.getClass().getSimpleName());
+        }
     }
 
     private List<ClientVisitPageRowProjection> loadVisitPage(ClientScope scope, ClientRef ref, int limit,

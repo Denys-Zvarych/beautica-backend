@@ -19,6 +19,7 @@ import com.beautica.common.security.PhoneHasher;
 import com.beautica.common.security.PhoneHasher.HashedPhone;
 import com.beautica.moderation.service.ClientBlockService;
 import com.beautica.moderation.service.ClientBlockService.BlockedAmong;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -33,7 +34,9 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -77,7 +80,7 @@ class ProviderClientServiceTest {
     @BeforeEach
     void setUp() {
         service = new ProviderClientService(repository, clientBlockService, phoneHasher,
-                new ClientPhonePolicy(authz), ratingSummaryService, Clock.fixed(NOW, ZoneOffset.UTC));
+                new ClientPhonePolicy(authz), ratingSummaryService, Clock.fixed(NOW, ZoneOffset.UTC), new ObjectMapper());
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────
@@ -142,7 +145,7 @@ class ProviderClientServiceTest {
     // ── card: registered ─────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_returnRegisteredCard_when_userHasVisitsInScope")
+    @DisplayName("registered client card is returned when the user has visits in scope")
     void should_returnRegisteredCard_when_userHasVisitsInScope() {
         when(repository.cardUserBySalon(salonId, userId, utc(NOW))).thenAnswer(i -> registeredRow(2, new BigDecimal("4.00")));
         when(clientBlockService.blockedAmong(any(), eq(List.of(userId)), eq(List.of())))
@@ -163,7 +166,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnNullPhoneForRegistered_when_phoneIsUnverified")
+    @DisplayName("registered client card hides the phone when it is unverified")
     void should_returnNullPhoneForRegistered_when_phoneIsUnverified() {
         lenient().when(authz.isGuestPhoneAudience()).thenReturn(true);
         when(repository.cardUserBySalon(salonId, userId, utc(NOW))).thenAnswer(i -> registeredRow(1, BigDecimal.ONE));
@@ -177,7 +180,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnVerifiedPhoneForRegistered_when_audienceIsAllowed")
+    @DisplayName("registered client card shows the verified phone to an allowed audience")
     void should_returnVerifiedPhoneForRegistered_when_audienceIsAllowed() {
         when(authz.isGuestPhoneAudience()).thenReturn(true);
         when(repository.cardUserBySalon(salonId, userId, utc(NOW))).thenAnswer(i -> {
@@ -194,7 +197,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnNullPhoneForRegistered_when_audienceIsNotAllowedEvenIfVerified")
+    @DisplayName("registered client card hides a verified phone from a disallowed audience")
     void should_returnNullPhoneForRegistered_when_audienceIsNotAllowedEvenIfVerified() {
         when(authz.isGuestPhoneAudience()).thenReturn(false);
         when(repository.cardUserByMaster(masterId, userId, utc(NOW))).thenAnswer(i -> {
@@ -211,7 +214,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_hideRatingAndNeverReadPhoneNumber_when_clientIsUnrated")
+    @DisplayName("unrated client card hides the rating and never reads the phone number")
     void should_hideRatingAndNeverReadPhoneNumber_when_clientIsUnrated() {
         when(repository.cardUserByMaster(masterId, userId, utc(NOW))).thenAnswer(i -> registeredRow(0, BigDecimal.ZERO));
         when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
@@ -228,7 +231,7 @@ class ProviderClientServiceTest {
     // ── card: guest + phone gate ─────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_returnGuestPhone_when_audienceIsAllowed")
+    @DisplayName("guest card shows the phone to an allowed audience")
     void should_returnGuestPhone_when_audienceIsAllowed() {
         HashedPhone hashed = mock(HashedPhone.class);
         when(authz.isGuestPhoneAudience()).thenReturn(true);
@@ -250,7 +253,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnNullPhone_when_audienceIsNotAllowed")
+    @DisplayName("guest card hides the phone from a disallowed audience")
     void should_returnNullPhone_when_audienceIsNotAllowed() {
         when(authz.isGuestPhoneAudience()).thenReturn(false);
         when(repository.cardGuestByMaster(masterId, bookingId, utc(NOW))).thenAnswer(i -> guestRow());
@@ -267,7 +270,7 @@ class ProviderClientServiceTest {
     // ── card: scope x identity dispatch ──────────────────────────────────────
 
     @Test
-    @DisplayName("should_useSalonMasterQueries_when_ownerMasterModeScope")
+    @DisplayName("owner-master mode card uses the salon-and-master queries")
     void should_useSalonMasterQueries_when_ownerMasterModeScope() {
         when(repository.cardUserBySalonAndMaster(salonId, masterId, userId, utc(NOW)))
                 .thenAnswer(i -> registeredRow(0, null));
@@ -285,10 +288,82 @@ class ProviderClientServiceTest {
         verifyNoMoreInteractions(repository);
     }
 
+    // ── card: servedByMasters (CLI-73) ───────────────────────────────────────
+
+    @Test
+    @DisplayName("salon card maps servedByMasters in column order, names joined and trimmed, null avatar kept")
+    void should_mapServedMastersInColumnOrder_when_salonScope() throws Exception {
+        UUID recent = UUID.randomUUID();
+        UUID older = UUID.randomUUID();
+        Map<String, Object> olderChip = new LinkedHashMap<>();
+        olderChip.put("masterId", older);
+        olderChip.put("firstName", "Стара");
+        olderChip.put("lastName", null);
+        olderChip.put("avatarUrl", null);
+        String json = new ObjectMapper().writeValueAsString(List.of(
+                Map.of("masterId", recent, "firstName", "Олена", "lastName", " Нова ",
+                        "avatarUrl", "https://cdn.example/m.png"),
+                olderChip));
+        when(repository.cardUserBySalon(salonId, userId, utc(NOW))).thenAnswer(i -> {
+            ClientCardRowProjection row = registeredRow(0, null);
+            when(row.getServedByMasters()).thenReturn(json);
+            return row;
+        });
+        when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        ClientCardResponse card = service.getCard(new SalonScope(salonId, null), new ClientRef.Registered(userId));
+
+        assertThat(card.servedByMasters()).containsExactly(
+                new ClientCardResponse.ServedMaster(recent, "Олена Нова", "https://cdn.example/m.png"),
+                new ClientCardResponse.ServedMaster(older, "Стара", null));
+    }
+
+    @Test
+    @DisplayName("salon card with an empty '[]' column carries no master chips")
+    void should_returnEmptyServedMasters_when_salonCardHasNone() {
+        when(repository.cardUserBySalon(salonId, userId, utc(NOW))).thenAnswer(i -> {
+            ClientCardRowProjection row = registeredRow(0, null);
+            when(row.getServedByMasters()).thenReturn("[]");
+            return row;
+        });
+        when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        ClientCardResponse card = service.getCard(new SalonScope(salonId, null), new ClientRef.Registered(userId));
+
+        assertThat(card.servedByMasters()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("master-scope card (NULL column) carries an empty, non-null chip list")
+    void should_returnEmptyServedMasters_when_masterScopeColumnIsNull() {
+        when(repository.cardGuestByMaster(masterId, bookingId, utc(NOW))).thenAnswer(i -> guestRow());
+        when(phoneHasher.tryHash(PHONE)).thenReturn(Optional.empty());
+
+        ClientCardResponse card = service.getCard(new MasterScope(masterId, null), new ClientRef.GuestAnchor(bookingId));
+
+        assertThat(card.servedByMasters()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("malformed servedByMasters column fails without echoing staff names")
+    void should_throwWithoutPayload_when_servedMastersColumnIsMalformed() {
+        when(repository.cardUserBySalon(salonId, userId, utc(NOW))).thenAnswer(i -> {
+            ClientCardRowProjection row = registeredRow(0, null);
+            when(row.getServedByMasters()).thenReturn("[{\"firstName\":\"Олена\"");
+            return row;
+        });
+
+        assertThatThrownBy(() -> service.getCard(new SalonScope(salonId, null), new ClientRef.Registered(userId)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageNotContaining("Олена");
+    }
+
     // ── card: uniform 404 ────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_throwNotFound_when_registeredHasNoVisitInScope")
+    @DisplayName("card lookup fails with not found when a registered client has no visit in scope")
     void should_throwNotFound_when_registeredHasNoVisitInScope() {
         when(repository.cardUserBySalon(salonId, userId, utc(NOW))).thenAnswer(i -> cardRow(0, 0, 0));
 
@@ -298,7 +373,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwSameNotFound_when_guestAnchorIsInvalid")
+    @DisplayName("card lookup gives the same not found when the guest anchor is invalid")
     void should_throwSameNotFound_when_guestAnchorIsInvalid() {
         when(repository.cardGuestBySalon(salonId, bookingId, utc(NOW))).thenAnswer(i -> cardRow(0, 0, 0));
 
@@ -314,7 +389,7 @@ class ProviderClientServiceTest {
     // ── visits ───────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_groupItemsUnderTheirVisitKeepingPageOrder_when_pageHasMultiRowVisits")
+    @DisplayName("multi-row visits are grouped into one visit each, in page order")
     void should_groupItemsUnderTheirVisitKeepingPageOrder_when_pageHasMultiRowVisits() {
         UUID newer = UUID.randomUUID();
         UUID older = UUID.randomUUID();
@@ -342,7 +417,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_passOffsetAndSizeToThePageQuery_when_secondPageRequested")
+    @DisplayName("second page request passes the right offset and size to the query")
     void should_passOffsetAndSizeToThePageQuery_when_secondPageRequested() {
         UUID key = UUID.randomUUID();
         when(repository.visitsGuestByMaster(masterId, bookingId, 20, 20L))
@@ -359,7 +434,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_skipItemsQueryAndKeepTotal_when_pageIsBeyondTheEnd")
+    @DisplayName("page beyond the end skips the items query and keeps the total")
     void should_skipItemsQueryAndKeepTotal_when_pageIsBeyondTheEnd() {
         when(repository.visitsUserBySalonAndMaster(salonId, masterId, userId, 20, 200L))
                 .thenAnswer(i -> List.of(pageRow(3, null, null)));
@@ -373,7 +448,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwNotFound_when_noVisitInScope")
+    @DisplayName("visits lookup fails with not found when there is no visit in scope")
     void should_throwNotFound_when_noVisitInScope() {
         when(repository.visitsGuestBySalon(eq(salonId), eq(bookingId), anyInt(), anyLong()))
                 .thenAnswer(i -> List.of(pageRow(0, null, null)));
@@ -409,7 +484,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_useSalonQueries_when_registeredClientInSalonScope")
+    @DisplayName("registered client in salon scope uses the salon queries")
     void should_useSalonQueries_when_registeredClientInSalonScope() {
         var row = ratingRow(bookingId, 5);
         when(repository.existsUserBySalon(salonId, userId)).thenReturn(true);
@@ -426,7 +501,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_useSalonAndMasterQueries_when_registeredClientInSalonMasterScope")
+    @DisplayName("registered client in salon-and-master scope uses the combined queries")
     void should_useSalonAndMasterQueries_when_registeredClientInSalonMasterScope() {
         var row = ratingRow(bookingId, 3);
         when(repository.existsUserBySalonAndMaster(salonId, masterId, userId)).thenReturn(true);
@@ -442,7 +517,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_useMasterQueries_when_registeredClientInMasterScope")
+    @DisplayName("registered client in master scope uses the master queries")
     void should_useMasterQueries_when_registeredClientInMasterScope() {
         var row = ratingRow(bookingId, 4);
         when(repository.existsUserByMaster(masterId, userId)).thenReturn(true);
@@ -458,7 +533,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnEmptyPageWithoutPageQuery_when_guestAnchorInSalonScope")
+    @DisplayName("guest in salon scope gets an empty page without a page query")
     void should_returnEmptyPageWithoutPageQuery_when_guestAnchorInSalonScope() {
         when(repository.existsGuestBySalon(salonId, bookingId)).thenReturn(true);
 
@@ -472,7 +547,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnEmptyPageWithoutPageQuery_when_guestAnchorInSalonMasterScope")
+    @DisplayName("guest in salon-and-master scope gets an empty page without a page query")
     void should_returnEmptyPageWithoutPageQuery_when_guestAnchorInSalonMasterScope() {
         when(repository.existsGuestBySalonAndMaster(salonId, masterId, bookingId)).thenReturn(true);
 
@@ -486,7 +561,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnEmptyPageWithoutPageQuery_when_guestAnchorInMasterScope")
+    @DisplayName("guest in master scope gets an empty page without a page query")
     void should_returnEmptyPageWithoutPageQuery_when_guestAnchorInMasterScope() {
         when(repository.existsGuestByMaster(masterId, bookingId)).thenReturn(true);
 
@@ -500,7 +575,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwClientNotFound_when_registeredClientNotInSalonScope")
+    @DisplayName("registered client outside the salon scope is not found")
     void should_throwClientNotFound_when_registeredClientNotInSalonScope() {
         when(repository.existsUserBySalon(salonId, userId)).thenReturn(false);
 
@@ -512,7 +587,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwClientNotFound_when_registeredClientNotInSalonMasterScope")
+    @DisplayName("registered client outside the salon-and-master scope is not found")
     void should_throwClientNotFound_when_registeredClientNotInSalonMasterScope() {
         when(repository.existsUserBySalonAndMaster(salonId, masterId, userId)).thenReturn(false);
 
@@ -523,7 +598,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwClientNotFound_when_registeredClientNotInMasterScope")
+    @DisplayName("registered client outside the master scope is not found")
     void should_throwClientNotFound_when_registeredClientNotInMasterScope() {
         when(repository.existsUserByMaster(masterId, userId)).thenReturn(false);
 
@@ -534,7 +609,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_throwClientNotFound_when_guestAnchorNotInScope")
+    @DisplayName("guest anchor outside every scope is not found")
     void should_throwClientNotFound_when_guestAnchorNotInScope() {
         when(repository.existsGuestBySalon(salonId, bookingId)).thenReturn(false);
         when(repository.existsGuestBySalonAndMaster(salonId, masterId, bookingId)).thenReturn(false);
@@ -552,7 +627,7 @@ class ProviderClientServiceTest {
     // ── phone policy seam ────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_returnNoPhoneForAnyKind_when_audienceIsNotAllowed")
+    @DisplayName("phone policy returns no phone for any client kind to a disallowed audience")
     void should_returnNoPhoneForAnyKind_when_audienceIsNotAllowed() {
         ClientPhonePolicy policy = new ClientPhonePolicy(authz);
         when(authz.isGuestPhoneAudience()).thenReturn(false);
@@ -562,7 +637,7 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnPhone_when_audienceIsAllowed")
+    @DisplayName("phone policy returns the phone to an allowed audience")
     void should_returnPhone_when_audienceIsAllowed() {
         ClientPhonePolicy policy = new ClientPhonePolicy(authz);
         lenient().when(authz.isGuestPhoneAudience()).thenReturn(true);

@@ -45,4 +45,10 @@ public interface ClientCardRowProjection {
     BigDecimal getAvgRating();
 
     Integer getReviewCount();
+
+    /**
+     * CLI-73 — the salon card's master chips as JSON text ({@code [{masterId, firstName, lastName, avatarUrl}]}, most
+     * recent booking first); {@code null} on the independent-master / SALON_MASTER card.
+     */
+    String getServedByMasters();
 }

@@ -14,7 +14,7 @@ class ClientCardResponseTest {
     @DisplayName("toString masks the phone and never prints the raw number or the name")
     void should_notLogRawPhone_when_toStringCalled() {
         var card = new ClientCardResponse(ClientKind.REGISTERED, UUID.randomUUID(), null, "Петро Сидоренко", null,
-                "+380671234567", false, null, 0, java.util.List.of(), null, null, null, new ClientCardResponse.Stats(1, 1, 0));
+                "+380671234567", false, null, 0, java.util.List.of(), null, null, null, new ClientCardResponse.Stats(1, 1, 0), java.util.List.of());
 
         String text = card.toString();
 
@@ -26,7 +26,7 @@ class ClientCardResponseTest {
     @DisplayName("toString prints null for an absent phone")
     void should_printNullPhone_when_phoneAbsent() {
         var card = new ClientCardResponse(ClientKind.GUEST, null, UUID.randomUUID(), null, null, null, false, null, 0,
-                java.util.List.of(), null, null, null, new ClientCardResponse.Stats(0, 0, 0));
+                java.util.List.of(), null, null, null, new ClientCardResponse.Stats(0, 0, 0), java.util.List.of());
 
         assertThat(card.toString()).contains("phone=null");
     }

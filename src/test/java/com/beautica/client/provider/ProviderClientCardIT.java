@@ -387,7 +387,8 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
         long largePage = statementsFor(owner, userCard + "/visits?size=20");
         long guestVisits = statementsFor(owner, guestCard + "/visits");
 
-        assertThat(userCardStatements).as("aggregate + blocks + salon-access lookup").isLessThanOrEqualTo(3);
+        assertThat(userCardStatements).as("aggregate (+ servedByMasters column) + blocks + salon-access lookup")
+                .isLessThanOrEqualTo(3);
         assertThat(guestCardStatements).isLessThanOrEqualTo(3);
         assertThat(masterCardStatements).as("master lookup + aggregate + blocks").isLessThanOrEqualTo(3);
         assertThat(smallPage).as("page + items + salon-access lookup").isLessThanOrEqualTo(3);
@@ -540,6 +541,196 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
         fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-9));
 
         assertNotFound(fx.get(fx.token(s.ownerEmail()), userCard(s.salonId(), c) + "?masterId=" + foreign.masterId()));
+    }
+
+    // ── CLI-73 / CLI-74: servedByMasters chips + admin master filter ──────────
+
+    private static List<String> servedIds(JsonNode card) {
+        List<String> ids = new ArrayList<>();
+        card.path("servedByMasters").forEach(m -> ids.add(m.path("masterId").asText()));
+        return ids;
+    }
+
+    @Test
+    @DisplayName("CLI-73: servedByMasters = this salon's masters who served the client, most recent booking first; "
+            + "another salon's master excluded; unchanged by ?masterId=; detached master keeps snapshot name, no avatar")
+    void should_listServedMastersMostRecentFirst_when_salonCardRead() throws Exception {
+        Salon s = fx.salon();
+        Salon other = fx.salon();
+        UUID masterB = (UUID) fx.secondMaster(s.salonId(), "Друга")[0];
+        UUID masterC = (UUID) fx.secondMaster(s.salonId(), "Третя")[0];
+        fx.secondMaster(s.salonId(), "Неробоча"); // never served the client -> no chip
+        jdbcTemplate.update("UPDATE users SET avatar_url = 'https://cdn.example/b.png' "
+                + "WHERE id = (SELECT user_id FROM masters WHERE id = ?)", masterB);
+        UUID c = fx.client("Чіпова", "Клієнтка");
+        fx.booking(masterC, s.salonId(), c, "CANCELLED", fx.at(-30));
+        fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-20));
+        fx.booking(masterB, s.salonId(), c, "COMPLETED", fx.at(-25));
+        fx.booking(masterB, s.salonId(), c, "CONFIRMED", fx.at(4));
+        fx.booking(other.masterId(), other.salonId(), c, "COMPLETED", fx.at(-1));
+        jdbcTemplate.update("UPDATE masters SET user_id = NULL, detached_first_name = 'Колишня', "
+                + "detached_last_name = NULL, detached_at = NOW(), is_active = false WHERE id = ?", masterC);
+        String token = fx.token(s.ownerEmail());
+
+        JsonNode all = ok(fx.get(token, userCard(s.salonId(), c)));
+        JsonNode filtered = ok(fx.get(token, userCard(s.salonId(), c) + "?masterId=" + s.masterId()));
+
+        assertThat(servedIds(all)).containsExactly(masterB.toString(), s.masterId().toString(), masterC.toString());
+        JsonNode chipB = all.path("servedByMasters").get(0);
+        assertThat(chipB.path("name").asText()).isEqualTo("Друга Б");
+        assertThat(chipB.path("avatarUrl").asText()).isEqualTo("https://cdn.example/b.png");
+        JsonNode chipC = all.path("servedByMasters").get(2);
+        assertThat(chipC.path("name").asText()).isEqualTo("Колишня");
+        assertThat(chipC.path("avatarUrl").isNull()).isTrue();
+        assertThat(chipC.size()).as("masterId, name, avatarUrl only").isEqualTo(3);
+        assertThat(servedIds(filtered)).as("chip row stays salon-wide").isEqualTo(servedIds(all));
+        assertThat(filtered.path("stats").path("totalVisits").asInt()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("CLI-73: guest card chips follow the card's guest identity (same phone, client_id NULL) in this salon")
+    void should_listServedMastersByGuestIdentity_when_guestCardRead() throws Exception {
+        Salon s = fx.salon();
+        UUID masterB = (UUID) fx.secondMaster(s.salonId(), "Друга")[0];
+        UUID masterC = (UUID) fx.secondMaster(s.salonId(), "Третя")[0];
+        UUID anchor = fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Гість", "А", "COMPLETED", fx.at(-9));
+        fx.guestBooking(masterB, s.salonId(), GUEST_PHONE, "Гість", "А", "COMPLETED", fx.at(-3));
+        fx.guestBooking(masterC, s.salonId(), "+380677778899", "Інший", "Гість", "COMPLETED", fx.at(-2));
+        UUID c = fx.client("Зареєстрована", "Клієнтка");
+        fx.booking(masterC, s.salonId(), c, "COMPLETED", fx.at(-1));
+
+        JsonNode card = ok(fx.get(fx.token(s.ownerEmail()), guestCard(s.salonId(), anchor)));
+
+        assertThat(servedIds(card)).containsExactly(masterB.toString(), s.masterId().toString());
+    }
+
+    @Test
+    @DisplayName("CLI-73: independent-master and SALON_MASTER cards carry an empty servedByMasters")
+    void should_returnEmptyServedMasters_when_masterScopeCard() throws Exception {
+        Salon s = fx.salon();
+        Independent im = fx.independent();
+        UUID c = fx.client("Без", "Чіпів");
+        fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-5));
+        fx.booking(im.masterId(), null, c, "COMPLETED", fx.at(-4));
+
+        JsonNode asSalonMaster = ok(fx.get(fx.token(s.masterEmail()), ME_URL + "/users/" + c));
+        JsonNode asIndependent = ok(fx.get(fx.token(im.email()), ME_URL + "/users/" + c));
+
+        assertThat(asSalonMaster.path("servedByMasters").isArray()).isTrue();
+        assertThat(asSalonMaster.path("servedByMasters")).isEmpty();
+        assertThat(asIndependent.path("servedByMasters").isArray()).isTrue();
+        assertThat(asIndependent.path("servedByMasters")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("CLI-74: the salon's admin filters card, «Наступний візит» and visits by masterId like the owner")
+    void should_narrowCardAndVisits_when_adminFiltersByMaster() throws Exception {
+        Salon s = fx.salon();
+        UUID masterB = (UUID) fx.secondMaster(s.salonId(), "Друга")[0];
+        UUID c = fx.client("Адмінська", "Клієнтка");
+        fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-9));
+        Instant nextWithA = fx.at(6);
+        fx.booking(s.masterId(), s.salonId(), c, "CONFIRMED", nextWithA);
+        Instant nextWithB = fx.at(2);
+        fx.booking(masterB, s.salonId(), c, "CONFIRMED", nextWithB);
+        String admin = fx.token(fx.admin(s.salonId()));
+
+        JsonNode all = ok(fx.get(admin, userCard(s.salonId(), c)));
+        JsonNode onlyA = ok(fx.get(admin, userCard(s.salonId(), c) + "?masterId=" + s.masterId()));
+        List<JsonNode> visitsA = visitRows(fx.get(admin, userCard(s.salonId(), c) + "/visits?masterId=" + s.masterId()));
+
+        assertThat(OffsetDateTime.parse(all.path("nextVisitAt").asText()).toInstant()).isEqualTo(nextWithB);
+        assertThat(OffsetDateTime.parse(onlyA.path("nextVisitAt").asText()).toInstant()).isEqualTo(nextWithA);
+        assertThat(onlyA.path("stats").path("totalVisits").asInt()).isEqualTo(2);
+        assertThat(visitsA).hasSize(2);
+        assertThat(visitsA.toString()).doesNotContain(masterB.toString());
+    }
+
+    @Test
+    @DisplayName("CLI-74: admin with another salon's masterId gets the uniform 404 on card and visits")
+    void should_return404_when_adminFiltersByForeignMaster() throws Exception {
+        Salon s = fx.salon();
+        Salon foreign = fx.salon();
+        UUID c = fx.client("Чужий", "Фільтр");
+        fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-9));
+        String admin = fx.token(fx.admin(s.salonId()));
+
+        assertNotFound(fx.get(admin, userCard(s.salonId(), c) + "?masterId=" + foreign.masterId()));
+        assertNotFound(fx.get(admin, userCard(s.salonId(), c) + "/visits?masterId=" + foreign.masterId()));
+    }
+
+    @Test
+    @DisplayName("CLI-73: the salon admin sees the same salon-wide chip row as the owner, also under ?masterId=")
+    void should_listSalonWideServedMasters_when_adminReadsCardWithAndWithoutMasterFilter() throws Exception {
+        Salon s = fx.salon();
+        UUID masterB = (UUID) fx.secondMaster(s.salonId(), "Друга")[0];
+        UUID c = fx.client("Адмін", "Чіпи");
+        fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-9));
+        fx.booking(masterB, s.salonId(), c, "COMPLETED", fx.at(-3));
+        String admin = fx.token(fx.admin(s.salonId()));
+        String owner = fx.token(s.ownerEmail());
+
+        JsonNode adminAll = ok(fx.get(admin, userCard(s.salonId(), c)));
+        JsonNode adminFiltered = ok(fx.get(admin, userCard(s.salonId(), c) + "?masterId=" + s.masterId()));
+        JsonNode ownerAll = ok(fx.get(owner, userCard(s.salonId(), c)));
+
+        assertThat(servedIds(adminAll)).containsExactly(masterB.toString(), s.masterId().toString());
+        assertThat(servedIds(adminFiltered)).as("?masterId= never narrows the chip row").isEqualTo(servedIds(adminAll));
+        assertThat(adminFiltered.path("stats").path("totalVisits").asInt()).as("card itself narrowed").isEqualTo(1);
+        assertThat(servedIds(ownerAll)).as("owner and admin see one row").isEqualTo(servedIds(adminAll));
+    }
+
+    @Test
+    @DisplayName("CLI-73/74: guest card under ?masterId= keeps the salon-wide chip row while the card narrows")
+    void should_keepSalonWideGuestChips_when_guestCardFilteredByMaster() throws Exception {
+        Salon s = fx.salon();
+        UUID masterB = (UUID) fx.secondMaster(s.salonId(), "Друга")[0];
+        UUID anchor = fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Гість", "А", "COMPLETED", fx.at(-9));
+        fx.guestBooking(masterB, s.salonId(), GUEST_PHONE, "Гість", "А", "COMPLETED", fx.at(-3));
+        String token = fx.token(s.ownerEmail());
+
+        JsonNode filtered = ok(fx.get(token, guestCard(s.salonId(), anchor) + "?masterId=" + s.masterId()));
+
+        assertThat(servedIds(filtered)).containsExactly(masterB.toString(), s.masterId().toString());
+        assertThat(filtered.path("stats").path("totalVisits").asInt()).as("card narrowed to master A").isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("CLI-73: a master who served the client here and then moved to another salon gets no chip")
+    void should_excludeMaster_when_masterMovedToAnotherSalon() throws Exception {
+        Salon s = fx.salon();
+        Salon other = fx.salon();
+        UUID moved = (UUID) fx.secondMaster(s.salonId(), "Перейшла")[0];
+        UUID c = fx.client("Клієнтка", "Переходу");
+        fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-9));
+        fx.booking(moved, s.salonId(), c, "COMPLETED", fx.at(-3));
+        jdbcTemplate.update("UPDATE masters SET salon_id = ? WHERE id = ?", other.salonId(), moved);
+        jdbcTemplate.update("UPDATE users SET salon_id = ? WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                other.salonId(), moved);
+
+        JsonNode card = ok(fx.get(fx.token(s.ownerEmail()), userCard(s.salonId(), c)));
+
+        assertThat(servedIds(card)).as("only masters on this salon's roster").containsExactly(s.masterId().toString());
+        assertThat(card.path("stats").path("totalVisits").asInt()).as("history still counts the visit").isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("CLI-73: the chip row is capped at 50, keeping the 50 most recently booked masters")
+    void should_capServedMastersAtFifty_when_moreMastersServedTheClient() throws Exception {
+        Salon s = fx.salon();
+        UUID c = fx.client("Багато", "Майстрів");
+        fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-60)); // oldest -> cut by the cap
+        List<String> expected = new ArrayList<>();
+        for (int i = 1; i <= 50; i++) {
+            UUID m = (UUID) fx.secondMaster(s.salonId(), "Майстер" + i)[0];
+            fx.booking(m, s.salonId(), c, "COMPLETED", fx.at(-i));
+            expected.add(m.toString());
+        }
+
+        JsonNode card = ok(fx.get(fx.token(s.ownerEmail()), userCard(s.salonId(), c)));
+
+        assertThat(servedIds(card)).as("50 most recent, newest first").containsExactlyElementsOf(expected);
+        assertThat(card.path("stats").path("totalVisits").asInt()).as("cap never trims the card").isEqualTo(51);
     }
 
     // ── auth matrix ──────────────────────────────────────────────────────────

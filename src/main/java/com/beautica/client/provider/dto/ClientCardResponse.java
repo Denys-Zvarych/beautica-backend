@@ -24,6 +24,9 @@ import java.util.UUID;
  * @param ratingCount    visible ratings received; 0 when unrated and always 0 for a guest
  * @param ratingDistribution always 5 buckets (5 down to 1), zero-filled; all zeros for a guest
  * @param firstVisitAt   earliest booking start in scope, any status
+ * @param servedByMasters CLI-73: SALON scope only — the salon's masters with at least one booking of this client (any
+ *                       status), most recent booking first, salon-wide whatever {@code ?masterId=}; always empty for
+ *                       the independent-master and SALON_MASTER cards
  */
 public record ClientCardResponse(
         ClientKind kind,
@@ -39,8 +42,13 @@ public record ClientCardResponse(
         OffsetDateTime firstVisitAt,
         OffsetDateTime lastVisitAt,
         OffsetDateTime nextVisitAt,
-        Stats stats
+        Stats stats,
+        List<ServedMaster> servedByMasters
 ) {
+
+    public ClientCardResponse {
+        servedByMasters = servedByMasters == null ? List.of() : List.copyOf(servedByMasters);
+    }
 
     /** Redacted: the generated record {@code toString} would print the client's phone and name in clear. */
     @Override
@@ -60,5 +68,13 @@ public record ClientCardResponse(
     @Schema(description = "Own-scope visit counts; a visit = one appointment (or one single booking). A partly "
             + "cancelled visit that still has a COMPLETED row counts in completedVisits.")
     public record Stats(int totalVisits, int completedVisits, int upcomingVisits) {
+    }
+
+    /**
+     * CLI-73 — one master chip on the salon card. {@code name} follows the visit items' master name (a removed staff
+     * account shows its kept name snapshot); {@code avatarUrl} is null for such a master.
+     */
+    @Schema(description = "A salon master who has served this client; the chip's masterId is a valid ?masterId= filter.")
+    public record ServedMaster(UUID masterId, String name, String avatarUrl) {
     }
 }
