@@ -458,23 +458,29 @@ class ClientBlockHttpContractIT extends AbstractModerationIT {
         }
 
         @Test
-        @DisplayName("STAFF walk-in of a REGISTERED client is not blockable for the admin, and POST is 400")
-        void should_reportNotBlockable_when_staffWalkInOfRegisteredClient() throws Exception {
+        @DisplayName("B527: a STAFF walk-in attached to a REGISTERED client is blockable for the admin as that ACCOUNT")
+        void should_reportBlockableAsAccount_when_staffWalkInOfRegisteredClient() throws Exception {
+            // MOD-27 registered branch (B527 § 6, CLI-62): an attached walk-in carries client_id, so the block
+            // target is the account; only an account-less walk-in stays 400 (MOD-28, ClientBlockIT).
             SalonFixture salon = createSalon();
             String adminEmail = unique("admin");
             createUser(adminEmail, "SALON_ADMIN", salon.salonId());
-            UUID bookingId = insertBooking(createUser(unique("client"), "CLIENT", null), salon, "COMPLETED");
+            UUID client = createUser(unique("client"), "CLIENT", null);
+            UUID bookingId = insertBooking(client, salon, "COMPLETED");
             jdbcTemplate.update("UPDATE bookings SET booking_source = 'STAFF' WHERE id = ?", bookingId);
             String token = tokenFor(adminEmail);
 
             JsonNode view = detail(bookingId, token);
             ResponseEntity<String> post = postBlock(token, bookingId);
 
-            assertThat(view.path("clientBlockable").asBoolean()).isFalse();
+            assertThat(view.path("clientBlockable").asBoolean()).isTrue();
             assertThat(view.path("clientBlocked").asBoolean()).isFalse();
             assertThat(view.path("clientBlockId").isNull()).isTrue();
-            assertThat(post.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-            assertThat(countBlocks()).isZero();
+            assertThat(post.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+            assertThat(data(post).path("kind").asText()).isEqualTo("CLIENT");
+            assertThat(countBlocks()).isEqualTo(1);
+            assertThat(jdbcTemplate.queryForObject("SELECT blocked_user_id FROM client_blocks", UUID.class))
+                    .isEqualTo(client);
         }
 
         @Test

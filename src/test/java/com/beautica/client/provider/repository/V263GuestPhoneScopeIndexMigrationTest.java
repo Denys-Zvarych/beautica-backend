@@ -106,15 +106,17 @@ class V263GuestPhoneScopeIndexMigrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("the retention erase-by-phone lookup plans on idx_bookings_guest_phone_open")
+    @DisplayName("the retention erase-by-phone lookup can read the phone through idx_bookings_guest_phone_open")
     void should_planEraseByPhoneOnOpenPhoneIndex_when_explained() {
-        // Act
+        // Act — applicability probe: on the near-empty shared table idx_bookings_guest_pii_due (same partial
+        // predicate) ties with the phone index and the pick is stats-dependent, so only the survivor is left.
         String plan = explain("""
                 SELECT id FROM bookings WHERE guest_phone = '+380501234567' AND client_id IS NULL
-                   AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL""", false);
+                   AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL""", true);
 
         // Assert
-        assertThat(plan).as(plan).contains(SURVIVOR);
+        assertThat(plan).as(plan).contains("Bitmap Index Scan on " + SURVIVOR)
+                .contains("Index Cond: ((guest_phone)::text = ").doesNotContain("Seq Scan on bookings");
     }
 
     private Integer countIndex(String index) {
