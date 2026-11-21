@@ -23,6 +23,10 @@ spring:
       '[mail.smtp.writetimeout]': 1000
 
 app:
+  client-phone-attach:
+    sweep:
+      # B527 audit cycle 2 — the 30-min retry sweep never runs mid-test; its tests call ClientPhoneAttachService#sweep directly.
+      enabled: false
   # B514 (AUTH-54) — OFF by default; the App Check ITs set the mode per class.
   auth:
     app-check:

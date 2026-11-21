@@ -42,4 +42,10 @@ public interface ClientListRowProjection {
     BigDecimal getAvgRating();
 
     Integer getReviewCount();
+
+    /**
+     * B527 — INTERNAL, raw E.164: the registered client's VERIFIED phone, read only to hash it for the block lookup (a
+     * registered client is blocked by account OR by the hash of that phone, D7). Never copied into a response or a log.
+     */
+    String getVerifiedPhone();
 }

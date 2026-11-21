@@ -342,8 +342,11 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
          * have: a new per-visit query, a lost fetch join, or the in-app write regressing off its
          * one-statement shape; a fall means either the feed row or the walk-in create baseline itself
          * shed a statement.
+         *
+         * <p>Re-baselined (B527) 20 -&gt; 21 together with {@code StaffBookingIT.StatementCount.CREATE_FIXED_STATEMENTS}
+         * (14 -&gt; 15): the create resolves the CLIENT account that owns the guest phone with one fixed SELECT.
          */
-        private static final long WALK_IN_CREATE_DIFFERENT_ACTOR_STATEMENTS = 20L;
+        private static final long WALK_IN_CREATE_DIFFERENT_ACTOR_STATEMENTS = 21L;
 
         @Test
         @DisplayName("STATEMENT-COUNT GATE: admin creates a walk-in for a DIFFERENT performing master "

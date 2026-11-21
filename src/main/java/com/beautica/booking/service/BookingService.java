@@ -387,7 +387,7 @@ public class BookingService {
                 && authz.canProviderReviewClient(actorUserId, booking);
         return providerCanReviewClient(
                 hasProviderAuthority, booking.getStatus(),
-                booking.getClient() != null,
+                booking.isRateableByProvider(),
                 () -> clientReviewRepository.existsByBookingId(booking.getId()));
     }
 
@@ -1294,7 +1294,7 @@ public class BookingService {
         // have flipped a response field. It can only REMOVE a statement, never add one: an actor
         // with no provider authority over any row of the page now skips the query outright.
         List<UUID> reviewCandidateIds = hydrated.stream()
-                .filter(b -> b.getClient() != null && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
+                .filter(b -> b.isRateableByProvider() && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
                 .map(Booking::getId)
                 .filter(withProviderAuthority::contains)
                 .toList();
@@ -1318,7 +1318,7 @@ public class BookingService {
                     // see resolveSalonPageProviderAuthority for why each conjunct is there.
                     boolean hasProviderAuthority = withProviderAuthority.contains(b.getId());
                     boolean providerCanReviewClient = providerCanReviewClient(
-                            hasProviderAuthority, b.getStatus(), b.getClient() != null,
+                            hasProviderAuthority, b.getStatus(), b.isRateableByProvider(),
                             () -> alreadyReviewedByProvider.contains(b.getId()));
                     return BookingDetailResponse.from(
                             b, canReview, providerCanReviewClient,
@@ -1358,7 +1358,7 @@ public class BookingService {
      */
     private Set<UUID> resolveSalonPageProviderAuthority(UUID actorUserId, List<Booking> page) {
         List<Booking> candidates = page.stream()
-                .filter(b -> b.getClient() != null
+                .filter(b -> b.isRateableByProvider()
                         && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
                 .toList();
         if (candidates.isEmpty()) {
@@ -1881,7 +1881,7 @@ public class BookingService {
                     // field, because a client that maps it faithfully can never clear the CTA.
                     boolean providerCanReviewClient = providerCanReviewClient(
                             providerReview.withAuthority().contains(b.getId()),
-                            b.getStatus(), b.getClient() != null,
+                            b.getStatus(), b.isRateableByProvider(),
                             () -> providerReview.alreadyReviewed().contains(b.getId()));
                     return BookingDetailResponse.from(
                             b, canReview, providerCanReviewClient,
@@ -1956,7 +1956,7 @@ public class BookingService {
         // pre-filter, so the conjunct is load-bearing there) and for the mutation that proved a
         // listing test can never detect its removal.
         List<Booking> candidates = page.stream()
-                .filter(b -> b.getClient() != null
+                .filter(b -> b.isRateableByProvider()
                         && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
                 .toList();
         if (candidates.isEmpty()) {
@@ -4078,7 +4078,7 @@ public class BookingService {
         // by account id only. Before both locks, so a refused create never contends for them. An idempotent
         // replay of a still-active booking returns from createBooking before reaching here; a pre-block future
         // booking was DECLINED by the block (phase 398 user decision), so its retry is refused like a fresh create.
-        bookingBlockGuard.requireClientMayBook(master, clientId);
+        bookingBlockGuard.requireClientMayBook(master, client);
 
         // Client lock (salt 1) is always acquired BEFORE the master lock (salt 0) — the
         // deterministic global order that keeps the two lock classes deadlock-free (see

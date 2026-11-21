@@ -66,7 +66,8 @@ final class ClientListSql {
                    g.next_visit_at AS nextVisitAt, g.completed_visits AS completedVisits,
                    g.anchor_booking_id AS anchorBookingId, g.guest_name AS guestName,
                    g.guest_surname AS guestSurname, u.first_name AS firstName, u.last_name AS lastName,
-                   u.avatar_url AS avatarUrl, u.avg_rating AS avgRating, u.review_count AS reviewCount
+                   u.avatar_url AS avatarUrl, u.avg_rating AS avgRating, u.review_count AS reviewCount,
+                   CASE WHEN u.phone_verified_at IS NOT NULL THEN u.phone_number END AS verifiedPhone
               FROM grouped g
               LEFT JOIN users u ON u.id = g.client_id
             """;

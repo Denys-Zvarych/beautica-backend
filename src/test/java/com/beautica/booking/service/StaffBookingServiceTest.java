@@ -99,6 +99,8 @@ class StaffBookingServiceTest {
     private static final int BUFFER = 15;
 
     @Mock private com.beautica.master.repository.MasterRepository masterRepository;
+    @Mock private com.beautica.client.service.ClientPhoneAttachService clientPhoneAttachService;
+    @Mock private WalkInCreateBudget walkInCreateBudget;
     @Mock private MasterServiceRepository masterServiceRepository;
     @Mock private BookingRepository bookingRepository;
     @Mock private com.beautica.booking.repository.AppointmentRepository appointmentRepository;
@@ -155,7 +157,9 @@ class StaffBookingServiceTest {
                 salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
                 bookingSmsDispatcher(), new BookingSmsProperties(),
                 Clock.fixed(NOW, ZoneOffset.UTC), appointmentService, inAppNotificationService,
-                new GuestCancelUrlBuilder(CANCEL_BASE_URL), GuestCancelTokenCipherFixtures.testCipher());
+                new GuestCancelUrlBuilder(CANCEL_BASE_URL), GuestCancelTokenCipherFixtures.testCipher(),
+                clientPhoneAttachService, walkInCreateBudget);
+        org.mockito.Mockito.lenient().when(walkInCreateBudget.tryConsume(any())).thenReturn(true);
         // Lenient: rejection-path tests never reach the enrich() call, and MockitoExtension's
         // default STRICT_STUBS would otherwise flag this as an unnecessary stub for every one of
         // them. The return value is a placeholder — no test in this suite asserts on its content;
@@ -213,6 +217,33 @@ class StaffBookingServiceTest {
                             + "seam — see should_enrichWithHeaderAndSavedChain_when_visitCreated for "
                             + "the assertion that enrich is called with the real persisted state")
                     .isEqualTo(BookingStatus.CONFIRMED);
+        }
+
+        @Test
+        @DisplayName("B527: a walk-in whose phone is a client account's verified phone is ATTACHED — header and rows, no SMS")
+        void should_attachHeaderAndRowsAndSendNoSms_when_phoneBelongsToAClientAccount() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+            com.beautica.user.User account = org.mockito.Mockito.mock(com.beautica.user.User.class);
+            when(clientPhoneAttachService.findAccountUnderHeldLock(E164_PHONE)).thenReturn(Optional.of(account));
+
+            create(command(guest(RAW_PHONE)));
+
+            Booking saved = captureSaved();
+            verify(clientPhoneAttachService).attachNew(eq(account), eq(saved));
+            verify(clientPhoneAttachService).attachNew(eq(account), any(com.beautica.booking.entity.Appointment.class));
+            verifyNoInteractions(smsService);
+        }
+
+        @Test
+        @DisplayName("B527: with no account for the phone the walk-in stays a guest and the SMS goes out as before")
+        void should_keepGuestAndSendSms_when_noAccountOwnsThePhone() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            verify(clientPhoneAttachService, org.mockito.Mockito.never()).attachNew(any(com.beautica.user.User.class),
+                    any(Booking.class));
+            verify(smsService).send(eq(E164_PHONE), any(String.class));
         }
 
         @Test
@@ -868,7 +899,7 @@ class StaffBookingServiceTest {
                     salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
                     bookingSmsDispatcher(), properties, Clock.fixed(NOW, ZoneOffset.UTC), appointmentService,
                     inAppNotificationService, new GuestCancelUrlBuilder(CANCEL_BASE_URL),
-                    GuestCancelTokenCipherFixtures.testCipher());
+                    GuestCancelTokenCipherFixtures.testCipher(), clientPhoneAttachService, walkInCreateBudget);
             stubHappyPath(salonMaster(), assignment(null, null));
 
             create(command(guest(RAW_PHONE)));
@@ -1177,6 +1208,83 @@ class StaffBookingServiceTest {
 
             verify(bookingRepository).acquireWalkInPhoneLock(E164_PHONE);
             verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
+        }
+
+        @Test
+        @DisplayName("B527 audit HIGH: a registered client's phone trips the same 429 once the account's own STAFF visits "
+                + "reach the cap (attached rows carry client_id, not guest_phone)")
+        void should_throw429BeforeTheMasterLock_when_attachedAccountVisitsReachTheCap() {
+            stubMasterAndAssignment(salonMaster(), assignment(null, null));
+            stubStaffSlotAvailable(START);
+            com.beautica.user.User account = org.mockito.Mockito.mock(com.beautica.user.User.class);
+            UUID accountId = UUID.randomUUID();
+            when(account.getId()).thenReturn(accountId);
+            when(clientPhoneAttachService.findAccountUnderHeldLock(E164_PHONE)).thenReturn(Optional.of(account));
+            when(bookingRepository.countStaffWalkInVisitsForPhoneSince(eq(E164_PHONE), any())).thenReturn(0L);
+            when(bookingRepository.countStaffVisitsForClientSince(eq(accountId), any())).thenReturn(5L);
+
+            assertThatThrownBy(() -> create(command(guest(RAW_PHONE))))
+                    .isInstanceOfSatisfying(BusinessException.class,
+                            e -> assertThat(e.getStatus()).isEqualTo(org.springframework.http.HttpStatus.TOO_MANY_REQUESTS));
+
+            verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
+            verify(bookingRepository, never()).saveAll(any());
+        }
+
+        @Test
+        @DisplayName("B527 audit HIGH: a guest phone never pays the client-visit count")
+        void should_notCountClientVisits_when_noAccountOwnsThePhone() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            verify(bookingRepository, never()).countStaffVisitsForClientSince(any(), any());
+            verify(walkInCreateBudget).tryConsume(staffUserId);
+        }
+
+        @Test
+        @DisplayName("B527 audit MEDIUM: the per-actor walk-in create budget (30/h) spent -> 429, nothing created")
+        void should_throw429AndCreateNothing_when_actorWalkInCreateBudgetIsSpent() {
+            stubMasterAndAssignment(salonMaster(), assignment(null, null));
+            stubStaffSlotAvailable(START);
+            com.beautica.user.User account = org.mockito.Mockito.mock(com.beautica.user.User.class);
+            when(clientPhoneAttachService.findAccountUnderHeldLock(E164_PHONE)).thenReturn(Optional.of(account));
+            when(walkInCreateBudget.tryConsume(staffUserId)).thenReturn(false);
+
+            assertThatThrownBy(() -> create(command(guest(RAW_PHONE))))
+                    .isInstanceOfSatisfying(BusinessException.class,
+                            e -> assertThat(e.getStatus()).isEqualTo(org.springframework.http.HttpStatus.TOO_MANY_REQUESTS));
+
+            verify(bookingRepository, never()).saveAll(any());
+            verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
+            verify(clientPhoneAttachService, never()).attachNew(any(com.beautica.user.User.class), any(Booking.class));
+        }
+
+        @Test
+        @DisplayName("B527 audit cycle 2: budget spent -> 429 on an UNMATCHED phone too (the 429 carries no match signal)")
+        void should_throw429AndCreateNothing_when_actorBudgetIsSpentAndPhoneIsUnmatched() {
+            stubMasterAndAssignment(salonMaster(), assignment(null, null));
+            stubStaffSlotAvailable(START);
+            when(clientPhoneAttachService.findAccountUnderHeldLock(E164_PHONE)).thenReturn(Optional.empty());
+            when(walkInCreateBudget.tryConsume(staffUserId)).thenReturn(false);
+
+            assertThatThrownBy(() -> create(command(guest(RAW_PHONE))))
+                    .isInstanceOfSatisfying(BusinessException.class,
+                            e -> assertThat(e.getStatus()).isEqualTo(org.springframework.http.HttpStatus.TOO_MANY_REQUESTS));
+
+            verify(bookingRepository, never()).saveAll(any());
+        }
+
+        @Test
+        @DisplayName("B527 audit cycle 2: a request rejected by the per-phone cap burns no budget token")
+        void should_notChargeBudget_when_perPhoneCapRejects() {
+            stubMasterAndAssignment(salonMaster(), assignment(null, null));
+            stubStaffSlotAvailable(START);
+            when(bookingRepository.countStaffWalkInVisitsForPhoneSince(eq(E164_PHONE), any())).thenReturn(5L);
+
+            assertThatThrownBy(() -> create(command(guest(RAW_PHONE)))).isInstanceOf(BusinessException.class);
+
+            verify(walkInCreateBudget, never()).tryConsume(any());
         }
 
         @Test

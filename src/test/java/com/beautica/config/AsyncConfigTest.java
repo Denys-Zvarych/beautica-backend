@@ -1203,6 +1203,129 @@ class AsyncConfigTest {
     }
 
     /**
+     * B527 audit cycle 2 — the retroactive phone-attach pool. Pins the production wiring the test profile replaces
+     * with a {@code SyncTaskExecutor}: 2 threads, 100 queued, AbortPolicy (a rejected attach is left for the 30-min
+     * sweep), and a shutdown that DRAINS queued attaches (id-driven, idempotent work, finished rather than dropped).
+     */
+    @Nested
+    @DisplayName("clientPhoneAttachExecutor bean")
+    class ClientPhoneAttachExecutor {
+
+        private final ThreadPoolTaskExecutor bean = (ThreadPoolTaskExecutor) asyncConfig.clientPhoneAttachExecutor();
+        private final ThreadPoolExecutor pool = bean.getThreadPoolExecutor();
+
+        @AfterEach
+        void shutDownPool() {
+            pool.shutdownNow();
+        }
+
+        @Test
+        @DisplayName("clientPhoneAttachExecutor — two threads (core equals max), idle threads time out")
+        void should_useTwoThreadsWithCoreEqualMax_when_clientPhoneAttachExecutorBuilt() {
+            assertThat(pool.getCorePoolSize())
+                    .as("core below max on a bounded queue never grows until the queue is full")
+                    .isEqualTo(pool.getMaximumPoolSize())
+                    .isEqualTo(AsyncConfig.CLIENT_PHONE_ATTACH_POOL_SIZE)
+                    .isEqualTo(2);
+            assertThat(pool.allowsCoreThreadTimeOut()).as("a rare job must not park threads").isTrue();
+        }
+
+        @Test
+        @DisplayName("clientPhoneAttachExecutor — the queue is bounded at 100")
+        void should_boundTheQueueAtOneHundred_when_clientPhoneAttachExecutorBuilt() {
+            assertThat(pool.getQueue().remainingCapacity())
+                    .isEqualTo(AsyncConfig.CLIENT_PHONE_ATTACH_QUEUE_CAPACITY)
+                    .isEqualTo(100);
+        }
+
+        @Test
+        @DisplayName("clientPhoneAttachExecutor — saturation ABORTS; the attach never runs on the verifying request thread")
+        void should_useAbortPolicy_when_clientPhoneAttachExecutorSaturated() {
+            assertThat(pool.getRejectedExecutionHandler())
+                    .isInstanceOf(ThreadPoolExecutor.AbortPolicy.class)
+                    .isNotInstanceOf(ThreadPoolExecutor.CallerRunsPolicy.class)
+                    .isNotInstanceOf(AsyncConfig.CallerBlocksPolicy.class);
+        }
+
+        @Test
+        @DisplayName("clientPhoneAttachExecutor — the 103rd hand-off (2 running + 100 queued) is refused, not run inline")
+        void should_rejectHandOff_when_runningSlotsAndQueueAreFull() throws InterruptedException {
+            CountDownLatch running = new CountDownLatch(AsyncConfig.CLIENT_PHONE_ATTACH_POOL_SIZE);
+            CountDownLatch release = new CountDownLatch(1);
+            AtomicReference<Thread> overflowRanOn = new AtomicReference<>();
+            try {
+                for (int i = 0; i < AsyncConfig.CLIENT_PHONE_ATTACH_POOL_SIZE; i++) {
+                    bean.execute(() -> {
+                        running.countDown();
+                        awaitQuietly(release);
+                    });
+                }
+                assertThat(running.await(5, TimeUnit.SECONDS)).as("fixture: workers never started").isTrue();
+                for (int i = 0; i < AsyncConfig.CLIENT_PHONE_ATTACH_QUEUE_CAPACITY; i++) {
+                    bean.execute(() -> { });
+                }
+
+                assertThatThrownBy(() -> bean.execute(() -> overflowRanOn.set(Thread.currentThread())))
+                        .isInstanceOf(org.springframework.core.task.TaskRejectedException.class);
+                assertThat(overflowRanOn.get()).as("a refused hand-off must never run on the caller").isNull();
+            } finally {
+                release.countDown();
+            }
+        }
+
+        @Test
+        @DisplayName("clientPhoneAttachExecutor — shutdown DRAINS: a queued attach still runs to completion")
+        void should_drainQueuedAttaches_when_shutdownRequested() throws InterruptedException {
+            CountDownLatch running = new CountDownLatch(AsyncConfig.CLIENT_PHONE_ATTACH_POOL_SIZE);
+            CountDownLatch release = new CountDownLatch(1);
+            AtomicReference<Boolean> queuedRan = new AtomicReference<>(false);
+            for (int i = 0; i < AsyncConfig.CLIENT_PHONE_ATTACH_POOL_SIZE; i++) {
+                bean.execute(() -> {
+                    running.countDown();
+                    awaitQuietly(release);
+                });
+            }
+            assertThat(running.await(5, TimeUnit.SECONDS)).as("fixture: workers never started").isTrue();
+            bean.execute(() -> queuedRan.set(true));
+
+            Thread shutdown = Thread.ofPlatform().start(bean::shutdown);
+            release.countDown();
+            shutdown.join(5_000);
+
+            assertThat(pool.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(queuedRan.get())
+                    .as("waitForTasksToCompleteOnShutdown=true: queued attaches finish instead of being dropped")
+                    .isTrue();
+        }
+
+        @Test
+        @DisplayName("clientPhoneAttachExecutor — worker threads use the 'client-phone-attach-' name prefix")
+        void should_nameWorkerThreadsWithClientPhoneAttachPrefix_when_taskSubmitted() throws InterruptedException {
+            assertThat(captureWorkerThreadName(bean)).startsWith("client-phone-attach-");
+        }
+
+        @Test
+        @DisplayName("clientPhoneAttachExecutor — test-profile counterpart runs the attach inline on the caller thread")
+        void should_runInline_when_testProfileSyncClientPhoneAttachExecutorUsed() {
+            TaskExecutor sync = asyncConfig.syncClientPhoneAttachExecutor();
+            AtomicReference<Thread> ranOn = new AtomicReference<>();
+
+            sync.execute(() -> ranOn.set(Thread.currentThread()));
+
+            assertThat(sync).isInstanceOf(org.springframework.core.task.SyncTaskExecutor.class);
+            assertThat(ranOn.get()).isSameAs(Thread.currentThread());
+        }
+
+        private static void awaitQuietly(CountDownLatch latch) {
+            try {
+                latch.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
      * Phase 433 — the one-off «booking details» Telegram send after a fresh link ({@code LinkedBookingDetailsSender}).
      * Pins the production wiring the test profile replaces with a {@code SyncTaskExecutor}: one send at a time, a
      * small bounded backlog, AbortPolicy (never the scheduler thread), and no shutdown drain (accepted loss).

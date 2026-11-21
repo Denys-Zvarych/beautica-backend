@@ -53,6 +53,7 @@ class ProviderClientControllerIT extends AbstractIntegrationTest {
     @Autowired private PhoneHasher phoneHasher;
     @Autowired private ClientReviewRepository clientReviewRepository;
     @Autowired private TransactionTemplate transactionTemplate;
+    @Autowired private com.beautica.client.service.ClientPhoneAttachService attachService;
     @Autowired private EntityManagerFactory entityManagerFactory;
 
     private ProviderClientFixtures fx;
@@ -94,8 +95,41 @@ class ProviderClientControllerIT extends AbstractIntegrationTest {
     // ── cases ────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("1/2: registered, merged guest and a same-phone account are three rows; a 3-service visit counts once")
-    void should_listThreeRows_when_guestAndAccountShareAPhone() throws Exception {
+    @DisplayName("1/2 (B527 — was: never merged): a same-phone VERIFIED account takes the attached guest rows — two rows, the account row counts all its visits")
+    void should_listTwoRows_when_guestRowsAreAttachedToTheAccount() throws Exception {
+        Salon s = fx.salon();
+        UUID r1 = fx.client("Анна", "Коваль");
+        fx.booking(s.masterId(), s.salonId(), r1, "COMPLETED", fx.at(-20));
+        UUID visit = fx.appointment(r1, s.salonId());
+        fx.bookingInVisit(s.masterId(), s.salonId(), r1, "COMPLETED", fx.at(-10), visit);
+        fx.bookingInVisit(s.masterId(), s.salonId(), r1, "COMPLETED", fx.at(-10), visit);
+        fx.bookingInVisit(s.masterId(), s.salonId(), r1, "COMPLETED", fx.at(-10), visit);
+        fx.guestBooking(s.masterId(), s.salonId(), "LINK", GUEST_PHONE, "Іванна", "Коваль", "COMPLETED", fx.at(-8));
+        fx.guestBooking(s.masterId(), s.salonId(), "STAFF", GUEST_PHONE, "Іванна", "Коваль", "COMPLETED", fx.at(-6));
+        UUID r2 = fx.client("Петро", "Сидоренко");
+        jdbcTemplate.update("UPDATE users SET phone_number = ?, phone_verified_at = NOW() WHERE id = ?", GUEST_PHONE, r2);
+        fx.booking(s.masterId(), s.salonId(), r2, "COMPLETED", fx.at(-4));
+        transactionTemplate.executeWithoutResult(st -> attachService.attachByPhone(GUEST_PHONE,
+                com.beautica.booking.enums.AttachReason.PHONE_VERIFIED));
+
+        List<JsonNode> rows = rows(salonList(fx.token(s.ownerEmail()), s.salonId(), null));
+
+        assertThat(rows).hasSize(2);
+        assertThat(rows.stream().filter(r -> "GUEST".equals(r.path("kind").asText()))).isEmpty();
+        JsonNode anna = byName(rows, "Анна Коваль");
+        assertThat(anna.path("completedVisits").asInt()).as("1 single + 1 three-service visit").isEqualTo(2);
+        assertThat(anna.path("userId").asText()).isEqualTo(r1.toString());
+        JsonNode petro = byName(rows, "Петро Сидоренко");
+        assertThat(petro.path("completedVisits").asInt()).as("1 app + the attached LINK + STAFF").isEqualTo(3);
+        assertThat(petro.path("userId").asText()).isEqualTo(r2.toString());
+        assertThat(json(salonList(fx.token(s.ownerEmail()), s.salonId(), null)).path("data").path("totalElements")
+                .asLong()).isEqualTo(2);
+    }
+
+
+    @Test
+    @DisplayName("1/2b: an UNVERIFIED same-phone account never takes the guest rows — registered, guest and account are three rows; a 3-service visit counts once")
+    void should_listThreeRows_when_accountPhoneIsNotVerified() throws Exception {
         Salon s = fx.salon();
         UUID r1 = fx.client("Анна", "Коваль");
         fx.booking(s.masterId(), s.salonId(), r1, "COMPLETED", fx.at(-20));

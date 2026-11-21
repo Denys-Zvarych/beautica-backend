@@ -10,11 +10,14 @@ import com.beautica.booking.domain.GuestConfirmationSmsText;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
 import com.beautica.notification.telegram.link.GuestTelegramLinkService;
+import com.beautica.notification.telegram.link.dto.TelegramAvailability;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.crypto.GuestCancelTokenCipher;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.client.service.ClientPhoneAttachService;
+import com.beautica.user.User;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
@@ -97,6 +100,11 @@ public class GuestBookingService {
     private final BookingBlockGuard bookingBlockGuard;
     /** Phase 407 D6 — the {@code telegram} block of the create response (read only; never issues a link token). */
     private final GuestTelegramLinkService guestTelegramLinkService;
+    /**
+     * B527 — resolves the CLIENT account that owns the OTP-verified phone (under the per-phone lock) so the booking is
+     * created attached to it (CLI-62, GST-82).
+     */
+    private final ClientPhoneAttachService clientPhoneAttachService;
     /** The create transaction (replaces the former {@code @Transactional} on the two create methods, phase 407 audit). */
     private final TransactionTemplate bookingTx;
 
@@ -121,6 +129,7 @@ public class GuestBookingService {
             GuestTokenBookingCap guestTokenBookingCap,
             BookingBlockGuard bookingBlockGuard,
             GuestTelegramLinkService guestTelegramLinkService,
+            ClientPhoneAttachService clientPhoneAttachService,
             PlatformTransactionManager transactionManager) {
         this.guestTokenProvider = guestTokenProvider;
         this.masterRepository = masterRepository;
@@ -142,6 +151,7 @@ public class GuestBookingService {
         this.guestTokenBookingCap = guestTokenBookingCap;
         this.bookingBlockGuard = bookingBlockGuard;
         this.guestTelegramLinkService = guestTelegramLinkService;
+        this.clientPhoneAttachService = clientPhoneAttachService;
         this.bookingTx = new TransactionTemplate(transactionManager);
     }
 
@@ -336,14 +346,22 @@ public class GuestBookingService {
      */
     private GuestBookingResponse createThenAttachTelegram(Supplier<CreatedGuestBooking> create) {
         CreatedGuestBooking created = Objects.requireNonNull(bookingTx.execute(status -> create.get()));
+        if (created.attached()) {
+            // B527 (GST-82): an attached booking follows the registered-client path — no SMS, no Telegram. The
+            // availability read is skipped (never offer a Telegram link for a phone that is a client account's).
+            return created.response().withTelegram(TelegramAvailability.UNAVAILABLE);
+        }
         return created.response().withTelegram(guestTelegramLinkService.availabilityForPhone(created.guestPhone()));
     }
 
-    /** The committed create result plus the OTP-verified phone the D6 read needs; never leaves this class. */
-    private record CreatedGuestBooking(GuestBookingResponse response, String guestPhone) {
+    /**
+     * The committed create result plus the OTP-verified phone the D6 read needs and whether the booking was attached to
+     * a client account (B527); never leaves this class.
+     */
+    private record CreatedGuestBooking(GuestBookingResponse response, String guestPhone, boolean attached) {
         @Override
         public String toString() {
-            return "CreatedGuestBooking[response=" + response + ", guestPhone=<redacted>]";
+            return "CreatedGuestBooking[response=" + response + ", guestPhone=<redacted>, attached=" + attached + "]";
         }
     }
 
@@ -366,10 +384,18 @@ public class GuestBookingService {
         BookingStartsAtValidator.validate(req.startsAt(), kyivClock);
 
         Master master = masterResolver.get();
+        // B527 (CLI-62, GST-82) — the per-phone lock, then the CLIENT account that owns this verified phone, if any.
+        // Taken here so a verification racing this create either sees this row (and attaches it) or committed first
+        // (and this lookup sees the account). Lock order phone -> master: no master lock is taken before this point.
+        User account = clientPhoneAttachService.lockAndFindAccount(guestPhone).orElse(null);
         // Phase 398 D2 — provider block gate on the phone the guest token proves (never request-body data); scope
         // from the TARGET master. At create, not OTP verify: verify carries no provider context and would turn
         // into a "blocked anywhere?" probe. Before every slot check, lock and side effect; the per-token cap
-        // reserved above is released by this transaction's rollback.
+        // reserved above is released by this transaction's rollback. B527 D7: an attached person is refused when
+        // EITHER the account (or its verified-phone hash) OR the guest phone hash is blocked (MOD-29).
+        if (account != null) {
+            bookingBlockGuard.requireClientMayBook(master, account);
+        }
         bookingBlockGuard.requireGuestMayBook(master, guestPhone);
 
         // BE-7: a masterServiceIds list (even a single element) is a multi-service VISIT — ONE Appointment
@@ -378,14 +404,14 @@ public class GuestBookingService {
         // one of the two must be supplied; the DTO cannot express that XOR, so it is enforced here.
         GuestBookingResponse response;
         if (req.masterServiceIds() != null && !req.masterServiceIds().isEmpty()) {
-            response = createGuestVisit(master, req, req.masterServiceIds(), guestPhone);
+            response = createGuestVisit(master, req, req.masterServiceIds(), guestPhone, account);
         } else if (req.serviceId() == null) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "serviceId or masterServiceIds is required");
         } else {
-            response = createSingleServiceBooking(master, req, guestPhone);
+            response = createSingleServiceBooking(master, req, guestPhone, account);
         }
         // Phase 407 D6 — the telegram block is attached after commit by createThenAttachTelegram.
-        return new CreatedGuestBooking(response, guestPhone);
+        return new CreatedGuestBooking(response, guestPhone, account != null);
     }
 
     /**
@@ -394,7 +420,7 @@ public class GuestBookingService {
      * master, and — after commit — sends the confirmation SMS and evicts the slot caches.
      */
     private GuestBookingResponse createSingleServiceBooking(
-            Master master, GuestBookingRequest req, String guestPhone) {
+            Master master, GuestBookingRequest req, String guestPhone, User account) {
         // findByMasterIdAndIdWithGraph filters WHERE ms.master.id = :masterId, so an
         // empty result means the service does not belong to this master (or does not
         // exist) — this IS the service-ownership check.
@@ -417,7 +443,7 @@ public class GuestBookingService {
         BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
                 slotCalculationService, master.getId(), msa.getId(), msa, req.startsAt());
 
-        Booking saved = persistBooking(master, msa, req, guestPhone);
+        Booking saved = persistBooking(master, msa, req, guestPhone, account);
 
         outboxService.enqueueNewBooking(saved.getId());
         // Phase 333, matrix row 1 — provider set (owner + admins + performing master); the guest has
@@ -427,9 +453,9 @@ public class GuestBookingService {
         inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_CREATED, saved, null);
 
         String cancelUrl = guestCancelUrlBuilder.build(saved.getCancelToken());
-        registerAfterCommit(master, saved, guestPhone, cancelUrl);
+        registerAfterCommit(master, saved, account == null ? guestPhone : null, cancelUrl);
 
-        return buildResponse(master, msa, saved, cancelUrl);
+        return buildResponse(master, msa, saved, cancelUrl, account != null);
     }
 
     /**
@@ -448,7 +474,7 @@ public class GuestBookingService {
      * surfaced; the guest holds only the visit-level token on the header, which cancels ALL items.
      */
     private GuestBookingResponse createGuestVisit(
-            Master master, GuestBookingRequest req, List<UUID> serviceIds, String guestPhone) {
+            Master master, GuestBookingRequest req, List<UUID> serviceIds, String guestPhone, User account) {
         OffsetDateTime firstStart = req.startsAt();
         List<VisitPlanner.PlannedItem> items = visitPlanner.planChainedItems(master, serviceIds, firstStart);
         OffsetDateTime lastEnd = items.get(items.size() - 1).endsAt();
@@ -480,6 +506,10 @@ public class GuestBookingService {
         Appointment appointment = Appointment.guestAppointment(
                 master.getSalon(), req.name(), req.surname(), guestPhone, cancelToken, consent,
                 BookingComments.normalize(req.clientComment()));
+        if (account != null) {
+            // B527 (CLI-62): the header and EVERY row of the visit attach together (one phone, one account).
+            clientPhoneAttachService.attachNew(account, appointment);
+        }
 
         List<Booking> children = new ArrayList<>(items.size());
         for (VisitPlanner.PlannedItem item : items) {
@@ -488,6 +518,9 @@ public class GuestBookingService {
                     item.startsAt(), item.endsAt(), item.price(), item.priceMax(),
                     item.duration(), item.buffer(), req.name(), req.surname(), guestPhone, consent);
             child.setAppointment(appointment);
+            if (account != null) {
+                clientPhoneAttachService.attachNew(account, child);
+            }
             children.add(child);
         }
 
@@ -515,8 +548,8 @@ public class GuestBookingService {
                 InAppNotificationType.BOOKING_CREATED, appointment.getId(), saved.get(0), null);
 
         String cancelUrl = guestCancelUrlBuilder.build(cancelToken);
-        registerVisitAfterCommit(master, saved.get(0), guestPhone, cancelUrl);
-        return buildVisitResponse(master, appointment, saved.get(0), items, cancelUrl);
+        registerVisitAfterCommit(master, saved.get(0), account == null ? guestPhone : null, cancelUrl);
+        return buildVisitResponse(master, appointment, saved.get(0), items, cancelUrl, account != null);
     }
 
     private GuestTokenProvider.GuestTokenClaims extractGuestClaims(String bearerToken) {
@@ -542,7 +575,7 @@ public class GuestBookingService {
      * connections on the same master's advisory lock.
      */
     private Booking persistBooking(Master master, MasterServiceAssignment msa,
-                                   GuestBookingRequest req, String guestPhone) {
+                                   GuestBookingRequest req, String guestPhone, User account) {
         ServiceDefinition def = msa.getServiceDefinition();
         BigDecimal price = msa.getPriceOverride() != null ? msa.getPriceOverride() : def.getBasePrice();
         int duration = msa.getDurationOverrideMinutes() != null
@@ -571,6 +604,9 @@ public class GuestBookingService {
                 price, BookingPriceRange.resolveCeiling(msa),
                 duration, buffer, req.name(), req.surname(), guestPhone, consentOf(req),
                 BookingComments.normalize(req.clientComment()));
+        if (account != null) {
+            clientPhoneAttachService.attachNew(account, booking);
+        }
         Booking saved = BookingSlotLockGuard.saveOrConflict(bookingRepository, booking);
         // Phase 435 — the reversible copy beside the hash (V230), so later guest SMS can link this booking's page.
         // Audit-fix: sealed AFTER the persist, because the AES-GCM associated data is the row id ("bookings:<id>"),
@@ -589,8 +625,9 @@ public class GuestBookingService {
         return new GuestConsent(kyivClock.instant(), req.privacyPolicyVersion());
     }
 
-    private void registerAfterCommit(Master master, Booking saved, String guestPhone, String cancelUrl) {
-        String smsText = buildConfirmationSms(saved, cancelUrl);
+    /** {@code smsPhone} is {@code null} for an attached booking (B527 GST-82): eviction only, no SMS / Telegram. */
+    private void registerAfterCommit(Master master, Booking saved, String smsPhone, String cancelUrl) {
+        String smsText = smsPhone == null ? null : buildConfirmationSms(saved, cancelUrl);
         // Capture the salon id inside the transaction (before the afterCommit callback runs) —
         // null for an independent master (no salon catalogue entry).
         UUID salonId = saved.getSalon() != null ? saved.getSalon().getId() : null;
@@ -613,8 +650,10 @@ public class GuestBookingService {
             if (salonId != null) {
                 salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
-            bookingSmsDispatcher.dispatch(
-                    BookingSmsDispatcher.Kind.GUEST_CONFIRMATION, guestPhone, smsText);
+            if (smsPhone != null) {
+                bookingSmsDispatcher.dispatch(
+                        BookingSmsDispatcher.Kind.GUEST_CONFIRMATION, smsPhone, smsText);
+            }
         };
         BookingAfterCommit.run(task);
     }
@@ -627,9 +666,9 @@ public class GuestBookingService {
      * {@link SlotCalculationService#evictMasterAvailabilityCaches} subsumes the per-{@code (date,
      * service)} key set this method used to enumerate; the salon catalogue is evicted once.
      */
-    private void registerVisitAfterCommit(Master master, Booking firstSaved, String guestPhone,
+    private void registerVisitAfterCommit(Master master, Booking firstSaved, String smsPhone,
                                           String cancelUrl) {
-        String smsText = buildConfirmationSms(firstSaved, cancelUrl);
+        String smsText = smsPhone == null ? null : buildConfirmationSms(firstSaved, cancelUrl);
         UUID salonId = master.getSalon() != null ? master.getSalon().getId() : null;
         Runnable task = () -> {
             // Eviction first, send second — see registerAfterCommit for why this order is
@@ -638,8 +677,10 @@ public class GuestBookingService {
             if (salonId != null) {
                 salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
-            bookingSmsDispatcher.dispatch(
-                    BookingSmsDispatcher.Kind.GUEST_CONFIRMATION, guestPhone, smsText);
+            if (smsPhone != null) {
+                bookingSmsDispatcher.dispatch(
+                        BookingSmsDispatcher.Kind.GUEST_CONFIRMATION, smsPhone, smsText);
+            }
         };
         BookingAfterCommit.run(task);
     }
@@ -668,14 +709,17 @@ public class GuestBookingService {
     }
 
     private GuestBookingResponse buildResponse(Master master, MasterServiceAssignment msa,
-                                               Booking saved, String cancelUrl) {
+                                               Booking saved, String cancelUrl, boolean attached) {
         return new GuestBookingResponse(
                 saved.getId(),
+                null,
                 saved.getStartsAt(),
                 masterName(master),
                 msa.getServiceDefinition().getName(),
                 saved.getDurationMinutesAtBooking(),
-                cancelUrl);
+                cancelUrl,
+                null,
+                attached);
     }
 
     /**
@@ -686,7 +730,7 @@ public class GuestBookingService {
      */
     private GuestBookingResponse buildVisitResponse(Master master, Appointment appointment,
                                                     Booking firstSaved, List<VisitPlanner.PlannedItem> items,
-                                                    String cancelUrl) {
+                                                    String cancelUrl, boolean attached) {
         int totalDuration = items.stream().mapToInt(VisitPlanner.PlannedItem::duration).sum();
         return new GuestBookingResponse(
                 firstSaved.getId(),
@@ -695,7 +739,9 @@ public class GuestBookingService {
                 masterName(master),
                 items.get(0).masterService().getServiceDefinition().getName(),
                 totalDuration,
-                cancelUrl);
+                cancelUrl,
+                null,
+                attached);
     }
 
     // V157 / phase 294 D3: displayFirstName()/displayLastName(), never getUser().getFirstName().

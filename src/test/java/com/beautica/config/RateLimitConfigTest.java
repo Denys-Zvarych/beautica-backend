@@ -48,6 +48,8 @@ class RateLimitConfigTest {
     // can reference the real MAX_CONFLICTS_PER_WRITE constant directly (same package) against a real
     // RateLimitConfig-built bucket.
     private static final long SCHEDULE_OVERRIDE_DECLINE_BUDGET_CAPACITY = 1500L;
+    // B527 fix round — per-staff-actor walk-in walk-in create budget (30/hour).
+    private static final long STAFF_WALK_IN_CREATE_CAPACITY = 30L;
 
     private RateLimitConfig config;
 
@@ -61,6 +63,7 @@ class RateLimitConfigTest {
         ReflectionTestUtils.setField(config, "changePasswordOtpCapacity", CHANGE_PASSWORD_OTP_CAPACITY);
         ReflectionTestUtils.setField(
                 config, "scheduleOverrideDeclineBudgetCapacity", SCHEDULE_OVERRIDE_DECLINE_BUDGET_CAPACITY);
+        ReflectionTestUtils.setField(config, "staffWalkInCreateCapacity", STAFF_WALK_IN_CREATE_CAPACITY);
     }
 
     @Test
@@ -136,6 +139,26 @@ class RateLimitConfigTest {
         assertThat(bucket.tryConsume(1))
                 .as("the 4th change-password-otp request within the window must be throttled")
                 .isFalse();
+    }
+
+    @Test
+    @DisplayName("should_allowExactlyStaffWalkInCreateCapacityThenThrottle_per_actor_when_1HourWindow (31st create/hour gets 429)")
+    void should_allowExactlyStaffWalkInCreateCapacityThenThrottle_per_actor_when_1HourWindow() {
+        LoadingCache<String, Bucket> buckets = config.staffWalkInCreateBuckets();
+        Bucket bucket = buckets.get("staff-actor-a");
+
+        for (int i = 0; i < STAFF_WALK_IN_CREATE_CAPACITY; i++) {
+            assertThat(bucket.tryConsume(1))
+                    .as("walk-in create %d of %d must be permitted", i + 1, STAFF_WALK_IN_CREATE_CAPACITY)
+                    .isTrue();
+        }
+
+        assertThat(bucket.tryConsume(1))
+                .as("the 31st walk-in create within the hour must be throttled")
+                .isFalse();
+        assertThat(buckets.get("staff-actor-b").tryConsume(1))
+                .as("another staff actor has its own bucket")
+                .isTrue();
     }
 
     @Test

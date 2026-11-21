@@ -665,4 +665,32 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                AND client_id IS NULL
             """, nativeQuery = true)
     int cancelGuestVisitById(@Param("id") UUID id);
+
+    /**
+     * B527 (CLI-62) — header twin of {@link BookingRepository#attachGuestRowsByPhone}: the visit headers go first, then
+     * the rows (a header and its rows always share one phone), inside the caller's transaction and under the same
+     * per-phone lock. Same predicate; {@code guest_phone} cleared on the header too.
+     *
+     * @return headers attached
+     */
+    @org.springframework.data.jpa.repository.Modifying(flushAutomatically = true)
+    @org.springframework.data.jpa.repository.Query(value = """
+            UPDATE appointments
+               SET client_id = :clientId,
+                   client_linked_at = :at,
+                   client_link_reason = :reason,
+                   guest_phone = NULL,
+                   cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
+                   updated_at = :at
+             WHERE client_id IS NULL
+               AND guest_phone = :phone
+               AND guest_pii_anonymised_at IS NULL
+               AND client_detached_at IS NULL
+               AND booking_source IN ('LINK', 'STAFF')
+            """, nativeQuery = true)
+    int attachGuestVisitsByPhone(@org.springframework.data.repository.query.Param("phone") String phone,
+                                 @org.springframework.data.repository.query.Param("clientId") java.util.UUID clientId,
+                                 @org.springframework.data.repository.query.Param("reason") String reason,
+                                 @org.springframework.data.repository.query.Param("at") java.time.Instant at);
 }

@@ -776,7 +776,12 @@ class StaffBookingIT extends AbstractIntegrationTest {
         // CREATE_FIXED_STATEMENTS + 1 there -- this ledger does not duplicate it. Fixed, not per-item:
         // this and its N=10 sibling below moved together, 16 to 14, so the anti-N+1 property the pair
         // exists to pin is unaffected.
-        private static final long CREATE_FIXED_STATEMENTS = 14L;
+        //
+        // Re-baselined (B527, one client identity by phone), 14 -> 15: the walk-in create resolves the CLIENT account that
+        // owns the guest phone ({@code UserRepository#findAttachableClientByVerifiedPhone}) so it can attach the visit
+        // (ONE fixed SELECT, never per item). The per-phone lock that makes it race-safe is the one the SMS budget check
+        // already takes (not a second round trip). The N=10 sibling moves with it, so the anti-N+1 property is unchanged.
+        private static final long CREATE_FIXED_STATEMENTS = 15L;
 
         /**
          * Per-CHAINED-ITEM cost: <b>ZERO</b>. Adding a service to the visit must not add a single

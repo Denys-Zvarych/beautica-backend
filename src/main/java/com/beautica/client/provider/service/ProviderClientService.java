@@ -67,13 +67,13 @@ public class ProviderClientService {
     private record ClientRow(
             UUID clientId, String guestPhone, Instant lastVisitAt, Instant nextVisitAt,
             long completedVisits, UUID anchorBookingId, String guestName, String guestSurname, String firstName,
-            String lastName, String avatarUrl, BigDecimal avgRating, int reviewCount) {
+            String lastName, String avatarUrl, BigDecimal avgRating, int reviewCount, String verifiedPhone) {
 
         static ClientRow of(ClientListRowProjection p) {
             return new ClientRow(p.getClientId(), p.getGuestPhone(), p.getLastVisitAt(), p.getNextVisitAt(),
                     p.getCompletedVisits() == null ? 0 : p.getCompletedVisits(), p.getAnchorBookingId(),
                     p.getGuestName(), p.getGuestSurname(), p.getFirstName(), p.getLastName(), p.getAvatarUrl(),
-                    p.getAvgRating(), p.getReviewCount() == null ? 0 : p.getReviewCount());
+                    p.getAvgRating(), p.getReviewCount() == null ? 0 : p.getReviewCount(), p.getVerifiedPhone());
         }
 
         boolean registered() {
@@ -127,6 +127,11 @@ public class ProviderClientService {
             HashedPhone phone = null;
             if (row.registered()) {
                 userIds.add(row.clientId());
+                // B527 D7: the account's verified-phone hash also blocks the person (one person, one answer).
+                phone = row.verifiedPhone() == null ? null : phoneHasher.tryHash(row.verifiedPhone()).orElse(null);
+                if (phone != null) {
+                    phones.add(phone);
+                }
             } else if (row.guestPhone() != null) {
                 phone = phoneHasher.tryHash(row.guestPhone()).orElse(null);
                 if (phone != null) {
@@ -140,9 +145,8 @@ public class ProviderClientService {
         for (int i = 0; i < rows.size(); i++) {
             ClientRow row = rows.get(i);
             HashedPhone phone = rowPhones.get(i);
-            boolean isBlocked = row.registered()
-                    ? blocked.isUserBlocked(row.clientId())
-                    : phone != null && blocked.isPhoneBlocked(phone);
+            boolean phoneBlocked = phone != null && blocked.isPhoneBlocked(phone);
+            boolean isBlocked = row.registered() ? blocked.isUserBlocked(row.clientId()) || phoneBlocked : phoneBlocked;
             out.add(toResponse(row, isBlocked));
         }
         return out;
@@ -191,8 +195,12 @@ public class ProviderClientService {
                 toInt(row.getCompletedVisits()), toInt(row.getUpcomingVisits()));
         return switch (ref) {
             case Registered(UUID userId) -> {
-                boolean blocked = clientBlockService.blockedAmong(scope.blockScope(), List.of(userId), List.of())
-                        .isUserBlocked(userId);
+                // B527 D7: account row OR the hash of the account's verified phone (one blockedAmong statement).
+                HashedPhone verified = row.getVerifiedPhone() == null
+                        ? null : phoneHasher.tryHash(row.getVerifiedPhone()).orElse(null);
+                BlockedAmong among = clientBlockService.blockedAmong(scope.blockScope(), List.of(userId),
+                        verified == null ? List.of() : List.of(verified));
+                boolean blocked = among.isUserBlocked(userId) || (verified != null && among.isPhoneBlocked(verified));
                 int ratingCount = row.getReviewCount() == null ? 0 : row.getReviewCount();
                 // B526: distribution = one grouped query, only when there is something to count (D2 shared compute)
                 List<RatingBucket> distribution = ratingCount > 0

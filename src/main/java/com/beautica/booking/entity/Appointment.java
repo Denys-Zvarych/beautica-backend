@@ -3,6 +3,7 @@ package com.beautica.booking.entity;
 import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.GuestConsent;
+import com.beautica.booking.enums.AttachReason;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
@@ -32,6 +33,7 @@ import org.hibernate.annotations.DynamicUpdate;
 import org.springframework.lang.Nullable;
 
 import java.time.Instant;
+import java.util.Objects;
 import java.util.UUID;
 
 /**
@@ -252,6 +254,32 @@ public class Appointment extends AuditableEntity {
         this.guestSurname = null;
         this.client = null;
         this.clientDetachedAt = at;
+        if (clientLinkReason != null) {
+            // B527 (CLI-66): see Booking#detachClient — the DETACHED arm requires cancel_token_hash NULL.
+            this.cancelTokenHash = null;
+            this.cancelTokenSealed = null;
+        }
+    }
+
+    // ── Phone attach (V260, phase 527) — header twin of the Booking columns ──
+    @Nullable
+    @Column(name = "client_linked_at")
+    private Instant clientLinkedAt;
+
+    @Nullable
+    @Enumerated(EnumType.STRING)
+    @Column(name = "client_link_reason", length = 16)
+    private AttachReason clientLinkReason;
+
+    /** Header twin of {@link Booking#attachToClient}; a NEW header, before its first persist. */
+    public void attachToClient(User account, AttachReason reason, Instant at) {
+        if (bookingSource == BookingSource.APP) {
+            throw new IllegalStateException("An APP visit is never attached by phone");
+        }
+        this.client = Objects.requireNonNull(account, "account");
+        this.clientLinkReason = Objects.requireNonNull(reason, "reason");
+        this.clientLinkedAt = Objects.requireNonNull(at, "at");
+        this.guestPhone = null;
     }
 
     /**

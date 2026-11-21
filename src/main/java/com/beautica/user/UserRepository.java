@@ -63,6 +63,20 @@ public interface UserRepository extends JpaRepository<User, UUID>, TransactionLo
     @Query("SELECT COUNT(u) > 0 FROM User u WHERE u.phoneNumber = :phone AND u.phoneVerifiedAt IS NOT NULL")
     boolean existsByVerifiedPhone(@Param("phone") String phoneE164);
 
+    /**
+     * B527 (CLI-62, D6) — the account a guest / walk-in phone attaches to: an ACTIVE CLIENT whose VERIFIED phone equals
+     * {@code phoneE164}. An unverified legacy {@code phone_number} never matches and no provider account ever does.
+     * Same partial unique index as {@link #findByVerifiedPhone}, so at most one row. The one predicate shared by the
+     * booking-time lookup and the retroactive attach ({@code ClientPhoneAttachService}); V261 mirrors it in SQL.
+     */
+    @Query("SELECT u FROM User u WHERE u.phoneNumber = :phone AND u.phoneVerifiedAt IS NOT NULL "
+            + "AND u.role = com.beautica.auth.Role.CLIENT AND u.isActive = true")
+    Optional<User> findAttachableClientByVerifiedPhone(@Param("phone") String phoneE164);
+
+    /** B527 (D7) — the account's VERIFIED phone (E.164), empty for an unverified / absent phone. PK lookup. */
+    @Query("SELECT u.phoneNumber FROM User u WHERE u.id = :userId AND u.phoneVerifiedAt IS NOT NULL")
+    Optional<String> findVerifiedPhoneById(@Param("userId") UUID userId);
+
     /** B516 (AUTH-44) — another verified account holds {@code phoneE164}; same index as {@link #findByVerifiedPhone}. */
     @Query("SELECT COUNT(u) > 0 FROM User u WHERE u.phoneNumber = :phone AND u.phoneVerifiedAt IS NOT NULL "
             + "AND u.id <> :userId")

@@ -50,6 +50,7 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
     @Autowired private PhoneHasher phoneHasher;
     @Autowired private ClientReviewRepository clientReviewRepository;
     @Autowired private TransactionTemplate transactionTemplate;
+    @Autowired private com.beautica.client.service.ClientPhoneAttachService attachService;
     @Autowired private EntityManagerFactory entityManagerFactory;
 
     private ProviderClientFixtures fx;
@@ -447,8 +448,35 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("16: a LINK guest and a registered account sharing one phone are two cards with disjoint counts")
-    void should_keepCardsApart_when_guestAndAccountShareAPhone() throws Exception {
+    @DisplayName("16 (B527 — was: never merged): a LINK guest / STAFF walk-in and a registered account sharing one "
+            + "VERIFIED phone are ONE card; the old guest anchor is the uniform 404")
+    void should_showOneCard_when_guestRowsShareTheAccountsVerifiedPhone() throws Exception {
+        Salon s = fx.salon();
+        UUID account = fx.client("Петро", "Спільний");
+        jdbcTemplate.update("UPDATE users SET phone_number = ?, phone_verified_at = NOW() WHERE id = ?",
+                GUEST_PHONE, account);
+        fx.booking(s.masterId(), s.salonId(), account, "COMPLETED", fx.at(-9));
+        fx.booking(s.masterId(), s.salonId(), account, "COMPLETED", fx.at(-8));
+        fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Петро", "Гість", "COMPLETED", fx.at(-7));
+        fx.guestBooking(s.masterId(), s.salonId(), "STAFF", GUEST_PHONE, "Петро", "Гість", "COMPLETED", fx.at(-6));
+        UUID anchor = fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Петро", "Гість", "COMPLETED", fx.at(-5));
+        transactionTemplate.executeWithoutResult(st -> attachService.attachByPhone(GUEST_PHONE,
+                com.beautica.booking.enums.AttachReason.PHONE_VERIFIED));
+        String token = fx.token(s.ownerEmail());
+
+        JsonNode user = ok(fx.get(token, userCard(s.salonId(), account)));
+        ResponseEntity<String> staleGuest = fx.get(token, guestCard(s.salonId(), anchor));
+
+        assertThat(user.path("kind").asText()).isEqualTo("REGISTERED");
+        assertThat(user.path("stats").path("totalVisits").asInt()).as("2 app + 3 attached").isEqualTo(5);
+        assertThat(user.path("phone").asText()).as("the verified phone is the account's (B518)").isEqualTo(GUEST_PHONE);
+        assertThat(visitRows(fx.get(token, userCard(s.salonId(), account) + "/visits"))).hasSize(5);
+        assertNotFound(staleGuest);
+    }
+
+    @Test
+    @DisplayName("16b: the SAME phone as an UNVERIFIED legacy users.phone_number never attaches — two cards, disjoint counts")
+    void should_keepCardsApart_when_accountPhoneIsNotVerified() throws Exception {
         Salon s = fx.salon();
         UUID account = fx.client("Петро", "Спільний");
         jdbcTemplate.update("UPDATE users SET phone_number = ? WHERE id = ?", GUEST_PHONE, account);
@@ -457,6 +485,8 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
         fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Петро", "Гість", "COMPLETED", fx.at(-7));
         fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Петро", "Гість", "COMPLETED", fx.at(-6));
         UUID anchor = fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Петро", "Гість", "COMPLETED", fx.at(-5));
+        transactionTemplate.executeWithoutResult(st -> attachService.attachByPhone(GUEST_PHONE,
+                com.beautica.booking.enums.AttachReason.PHONE_VERIFIED));
         String token = fx.token(s.ownerEmail());
 
         JsonNode user = ok(fx.get(token, userCard(s.salonId(), account)));
