@@ -25,6 +25,7 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.service.InAppNotificationService;
+import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
@@ -137,6 +138,11 @@ import java.util.UUID;
  * user-decided 2026-09-28) — see {@link #registerInAppFeedNotification}. This is a SEPARATE seam
  * from the outbox untouched above (see {@code InAppNotificationService}'s class javadoc); it does not
  * revisit the "no outbox" decision this section otherwise still describes.
+ *
+ * <p><b>B527 exception — the attached client's receipt email.</b> A walk-in attached to a CLIENT account by its verified
+ * phone enqueues ONE {@code STATUS_CHANGED} row per visit, the same client-facing row an APP create enqueues, so the
+ * client gets the existing «Бронювання підтверджено» email + .ics — only when the account has a confirmed email
+ * (NTF-67, NTF-D15). No provider row is added (the provider is the actor).
  */
 @Slf4j
 @Service
@@ -172,6 +178,8 @@ public class StaffBookingService {
     private final ClientPhoneAttachService clientPhoneAttachService;
 
     private final WalkInCreateBudget walkInCreateBudget;
+    /** B527 (NTF-67) — the attached client's receipt email rides the existing client-facing STATUS_CHANGED row. */
+    private final NotificationOutboxService outboxService;
 
     /**
      * Per-recipient ceiling on walk-in confirmation SMS, mirroring {@code PhoneOtpService}'s
@@ -400,7 +408,13 @@ public class StaffBookingService {
                             guestCancelUrlBuilder.build(cancelToken)));
         }
         // else (B527, NTF-67): an attached walk-in is told in the app (feed + push, via registerInAppFeedNotification
-        // above) and never by SMS — registered users get no SMS / Telegram.
+        // above) and never by SMS — registered users get no SMS / Telegram — plus the receipt email + .ics below.
+        if (account != null && account.hasConfirmedEmail()) {
+            // REUSE-FIRST: the APP create's client-facing row (BookingService#doCreateBooking) — its drain sends
+            // «Бронювання підтверджено» + .ics to the client. Once per visit, keyed to the first item (NTF-D15:
+            // a confirmed email only).
+            outboxService.enqueueStatusChanged(saved.get(0).getId());
+        }
 
         // REUSE-FIRST (Phase 22.14): the visit-detail enrichment is AppointmentService#enrich's job,
         // not a second mapper here. `saved` already carries everything `enrich` dereferences —

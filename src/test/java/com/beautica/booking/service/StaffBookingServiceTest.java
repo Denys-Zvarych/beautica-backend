@@ -66,6 +66,7 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -101,6 +102,7 @@ class StaffBookingServiceTest {
     @Mock private com.beautica.master.repository.MasterRepository masterRepository;
     @Mock private com.beautica.client.service.ClientPhoneAttachService clientPhoneAttachService;
     @Mock private WalkInCreateBudget walkInCreateBudget;
+    @Mock private com.beautica.notification.service.NotificationOutboxService outboxService;
     @Mock private MasterServiceRepository masterServiceRepository;
     @Mock private BookingRepository bookingRepository;
     @Mock private com.beautica.booking.repository.AppointmentRepository appointmentRepository;
@@ -158,7 +160,7 @@ class StaffBookingServiceTest {
                 bookingSmsDispatcher(), new BookingSmsProperties(),
                 Clock.fixed(NOW, ZoneOffset.UTC), appointmentService, inAppNotificationService,
                 new GuestCancelUrlBuilder(CANCEL_BASE_URL), GuestCancelTokenCipherFixtures.testCipher(),
-                clientPhoneAttachService, walkInCreateBudget);
+                clientPhoneAttachService, walkInCreateBudget, outboxService);
         org.mockito.Mockito.lenient().when(walkInCreateBudget.tryConsume(any())).thenReturn(true);
         // Lenient: rejection-path tests never reach the enrich() call, and MockitoExtension's
         // default STRICT_STUBS would otherwise flag this as an unnecessary stub for every one of
@@ -244,6 +246,44 @@ class StaffBookingServiceTest {
             verify(clientPhoneAttachService, org.mockito.Mockito.never()).attachNew(any(com.beautica.user.User.class),
                     any(Booking.class));
             verify(smsService).send(eq(E164_PHONE), any(String.class));
+        }
+
+        @Test
+        @DisplayName("B527 (NTF-67): an attached walk-in whose account has a confirmed email gets ONE client receipt row")
+        void should_enqueueOneClientReceipt_when_attachedAccountHasConfirmedEmail() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+            com.beautica.user.User account = org.mockito.Mockito.mock(com.beautica.user.User.class);
+            when(account.hasConfirmedEmail()).thenReturn(true);
+            when(clientPhoneAttachService.findAccountUnderHeldLock(E164_PHONE)).thenReturn(Optional.of(account));
+
+            create(command(guest(RAW_PHONE)));
+
+            Booking saved = captureSaved();
+            verify(outboxService).enqueueStatusChanged(saved.getId());
+            verifyNoMoreInteractions(outboxService);
+        }
+
+        @Test
+        @DisplayName("B527 (NTF-D15): an attached walk-in whose account has no confirmed email gets no receipt row")
+        void should_enqueueNoClientReceipt_when_attachedAccountHasNoConfirmedEmail() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+            com.beautica.user.User account = org.mockito.Mockito.mock(com.beautica.user.User.class);
+            when(account.hasConfirmedEmail()).thenReturn(false);
+            when(clientPhoneAttachService.findAccountUnderHeldLock(E164_PHONE)).thenReturn(Optional.of(account));
+
+            create(command(guest(RAW_PHONE)));
+
+            verifyNoInteractions(outboxService);
+        }
+
+        @Test
+        @DisplayName("B527: a non-attached walk-in still enqueues no outbox row (guest path unchanged)")
+        void should_enqueueNoOutboxRow_when_walkInIsNotAttached() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            verifyNoInteractions(outboxService);
         }
 
         @Test
@@ -899,7 +939,7 @@ class StaffBookingServiceTest {
                     salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
                     bookingSmsDispatcher(), properties, Clock.fixed(NOW, ZoneOffset.UTC), appointmentService,
                     inAppNotificationService, new GuestCancelUrlBuilder(CANCEL_BASE_URL),
-                    GuestCancelTokenCipherFixtures.testCipher(), clientPhoneAttachService, walkInCreateBudget);
+                    GuestCancelTokenCipherFixtures.testCipher(), clientPhoneAttachService, walkInCreateBudget, outboxService);
             stubHappyPath(salonMaster(), assignment(null, null));
 
             create(command(guest(RAW_PHONE)));

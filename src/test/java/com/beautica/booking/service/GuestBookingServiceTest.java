@@ -348,6 +348,42 @@ class GuestBookingServiceTest {
     }
 
     @Test
+    @DisplayName("B527 (NTF-67): an attached booking whose account has a confirmed email enqueues ONE client receipt "
+            + "row (STATUS_CHANGED, keyed to the first item) next to the provider's NEW_BOOKING")
+    void should_enqueueOneClientReceipt_when_attachedAccountHasConfirmedEmail() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        stubHappyPath(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
+        com.beautica.user.User account = org.mockito.Mockito.mock(com.beautica.user.User.class);
+        when(account.hasConfirmedEmail()).thenReturn(true);
+        when(clientPhoneAttachService.lockAndFindAccount(GUEST_PHONE)).thenReturn(Optional.of(account));
+
+        service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        ArgumentCaptor<List<Booking>> savedCaptor = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).saveAll(savedCaptor.capture());
+        verify(outboxService).enqueueStatusChanged(savedCaptor.getValue().get(0).getId());
+        verify(outboxService).enqueueNewBooking(savedCaptor.getValue().get(0).getId());
+    }
+
+    @Test
+    @DisplayName("B527 (NTF-D15): an attached booking whose account has no confirmed email enqueues no client receipt")
+    void should_enqueueNoClientReceipt_when_attachedAccountHasNoConfirmedEmail() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        stubHappyPath(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
+        com.beautica.user.User account = org.mockito.Mockito.mock(com.beautica.user.User.class);
+        when(account.hasConfirmedEmail()).thenReturn(false);
+        when(clientPhoneAttachService.lockAndFindAccount(GUEST_PHONE)).thenReturn(Optional.of(account));
+
+        service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        verify(outboxService, org.mockito.Mockito.never()).enqueueStatusChanged(any());
+    }
+
+    @Test
     @DisplayName("B527: no account owns the phone — a plain guest booking, attachedToAccount false, SMS as before")
     void should_createGuestBooking_when_noAccountOwnsThePhone() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
@@ -363,6 +399,7 @@ class GuestBookingServiceTest {
         verify(bookingBlockGuard, org.mockito.Mockito.never()).requireClientMayBook(any(), any());
         verify(smsService).send(eq(GUEST_PHONE), anyString());
         assertThat(response.attachedToAccount()).isFalse();
+        verify(outboxService, org.mockito.Mockito.never()).enqueueStatusChanged(any());
     }
 
     @Test

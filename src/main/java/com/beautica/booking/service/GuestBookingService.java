@@ -38,6 +38,7 @@ import com.beautica.service.service.SalonCatalogCacheEvictor;
 import io.jsonwebtoken.JwtException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
+import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
@@ -446,6 +447,7 @@ public class GuestBookingService {
         Booking saved = persistBooking(master, msa, req, guestPhone, account);
 
         outboxService.enqueueNewBooking(saved.getId());
+        enqueueAttachedClientReceipt(account, saved);
         // Phase 333, matrix row 1 — provider set (owner + admins + performing master); the guest has
         // no user account, so there is no actor to exclude (null is a safe Set#remove no-op). `saved`
         // carries the real `master`/`salon` instances persistBooking built — never reloaded
@@ -541,6 +543,7 @@ public class GuestBookingService {
 
         // EXACTLY ONE new-visit notification (referencing the first item — never one per service).
         outboxService.enqueueNewBooking(saved.get(0).getId());
+        enqueueAttachedClientReceipt(account, saved.get(0));
         // Phase 333, matrix row 1 — provider set; no actor (guest, no user account). `saved.get(0)`
         // carries the real `master`/`salon` instances built above — never reloaded (audit-fix
         // cycle 1, finding 1).
@@ -550,6 +553,18 @@ public class GuestBookingService {
         String cancelUrl = guestCancelUrlBuilder.build(cancelToken);
         registerVisitAfterCommit(master, saved.get(0), account == null ? guestPhone : null, cancelUrl);
         return buildVisitResponse(master, appointment, saved.get(0), items, cancelUrl, account != null);
+    }
+
+    /**
+     * B527 (NTF-67, NTF-D15) — a LINK booking attached to a CLIENT account gets the registered client's receipt: the
+     * same client-facing {@code STATUS_CHANGED} row an APP create enqueues ({@code BookingService#doCreateBooking}), whose
+     * drain sends «Бронювання підтверджено» + .ics. Only to a confirmed email; once per visit (keyed to the first item).
+     * An account-less guest gets no row — its drain branch is a no-op for CONFIRMED anyway.
+     */
+    private void enqueueAttachedClientReceipt(@Nullable User account, Booking firstItem) {
+        if (account != null && account.hasConfirmedEmail()) {
+            outboxService.enqueueStatusChanged(firstItem.getId());
+        }
     }
 
     private GuestTokenProvider.GuestTokenClaims extractGuestClaims(String bearerToken) {

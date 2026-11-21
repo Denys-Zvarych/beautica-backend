@@ -292,6 +292,76 @@ class ClientPhoneAttachCreateIT extends AbstractIntegrationTest {
         verify(smsService, never()).send(any(), any());
     }
 
+    private List<UUID> clientReceiptRows() {
+        return jdbcTemplate.queryForList(
+                "SELECT aggregate_id FROM notification_outbox WHERE event_type = 'STATUS_CHANGED'", UUID.class);
+    }
+
+    /** A verified-phone CLIENT with no email at all (phone-registered, AUTH-D11) — NTF-D15: no receipt email. */
+    private void verifiedClientWithoutEmail(String phone) {
+        jdbcTemplate.update("INSERT INTO users (id, email, password_hash, role, first_name, last_name, phone_number, "
+                        + "phone_verified_at, is_active, email_verified) "
+                        + "VALUES (?, NULL, ?, 'CLIENT', 'Ірина', 'Кравчук', ?, NOW(), true, false)",
+                UUID.randomUUID(), passwordEncoder.encode(PublicBookingPageFixtures.PASSWORD), phone);
+    }
+
+    @Test
+    @DisplayName("2c (NTF-67): an attached link booking and an attached walk-in for an account with a confirmed email "
+            + "each enqueue ONE client receipt row (STATUS_CHANGED, the APP create's confirmation e-mail + .ics)")
+    void should_enqueueOneClientReceiptEach_when_attachedAccountHasConfirmedEmail() throws Exception {
+        IndependentMaster master = pages.independentMaster(true);
+        verifiedClient(PHONE);
+
+        UUID linkId = UUID.fromString(created(linkBook(master, PHONE, slot(3, 12))).path("bookingId").asText());
+        UUID walkInId = UUID.fromString(created(walkIn(master, "0671234501", slot(4, 12)))
+                .path("data").path("items").get(0).path("bookingId").asText());
+
+        assertThat(clientReceiptRows()).as("one receipt row per attached visit, keyed to its booking")
+                .containsExactlyInAnyOrder(linkId, walkInId);
+    }
+
+    @Test
+    @DisplayName("2d (NTF-D15): an attached link booking and walk-in for an account with no email enqueue no client "
+            + "receipt row")
+    void should_enqueueNoClientReceipt_when_attachedAccountHasNoEmail() throws Exception {
+        IndependentMaster master = pages.independentMaster(true);
+        verifiedClientWithoutEmail(PHONE);
+
+        JsonNode link = created(linkBook(master, PHONE, slot(3, 12)));
+        created(walkIn(master, "0671234501", slot(4, 12)));
+
+        assertThat(link.path("attachedToAccount").asBoolean()).as("precondition: attached").isTrue();
+        assertThat(clientReceiptRows()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("2f (NTF-67): a two-service attached link visit enqueues exactly ONE client receipt row, keyed to the "
+            + "visit's first item — never one per service")
+    void should_enqueueOneClientReceipt_when_attachedLinkVisitHasTwoServices() throws Exception {
+        IndependentMaster master = pages.independentMaster(true);
+        verifiedClient(PHONE);
+        String ids = "\"masterServiceIds\":[\"" + masterServiceOf(master) + "\",\"" + secondService(master) + "\"]";
+
+        UUID appointmentId = UUID.fromString(created(linkBook(master, PHONE, slot(3, 12), ids))
+                .path("appointmentId").asText());
+
+        UUID firstItem = jdbcTemplate.queryForObject("SELECT id FROM bookings WHERE appointment_id = ? "
+                + "ORDER BY starts_at LIMIT 1", UUID.class, appointmentId);
+        assertThat(clientReceiptRows()).as("one receipt row per visit").containsExactly(firstItem);
+    }
+
+    @Test
+    @DisplayName("2e: a link booking and a walk-in for a phone no account owns enqueue no client receipt row "
+            + "(guest path unchanged)")
+    void should_enqueueNoClientReceipt_when_bookingIsNotAttached() throws Exception {
+        IndependentMaster master = pages.independentMaster(true);
+
+        created(linkBook(master, PHONE, slot(3, 12)));
+        created(walkIn(master, "0671234501", slot(4, 12)));
+
+        assertThat(clientReceiptRows()).isEmpty();
+    }
+
     @Test
     @DisplayName("2b: attached link booking and attached walk-in each enqueue one INAPP_PUSH outbox row keyed by the "
             + "client's feed row; no SMS")

@@ -853,6 +853,55 @@ class StaffBookingIT extends AbstractIntegrationTest {
                     .isEqualTo(CREATE_FIXED_STATEMENTS + 10 * CREATE_PER_ITEM_STATEMENTS);
         }
 
+        /**
+         * B527 follow-up (NTF-67) — an ATTACHED walk-in for an account with a confirmed email costs the fixed baseline
+         * plus the attach's own writes plus exactly ONE more: the client's {@code STATUS_CHANGED} receipt row. Its
+         * no-email sibling below must cost exactly one statement less, which is what pins the receipt at one row per
+         * visit (never per item, never two).
+         *
+         * <p>Measured 2026-11-21: 18 = {@link #CREATE_FIXED_STATEMENTS} (15) + 2 (the attached account's own in-app
+         * path, measured as the no-email sibling's 17) + 1 (the receipt row).
+         */
+        private static final long CREATE_ATTACHED_WITH_RECEIPT_STATEMENTS = 18L;
+
+        @Test
+        @DisplayName("attached walk-in, confirmed email: the pinned cost, one statement more than without an email")
+        void should_issuePinnedStatementCount_when_walkInAttachedToClientWithConfirmedEmail() {
+            long withEmail = attachedCreateStatements(true, 11);
+            long withoutEmail = attachedCreateStatements(false, 12);
+
+            assertThat(withEmail).as("attached walk-in create statements (receipt row included)")
+                    .isEqualTo(CREATE_ATTACHED_WITH_RECEIPT_STATEMENTS);
+            assertThat(withEmail - withoutEmail).as("the receipt is exactly ONE outbox insert").isEqualTo(1L);
+        }
+
+        /** One attached single-service create against a fresh master, for a CLIENT owning the guest phone. */
+        private long attachedCreateStatements(boolean confirmedEmail, int phoneSuffix) {
+            Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
+            statistics.setStatisticsEnabled(true);
+            Seed fresh = seedStatementCountMaster();
+            StaffBookingCommand cmd = singleServiceStatementCountCommand(fresh, phoneSuffix);
+            insertVerifiedPhoneClient(((StaffClientRef.Guest) cmd.client()).phone(), confirmedEmail);
+
+            statistics.clear();
+            AppointmentDetailResponse created = create(fresh, cmd);
+            long statements = statistics.getPrepareStatementCount();
+
+            assertThat(jdbc.queryForObject("SELECT client_id IS NOT NULL FROM bookings WHERE id = ?", Boolean.class,
+                    created.items().get(0).bookingId())).as("precondition: the walk-in attached").isTrue();
+            return statements;
+        }
+
+        private void insertVerifiedPhoneClient(String e164, boolean confirmedEmail) {
+            UUID id = UUID.randomUUID();
+            jdbc.update("INSERT INTO users (id, email, password_hash, role, first_name, last_name, phone_number, "
+                            + "phone_verified_at, is_active, email_verified) "
+                            + "VALUES (?, ?, ?, 'CLIENT', 'Ірина', 'Кравчук', ?, NOW(), true, ?)",
+                    id, "attached-" + id + "@beautica.test",
+                    new org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder(4).encode("test-password"),
+                    e164, confirmedEmail);
+        }
+
         /** Isolated per-test master: own salon, own weekly schedule wide enough for a 10×60min chain. */
         private Seed seedStatementCountMaster() {
             Seed fresh = seedSalonMaster();
