@@ -277,9 +277,12 @@ public class CategoryRequestService {
      * ServiceCatalogService#buildCategoryOrderAndNames} with the same {@code findApprovedActive()}
      * query result, kept as a separate cache/bean because it returns entities for internal
      * ordering rather than the {@link ApprovedCategoryResponse} DTO this method exposes.
+     *
+     * <p>{@code sync = true} (B503): one hot platform-wide key, so a TTL expiry or an approve's eviction loads it once
+     * instead of once per concurrent picker.
      */
     @Transactional(readOnly = true)
-    @Cacheable(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY)
+    @Cacheable(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY, sync = true)
     public List<ApprovedCategoryResponse> listApproved() {
         return platformCategoryRepository.findApprovedActive().stream()
                 .map(ApprovedCategoryResponse::from)
@@ -301,7 +304,52 @@ public class CategoryRequestService {
         if (isExpired(category)) {
             return DecisionOutcome.INVALID_OR_EXPIRED;
         }
+        return decide(category, approve, reason);
+    }
 
+    /**
+     * B503 (SVC-06) — the platform operator approves the category request from the catalog portal. Same outcome as
+     * the email link: it runs the SAME {@link #decide(PlatformCategory, boolean, String)} (APPROVED + active, the
+     * carried initial-service suggestion, in-app item, decision e-mail) and clears the email token, so a later link
+     * click shows «already decided». The row is locked ({@code FOR UPDATE}, the lock B502's edit and the token path
+     * take), so the first decision wins. Token expiry does not apply: it bounds the e-mailed link, not the request.
+     *
+     * <p>No cache annotation here: the caller ({@code CatalogRequestAdminService}) runs this inside its own
+     * transaction and calls {@code CatalogCacheEvictor.evictAll()} after commit, a superset of {@link #approve}'s
+     * evict set; a nested {@code @CacheEvict} would fire before that outer commit (Anti-Bug §F-2).
+     *
+     * @throws NotFoundException               no category row with this id
+     * @throws CatalogRequestConflictException {@code REQUEST_NOT_PENDING} when the row is not a PENDING request
+     */
+    @Transactional
+    public DecisionOutcome approveById(Long categoryId) {
+        return decide(lockPendingById(categoryId), true, null);
+    }
+
+    /**
+     * B503 — portal reject; see {@link #approveById}. {@code reason} is already cleaned and length-checked by the
+     * caller ({@code DecisionReason}, the email path's rules); {@code null} when none.
+     */
+    @Transactional
+    public DecisionOutcome rejectById(Long categoryId, String reason) {
+        return decide(lockPendingById(categoryId), false, reason);
+    }
+
+    private PlatformCategory lockPendingById(Long categoryId) {
+        PlatformCategory category = platformCategoryRepository.findByIdForUpdate(categoryId)
+                .orElseThrow(() -> new NotFoundException("Request not found"));
+        if (!category.isPending()) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING);
+        }
+        return category;
+    }
+
+    /**
+     * The ONE decision for a locked PENDING request, shared by the email-link path ({@link #approve} /
+     * {@link #reject}) and the portal path ({@link #approveById} / {@link #rejectById}) — B503 D1. B541 adds its
+     * approve-branch check here.
+     */
+    private DecisionOutcome decide(PlatformCategory category, boolean approve, String reason) {
         OffsetDateTime now = OffsetDateTime.now(clock);
         if (approve) {
             category.approve(now);

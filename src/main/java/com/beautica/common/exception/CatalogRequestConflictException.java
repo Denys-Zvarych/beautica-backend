@@ -3,7 +3,8 @@ package com.beautica.common.exception;
 import org.springframework.http.HttpStatus;
 
 /**
- * B502 (SVC-55) — a catalog-admin edit of a pending category request / service-type suggestion was refused.
+ * B502 (SVC-55) — a catalog-admin edit of a pending category request / service-type suggestion was refused; since B503
+ * (SVC-06) also a portal approve / reject of a row that is no longer PENDING ({@link Code#REQUEST_NOT_PENDING}).
  *
  * <p>Surfaces as {@code 409 Conflict} carrying the stable {@link Code} under {@code data.code} (the project's typed
  * error-code convention, same shape as {@link OwnerAccountDeletionBlockedException}):

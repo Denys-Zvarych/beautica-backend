@@ -11,6 +11,7 @@ import com.beautica.service.ServiceTestFixtures;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -25,7 +26,6 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 
@@ -39,11 +39,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -76,34 +71,22 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
     @Autowired private CategoryRequestService categoryRequestService;
     @Autowired private PlatformTransactionManager transactionManager;
 
-    private static final Duration WAIT = Duration.ofSeconds(10);
-    private static final long POLL_MILLIS = 50;
+    private CatalogRequestFixture fixture;
 
-    private final List<UUID> suggestionIds = new ArrayList<>();
-    private final List<String> categoryNames = new ArrayList<>();
-
-    private final List<String> promotedTypeNames = new ArrayList<>();
+    @BeforeEach
+    void createFixture() {
+        fixture = new CatalogRequestFixture(jdbcTemplate, passwordEncoder, tokenGenerator);
+    }
 
     @AfterEach
     void removeSeededRequests() {
-        // service_types rows an approve in the race tests promoted (no service_definitions reference them).
-        promotedTypeNames.forEach(n -> jdbcTemplate.update("DELETE FROM service_types WHERE name_uk = ?", n));
-        // Neither table is in cleanDb() (platform_categories holds the seeds). No FK between them; both reference
-        // users ON DELETE SET NULL, so they go first, ahead of cleanDb()'s DELETE FROM users.
-        suggestionIds.forEach(id -> jdbcTemplate.update("DELETE FROM service_type_suggestion WHERE id = ?", id));
-        // Suggestions an approved category request spawned from its initial service name (keyed by the wire name).
-        categoryNames.forEach(n -> jdbcTemplate.update("DELETE FROM service_type_suggestion WHERE category_name = ?", n));
-        categoryNames.forEach(n -> jdbcTemplate.update("DELETE FROM platform_categories WHERE name = ?", n));
+        fixture.cleanup();
     }
 
     // ── seeding ────────────────────────────────────────────────────────────────
 
     private UUID insertUser(String email, String role, String first, String last, String phone) {
-        UUID id = UUID.randomUUID();
-        jdbcTemplate.update("INSERT INTO users (id, email, password_hash, role, is_active, email_verified, first_name, "
-                        + "last_name, phone_number) VALUES (?, ?, ?, ?, true, true, ?, ?, ?)",
-                id, email, passwordEncoder.encode("test-password"), role, first, last, phone);
-        return id;
+        return fixture.insertUser(email, role, first, last, phone);
     }
 
     private UUID insertOwnerWithSalon(String salonName) {
@@ -115,27 +98,11 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
     }
 
     private long insertCategory(String name, String displayName, String status, UUID requester, Instant createdAt) {
-        categoryNames.add(name);
-        boolean pending = "PENDING".equals(status);
-        jdbcTemplate.update("INSERT INTO platform_categories (name, display_name, active, status, requested_by_user_id, "
-                        + "requested_at, token_hash, token_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                name, displayName, "APPROVED".equals(status), status, requester, Timestamp.from(createdAt),
-                pending ? "hash-" + name : null, pending ? Timestamp.from(createdAt.plusSeconds(86_400_000L)) : null,
-                Timestamp.from(createdAt));
-        return jdbcTemplate.queryForObject("SELECT id FROM platform_categories WHERE name = ?", Long.class, name);
+        return fixture.insertCategory(name, displayName, status, requester, createdAt);
     }
 
     private UUID insertSuggestion(String category, String name, String status, UUID requester, Instant createdAt) {
-        UUID id = UUID.randomUUID();
-        suggestionIds.add(id);
-        boolean pending = "PENDING".equals(status);
-        jdbcTemplate.update("INSERT INTO service_type_suggestion (id, requested_by_user_id, category_name, "
-                        + "suggested_name, description, status, token_hash, token_expires_at, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                id, requester, category, name, "опис", status,
-                pending ? "hash-" + id : null, pending ? Timestamp.from(createdAt.plusSeconds(86_400_000L)) : null,
-                Timestamp.from(createdAt));
-        return id;
+        return fixture.insertSuggestion(category, name, status, requester, createdAt);
     }
 
     // ── HTTP ───────────────────────────────────────────────────────────────────
@@ -400,79 +367,20 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
     private RacedSuggestion seedApprovable(String name, Instant createdAt) {
         String category = new ServiceTestFixtures(null, jdbcTemplate, objectMapper, passwordEncoder)
                 .activeSelectableServiceTypes(1).get(0).platformCategoryName();
-        String raw = "it502-race-token-" + UUID.randomUUID();
-        UUID id = UUID.randomUUID();
-        suggestionIds.add(id);
-        jdbcTemplate.update("INSERT INTO service_type_suggestion (id, category_name, suggested_name, status, token_hash, "
-                        + "token_expires_at, created_at) VALUES (?, ?, ?, 'PENDING', ?, ?, ?)",
-                id, category, name, tokenGenerator.hash(raw), Timestamp.from(Instant.now().plus(Duration.ofDays(3))),
-                Timestamp.from(createdAt));
-        return new RacedSuggestion(id, raw, category);
+        CatalogRequestFixture.Seeded<UUID> row = fixture.pendingSuggestionWithToken(category, name, null,
+                Instant.now().plus(Duration.ofDays(3)), createdAt);
+        return new RacedSuggestion(row.id(), row.rawToken(), category);
     }
 
-    /**
-     * Runs {@code first} in a transaction held open after it finishes, starts {@code second} on another thread, waits
-     * until {@code second} is done or a backend is waiting on a lock (pg_stat_activity), then commits {@code first}.
-     * Returns {@code second}'s result or throws its failure.
-     */
     private <T> T raceAfterHeldTransaction(Runnable first, Supplier<T> second) throws Exception {
-        TransactionTemplate tx = new TransactionTemplate(transactionManager);
-        CountDownLatch firstDone = new CountDownLatch(1);
-        CountDownLatch releaseFirst = new CountDownLatch(1);
-        CompletableFuture<Void> holder = CompletableFuture.runAsync(() -> tx.executeWithoutResult(status -> {
-            first.run();
-            firstDone.countDown();
-            try {
-                if (!releaseFirst.await(WAIT.toSeconds(), TimeUnit.SECONDS)) {
-                    throw new IllegalStateException("holder never released");
-                }
-            } catch (InterruptedException ex) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException(ex);
-            }
-        }));
-        if (!firstDone.await(WAIT.toSeconds(), TimeUnit.SECONDS)) {
-            holder.get(POLL_MILLIS, TimeUnit.MILLISECONDS);
-            throw new AssertionError("first never ran");
-        }
-        CompletableFuture<T> contender = CompletableFuture.supplyAsync(second);
-        awaitBlockedOrDone(contender);
-        releaseFirst.countDown();
-        holder.get(WAIT.toSeconds(), TimeUnit.SECONDS);
-        try {
-            return contender.get(WAIT.toSeconds(), TimeUnit.SECONDS);
-        } catch (ExecutionException ex) {
-            if (ex.getCause() instanceof Exception cause) {
-                throw cause;
-            }
-            throw ex;
-        }
-    }
-
-    private void awaitBlockedOrDone(CompletableFuture<?> contender) throws Exception {
-        Instant deadline = Instant.now().plus(WAIT);
-        while (Instant.now().isBefore(deadline)) {
-            try {
-                contender.get(POLL_MILLIS, TimeUnit.MILLISECONDS);
-                return;
-            } catch (ExecutionException done) {
-                return;
-            } catch (TimeoutException stillRunning) {
-                Integer waiting = jdbcTemplate.queryForObject("SELECT count(*) FROM pg_stat_activity "
-                        + "WHERE wait_event_type = 'Lock' AND datname = current_database()", Integer.class);
-                if (waiting != null && waiting > 0) {
-                    return;
-                }
-            }
-        }
-        throw new AssertionError("contender neither finished nor blocked on a lock");
+        return new HeldTransactionRace(transactionManager, jdbcTemplate).run(first, second);
     }
 
     @Test
     @DisplayName("approve holds the row → a parallel edit waits on FOR UPDATE, then gets REQUEST_NOT_PENDING")
     void should_refuseEdit_when_approveCommitsFirst() throws Exception {
         RacedSuggestion row = seedApprovable("Гонка IT502 перша", Instant.parse("2020-05-01T10:00:00Z"));
-        promotedTypeNames.add("Гонка IT502 перша");
+        fixture.trackType("Гонка IT502 перша");
 
         Throwable failure = null;
         try {
@@ -498,7 +406,7 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
     @DisplayName("edit holds the row → a parallel email-link approve waits, then promotes the EDITED name")
     void should_promoteEditedName_when_editCommitsFirst() throws Exception {
         RacedSuggestion row = seedApprovable("Гонка IT502 друга", Instant.parse("2020-05-02T10:00:00Z"));
-        promotedTypeNames.add("Гонка IT502 виправлена");
+        fixture.trackType("Гонка IT502 виправлена");
 
         ServiceTypeSuggestionService.DecisionOutcome outcome = raceAfterHeldTransaction(
                 () -> suggestionService.editPendingName(row.id(), "Гонка IT502 виправлена"),
@@ -517,15 +425,9 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
 
     private RacedCategory seedApprovableCategory(String name, String displayName, String initialServiceName,
                                                  Instant createdAt) {
-        categoryNames.add(name);
-        String raw = "it502-cat-token-" + UUID.randomUUID();
-        jdbcTemplate.update("INSERT INTO platform_categories (name, display_name, active, status, requested_at, "
-                        + "token_hash, token_expires_at, created_at, initial_service_name) "
-                        + "VALUES (?, ?, false, 'PENDING', ?, ?, ?, ?, ?)",
-                name, displayName, Timestamp.from(createdAt), tokenGenerator.hash(raw),
-                Timestamp.from(Instant.now().plus(Duration.ofDays(3))), Timestamp.from(createdAt), initialServiceName);
-        long id = jdbcTemplate.queryForObject("SELECT id FROM platform_categories WHERE name = ?", Long.class, name);
-        return new RacedCategory(id, raw, name);
+        CatalogRequestFixture.Seeded<Long> row = fixture.pendingCategoryWithToken(name, displayName, null,
+                initialServiceName, Instant.now().plus(Duration.ofDays(3)), createdAt);
+        return new RacedCategory(row.id(), row.rawToken(), name);
     }
 
     @Test
@@ -587,8 +489,8 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
     @DisplayName("Q3 SERVICE_TYPE — portal PATCH, then the email-link approve promotes the edited name")
     void should_promotePortalEditedName_when_suggestionApprovedByEmailLink() throws Exception {
         RacedSuggestion row = seedApprovable("Q3 IT502 з помилкою", Instant.parse("2020-06-01T10:00:00Z"));
-        promotedTypeNames.add("Q3 IT502 виправлена");
-        promotedTypeNames.add("Q3 IT502 з помилкою");
+        fixture.trackType("Q3 IT502 виправлена");
+        fixture.trackType("Q3 IT502 з помилкою");
 
         ResponseEntity<String> edit = patch("SERVICE_TYPE", row.id(), Map.of("name", "Q3 IT502 виправлена"));
         ResponseEntity<String> approve = approveByEmailLink("/api/v1/service-types/suggestions/approve", row.rawToken());
@@ -693,7 +595,7 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
         UUID sugPending = insertSuggestion(SUGGESTION_CATEGORY, "Очікує", "PENDING", null, t.plusSeconds(180));
         UUID sugApproved = insertSuggestion(SUGGESTION_CATEGORY, "Схвалена", "APPROVED", null, t.plusSeconds(240));
         UUID sugRejected = insertSuggestion(SUGGESTION_CATEGORY, "Відхилена", "REJECTED", null, t.plusSeconds(300));
-        categoryNames.add("IT502_ST_SEED");
+        fixture.trackCategory("IT502_ST_SEED");
         jdbcTemplate.update("INSERT INTO platform_categories (name, display_name, active, status, created_at) "
                 + "VALUES ('IT502_ST_SEED', 'Засіяна', true, 'APPROVED', ?)", Timestamp.from(t.minusSeconds(60)));
         long seedLike = jdbcTemplate.queryForObject("SELECT id FROM platform_categories WHERE name = 'IT502_ST_SEED'",

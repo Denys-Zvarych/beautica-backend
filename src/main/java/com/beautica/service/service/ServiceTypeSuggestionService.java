@@ -331,7 +331,52 @@ public class ServiceTypeSuggestionService {
         if (isExpired(suggestion)) {
             return DecisionOutcome.INVALID_OR_EXPIRED;
         }
+        return decide(suggestion, approve, reason);
+    }
 
+    /**
+     * B503 (SVC-06) — the platform operator approves the suggestion from the catalog portal. Same outcome as the
+     * email link: it runs the SAME {@link #decide(ServiceTypeSuggestion, boolean, String)} (promotion, in-app item,
+     * decision e-mail) and clears the email token, so a later link click shows «already decided». The row is
+     * locked ({@code FOR UPDATE}, the lock B502's edit and the token path take), so the first decision wins.
+     * Token expiry does not apply: it bounds the e-mailed link, not the request.
+     *
+     * <p>No cache annotation here: the caller ({@code CatalogRequestAdminService}) runs this inside its own
+     * transaction and calls {@code CatalogCacheEvictor.evictAll()} after commit, a superset of {@link #approve}'s
+     * evict set; a nested {@code @CacheEvict} would fire before that outer commit (Anti-Bug §F-2).
+     *
+     * @throws NotFoundException               no suggestion with this id
+     * @throws CatalogRequestConflictException {@code REQUEST_NOT_PENDING} when already decided
+     */
+    @Transactional
+    public DecisionOutcome approveById(UUID suggestionId) {
+        return decide(lockPendingById(suggestionId), true, null);
+    }
+
+    /**
+     * B503 — portal reject; see {@link #approveById}. {@code reason} is already cleaned and length-checked by the
+     * caller ({@code DecisionReason}, the email path's rules); {@code null} when none.
+     */
+    @Transactional
+    public DecisionOutcome rejectById(UUID suggestionId, String reason) {
+        return decide(lockPendingById(suggestionId), false, reason);
+    }
+
+    private ServiceTypeSuggestion lockPendingById(UUID suggestionId) {
+        ServiceTypeSuggestion suggestion = suggestionRepository.findByIdForUpdate(suggestionId)
+                .orElseThrow(() -> new NotFoundException("Request not found"));
+        if (!suggestion.isPending()) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING);
+        }
+        return suggestion;
+    }
+
+    /**
+     * The ONE decision for a locked PENDING suggestion, shared by the email-link path ({@link #approve} /
+     * {@link #reject}) and the portal path ({@link #approveById} / {@link #rejectById}) — B503 D1. B541 adds its
+     * approve-branch check here.
+     */
+    private DecisionOutcome decide(ServiceTypeSuggestion suggestion, boolean approve, String reason) {
         OffsetDateTime now = OffsetDateTime.now(clock);
         if (approve) {
             suggestion.approve(now);          // flips APPROVED + clears the single-use token

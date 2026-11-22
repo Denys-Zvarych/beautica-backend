@@ -1,15 +1,18 @@
 package com.beautica.catalog.admin;
 
+import com.beautica.catalog.CatalogCacheEvictor;
 import com.beautica.catalog.admin.dto.CatalogRequestDto;
 import com.beautica.catalog.admin.dto.EditRequestNameRequest;
 import com.beautica.catalog.admin.repository.CatalogRequestQueryRepository;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.service.service.CategoryRequestService;
 import com.beautica.service.service.ServiceTypeSuggestionService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.domain.Page;
@@ -27,9 +30,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -42,12 +49,14 @@ class CatalogRequestAdminServiceTest {
     @Mock private CategoryRequestService categoryRequestService;
     @Mock private ServiceTypeSuggestionService suggestionService;
     @Mock private CatalogAdminAuditService auditService;
+    @Mock private CatalogCacheEvictor cacheEvictor;
 
     private CatalogRequestAdminService service;
 
     @BeforeEach
     void setUp() {
-        service = new CatalogRequestAdminService(queryRepository, categoryRequestService, suggestionService, auditService);
+        service = new CatalogRequestAdminService(queryRepository, categoryRequestService, suggestionService, auditService,
+                cacheEvictor);
     }
 
     private static CatalogRequestDto row(String id) {
@@ -58,7 +67,7 @@ class CatalogRequestAdminServiceTest {
     // ── list ───────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_returnPageWithSqlOffset_when_rowsExist")
+    @DisplayName("list → page number × size becomes the SQL offset; the caller's sort is ignored (always oldest first)")
     void should_returnPageWithSqlOffset_when_rowsExist() {
         when(queryRepository.count(CatalogRequestStatus.PENDING)).thenReturn(3L);
         when(queryRepository.findPage(CatalogRequestStatus.PENDING, 2L, 2)).thenReturn(List.of(row("c")));
@@ -72,7 +81,7 @@ class CatalogRequestAdminServiceTest {
     }
 
     @Test
-    @DisplayName("should_skipPageQuery_when_offsetPastTotal")
+    @DisplayName("list past the last page → empty page with the real total, no page query")
     void should_skipPageQuery_when_offsetPastTotal() {
         when(queryRepository.count(CatalogRequestStatus.REJECTED)).thenReturn(1L);
 
@@ -86,7 +95,7 @@ class CatalogRequestAdminServiceTest {
     // ── editName ───────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_editSuggestionAndAuditNameOnly_when_kindServiceType")
+    @DisplayName("edit SERVICE_TYPE → renames via the owning service; audit carries only {suggestedName}")
     void should_editSuggestionAndAuditNameOnly_when_kindServiceType() {
         UUID id = UUID.randomUUID();
         when(suggestionService.editPendingName(id, "Балаяж"))
@@ -99,7 +108,7 @@ class CatalogRequestAdminServiceTest {
     }
 
     @Test
-    @DisplayName("should_editCategoryAndAuditBothFields_when_kindCategory")
+    @DisplayName("edit CATEGORY → audit carries exactly {displayName, initialServiceName}, null kept")
     void should_editCategoryAndAuditBothFields_when_kindCategory() {
         when(categoryRequestService.editPendingName(42L, "Нейл-арт", ""))
                 .thenReturn(new CategoryRequestService.NameChange("Нейл арт", "Нейл-арт", "Френч", null));
@@ -117,7 +126,7 @@ class CatalogRequestAdminServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw400_when_initialServiceNameSentForServiceType")
+    @DisplayName("edit SERVICE_TYPE with initialServiceName → 400, nothing edited or audited")
     void should_throw400_when_initialServiceNameSentForServiceType() {
         String id = UUID.randomUUID().toString();
 
@@ -129,7 +138,7 @@ class CatalogRequestAdminServiceTest {
     }
 
     @Test
-    @DisplayName("should_throw400_when_idMalformedForKind")
+    @DisplayName("edit with an id of the wrong shape for its kind → 400 before any service call")
     void should_throw400_when_idMalformedForKind() {
         EditRequestNameRequest request = new EditRequestNameRequest("Балаяж", null);
 
@@ -140,5 +149,92 @@ class CatalogRequestAdminServiceTest {
                 .isInstanceOfSatisfying(BusinessException.class,
                         ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
         verifyNoInteractions(categoryRequestService, suggestionService, auditService);
+    }
+
+    // ── approve / reject (B503) ────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("approve SERVICE_TYPE → decide by id, then APPROVE audit {status}, then evict every catalog cache")
+    void should_decideAuditThenEvict_when_suggestionApproved() {
+        UUID id = UUID.randomUUID();
+
+        service.approve(ACTOR, CatalogRequestKind.SERVICE_TYPE, id.toString());
+
+        InOrder order = inOrder(suggestionService, auditService, cacheEvictor);
+        order.verify(suggestionService).approveById(id);
+        order.verify(auditService).record(ACTOR, "APPROVE", CatalogAuditTargetType.TYPE_SUGGESTION, id.toString(),
+                Map.of("status", "PENDING"), Map.of("status", "APPROVED"));
+        order.verify(cacheEvictor).evictAll();
+        verifyNoInteractions(categoryRequestService);
+    }
+
+    @Test
+    @DisplayName("approve CATEGORY → numeric id to the category service, CATEGORY_REQUEST audit, evict")
+    void should_approveCategoryById_when_kindCategory() {
+        service.approve(ACTOR, CatalogRequestKind.CATEGORY, "77");
+
+        verify(categoryRequestService).approveById(77L);
+        verify(auditService).record(ACTOR, "APPROVE", CatalogAuditTargetType.CATEGORY_REQUEST, "77",
+                Map.of("status", "PENDING"), Map.of("status", "APPROVED"));
+        verify(cacheEvictor).evictAll();
+    }
+
+    @Test
+    @DisplayName("reject → reason cleaned by the email-form rules; audit records only reasonPresent=true; no eviction")
+    void should_passCleanedReasonAuditItAndNotEvict_when_rejected() {
+        service.reject(ACTOR, CatalogRequestKind.CATEGORY, "77", "  Вже\r\nє\u200B така ");
+
+        verify(categoryRequestService).rejectById(77L, "Вже є така");
+        verify(auditService).record(ACTOR, "REJECT", CatalogAuditTargetType.CATEGORY_REQUEST, "77",
+                Map.of("status", "PENDING"), Map.of("status", "REJECTED", "reasonPresent", true));
+        verifyNoInteractions(cacheEvictor);
+    }
+
+    @Test
+    @DisplayName("reject with a blank reason → no reason passed, audit reasonPresent=false, no eviction")
+    void should_rejectWithNullReason_when_reasonBlank() {
+        UUID id = UUID.randomUUID();
+
+        service.reject(ACTOR, CatalogRequestKind.SERVICE_TYPE, id.toString(), "   ");
+
+        verify(suggestionService).rejectById(id, null);
+        verify(auditService).record(ACTOR, "REJECT", CatalogAuditTargetType.TYPE_SUGGESTION, id.toString(),
+                Map.of("status", "PENDING"), Map.of("status", "REJECTED", "reasonPresent", false));
+        verifyNoInteractions(cacheEvictor);
+    }
+
+    @Test
+    @DisplayName("reject with a 301-code-point reason → 400, nothing decided, audited or evicted")
+    void should_throw400AndDecideNothing_when_reasonOver300CodePoints() {
+        assertThatThrownBy(() -> service.reject(ACTOR, CatalogRequestKind.CATEGORY, "77", "ж".repeat(301)))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verifyNoInteractions(categoryRequestService, auditService, cacheEvictor);
+    }
+
+    @Test
+    @DisplayName("decision on a non-pending row → REQUEST_NOT_PENDING propagates, no audit, no eviction")
+    void should_propagateConflictWithoutAuditOrEvict_when_notPending() {
+        UUID id = UUID.randomUUID();
+        doThrow(new CatalogRequestConflictException(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING))
+                .when(suggestionService).approveById(id);
+
+        assertThatThrownBy(() -> service.approve(ACTOR, CatalogRequestKind.SERVICE_TYPE, id.toString()))
+                .isInstanceOf(CatalogRequestConflictException.class);
+
+        verify(auditService, never()).record(org.mockito.ArgumentMatchers.any(), anyString(),
+                org.mockito.ArgumentMatchers.any(), anyString(), anyMap(), anyMap());
+        verifyNoInteractions(cacheEvictor);
+    }
+
+    @Test
+    @DisplayName("approve with a malformed id → 400 before any decision")
+    void should_throw400_when_decisionIdMalformed() {
+        assertThatThrownBy(() -> service.approve(ACTOR, CatalogRequestKind.SERVICE_TYPE, "42"))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verifyNoInteractions(suggestionService, auditService, cacheEvictor);
     }
 }

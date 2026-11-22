@@ -6,6 +6,7 @@ import com.beautica.catalog.admin.CatalogRequestKind;
 import com.beautica.catalog.admin.CatalogRequestStatus;
 import com.beautica.catalog.admin.dto.CatalogRequestDto;
 import com.beautica.catalog.admin.dto.EditRequestNameRequest;
+import com.beautica.catalog.admin.dto.RejectRequestRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
 import jakarta.validation.Valid;
@@ -16,6 +17,7 @@ import org.springframework.data.web.PageableDefault;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -30,6 +32,9 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>Errors: a refused edit is a 409 with the stable code under {@code data.code}
  * ({@code REQUEST_NOT_PENDING}, {@code DUPLICATE_PENDING}, {@code TYPE_EXISTS}); a bad name, id, kind or a missing /
  * invalid {@value AdminActor#HEADER} is a 400; an unknown id is a 404.
+ *
+ * <p>B503 (SVC-06) — {@code POST /{kind}/{id}/approve} and {@code /reject} run the same decision as the emailed link
+ * (promotion, decision e-mail NTF-35, token invalidated); a row no longer pending is 409 {@code REQUEST_NOT_PENDING}.
  */
 @RestController
 @RequestMapping("/api/v1/internal/catalog/requests")
@@ -60,6 +65,27 @@ public class InternalCatalogRequestController {
             @PathVariable String id,
             @Valid @RequestBody EditRequestNameRequest request) {
         adminService.editName(AdminActor.of(actorHeader), kind, id, request);
+        return ApiResponse.ok(null);
+    }
+
+    /** Approves a PENDING request. 200 with {@code data: null}. */
+    @PostMapping("/{kind}/{id}/approve")
+    public ApiResponse<Void> approve(
+            @RequestHeader(value = AdminActor.HEADER, required = false) String actorHeader,
+            @PathVariable CatalogRequestKind kind,
+            @PathVariable String id) {
+        adminService.approve(AdminActor.of(actorHeader), kind, id);
+        return ApiResponse.ok(null);
+    }
+
+    /** Rejects a PENDING request; the body {@code {"reason": "…"}} is optional. 200 with {@code data: null}. */
+    @PostMapping("/{kind}/{id}/reject")
+    public ApiResponse<Void> reject(
+            @RequestHeader(value = AdminActor.HEADER, required = false) String actorHeader,
+            @PathVariable CatalogRequestKind kind,
+            @PathVariable String id,
+            @Valid @RequestBody(required = false) RejectRequestRequest request) {
+        adminService.reject(AdminActor.of(actorHeader), kind, id, request == null ? null : request.reason());
         return ApiResponse.ok(null);
     }
 }
