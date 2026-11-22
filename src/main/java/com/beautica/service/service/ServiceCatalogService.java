@@ -1024,7 +1024,7 @@ public class ServiceCatalogService {
         Set<String> selectable = Set.copyOf(platformCategoryRepository.findSelectableNamesIn(requested));
         for (String category : requested) {
             if (!selectable.contains(category)) {
-                throw new BusinessException(HttpStatus.BAD_REQUEST, "Unknown category: " + category);
+                throw BusinessException.withUserInput(HttpStatus.BAD_REQUEST, "Unknown category: " + category);
             }
         }
     }
@@ -3129,7 +3129,7 @@ public class ServiceCatalogService {
         // self-service requests and REJECTED rows must never pass this gate.
         if (!platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 category, com.beautica.service.entity.PlatformCategoryStatus.APPROVED)) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST, "Unknown category: " + category);
+            throw BusinessException.withUserInput(HttpStatus.BAD_REQUEST, "Unknown category: " + category);
         }
     }
 

@@ -55,7 +55,7 @@ public class InternalCategoryService {
     })
     public PlatformCategoryResponse create(CreatePlatformCategoryRequest request) {
         if (platformCategoryRepository.existsByNameIgnoreCase(request.name())) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Category already exists: " + request.name());
+            throw BusinessException.withUserInput(HttpStatus.CONFLICT, "Category already exists: " + request.name());
         }
 
         // Ops-created categories are immediately usable: APPROVED + active. The

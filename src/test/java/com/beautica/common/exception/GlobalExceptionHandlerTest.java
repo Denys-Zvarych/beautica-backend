@@ -603,8 +603,8 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("handleBusiness — internal message is emitted at DEBUG level for server-side triage")
-    void should_emitDebugLog_when_businessExceptionThrown() {
+    @DisplayName("handleBusiness — a 409's internal message is emitted at WARN for server-side triage (phase 500)")
+    void should_emitWarnLog_when_conflictBusinessExceptionThrown() {
         // Arrange
         String internalMessage = "Owner master profile already exists in a different salon";
         var ex = new ConflictException(internalMessage);
@@ -613,15 +613,15 @@ class GlobalExceptionHandlerTest {
         // Act
         handler.handleBusiness(ex);
 
-        // Assert — exactly one DEBUG event containing the internal message
-        List<ILoggingEvent> debugEvents = listAppender.list.stream()
-                .filter(e -> e.getLevel() == Level.DEBUG)
+        // Assert — exactly one WARN event containing the internal message
+        List<ILoggingEvent> warnEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
                 .toList();
-        assertThat(debugEvents)
-                .as("handleBusiness must emit exactly one DEBUG log for server-side triage")
+        assertThat(warnEvents)
+                .as("handleBusiness must emit exactly one WARN log for a 409")
                 .hasSize(1);
-        assertThat(debugEvents.get(0).getFormattedMessage())
-                .as("DEBUG log must contain the original internal message")
+        assertThat(warnEvents.get(0).getFormattedMessage())
+                .as("WARN log must contain the original internal message")
                 .contains(internalMessage);
     }
 
