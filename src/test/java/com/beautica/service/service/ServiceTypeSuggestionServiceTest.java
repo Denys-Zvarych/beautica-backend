@@ -2,6 +2,8 @@ package com.beautica.service.service;
 
 import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.CatalogRequestConflictException;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
@@ -519,5 +521,126 @@ class ServiceTypeSuggestionServiceTest {
         assertThatThrownBy(() -> service.approve(RAW_TOKEN)).isInstanceOf(IllegalStateException.class);
 
         verifyNoInteractions(notificationOutboxService);
+    }
+
+    // ── editPendingName (B502) ─────────────────────────────────────────────────
+
+    private ServiceTypeSuggestion lockedPending(UUID id) {
+        ServiceTypeSuggestion suggestion = pendingSuggestion(OffsetDateTime.now(Clock.fixed(NOW, ZoneOffset.UTC)).plusDays(3));
+        when(suggestionRepository.findByIdForUpdate(id)).thenReturn(Optional.of(suggestion));
+        return suggestion;
+    }
+
+    @Test
+    @DisplayName("should_renameAndReturnChange_when_suggestionPendingAndNameFree")
+    void should_renameAndReturnChange_when_suggestionPendingAndNameFree() {
+        UUID id = UUID.randomUUID();
+        ServiceTypeSuggestion suggestion = lockedPending(id);
+        when(suggestionRepository.existsOtherPendingByCategoryNameAndSuggestedNameIgnoreCase(CATEGORY, "Балаяж плюс", id))
+                .thenReturn(false);
+        when(promotionService.activeTypeExists(CATEGORY, "Балаяж плюс")).thenReturn(false);
+
+        ServiceTypeSuggestionService.NameChange change = service.editPendingName(id, "  Балаяж   плюс ");
+
+        assertThat(change).isEqualTo(new ServiceTypeSuggestionService.NameChange(CATEGORY, SUGGESTED, "Балаяж плюс"));
+        assertThat(suggestion.getSuggestedName()).as("canonical form stored").isEqualTo("Балаяж плюс");
+        assertThat(suggestion.getTokenHash()).as("email link stays valid (D2)").isEqualTo(TOKEN_HASH);
+        verify(suggestionRepository).saveAndFlush(suggestion);
+        verifyNoInteractions(emailService, inAppNotificationService, notificationOutboxService);
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_suggestionMissing")
+    void should_throwNotFound_when_suggestionMissing() {
+        UUID id = UUID.randomUUID();
+        when(suggestionRepository.findByIdForUpdate(id)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.editPendingName(id, "Балаяж"))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    @Test
+    @DisplayName("should_throwRequestNotPending_when_suggestionAlreadyDecided")
+    void should_throwRequestNotPending_when_suggestionAlreadyDecided() {
+        UUID id = UUID.randomUUID();
+        ServiceTypeSuggestion suggestion = lockedPending(id);
+        suggestion.approve(OffsetDateTime.now(Clock.fixed(NOW, ZoneOffset.UTC)));
+
+        assertThatThrownBy(() -> service.editPendingName(id, "Балаяж плюс"))
+                .isInstanceOfSatisfying(CatalogRequestConflictException.class, ex -> assertThat(ex.getCode())
+                        .isEqualTo(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING));
+        verify(suggestionRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("should_throw400_when_nameBreaksAllowList")
+    void should_throw400_when_nameBreaksAllowList() {
+        UUID id = UUID.randomUUID();
+        lockedPending(id);
+
+        assertThatThrownBy(() -> service.editPendingName(id, "Балаяж \uD83D\uDC85"))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        ex -> assertThat(ex.getStatus()).isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST));
+        verify(suggestionRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("should_throwDuplicatePending_when_otherPendingHasName")
+    void should_throwDuplicatePending_when_otherPendingHasName() {
+        UUID id = UUID.randomUUID();
+        lockedPending(id);
+        when(suggestionRepository.existsOtherPendingByCategoryNameAndSuggestedNameIgnoreCase(CATEGORY, "Омбре", id))
+                .thenReturn(true);
+
+        assertThatThrownBy(() -> service.editPendingName(id, "Омбре"))
+                .isInstanceOfSatisfying(CatalogRequestConflictException.class, ex -> assertThat(ex.getCode())
+                        .isEqualTo(CatalogRequestConflictException.Code.DUPLICATE_PENDING));
+        verify(suggestionRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("should_throwDuplicatePending_when_dedupIndexRejectsFlush")
+    void should_throwDuplicatePending_when_dedupIndexRejectsFlush() {
+        UUID id = UUID.randomUUID();
+        lockedPending(id);
+        when(suggestionRepository.existsOtherPendingByCategoryNameAndSuggestedNameIgnoreCase(CATEGORY, "Омбре", id))
+                .thenReturn(false);
+        when(promotionService.activeTypeExists(CATEGORY, "Омбре")).thenReturn(false);
+        DataIntegrityViolationException race = new DataIntegrityViolationException("dup",
+                new ConstraintViolationException("dup", new SQLException("dup"),
+                        ServiceTypeSuggestionService.PENDING_DEDUP_INDEX));
+        when(suggestionRepository.saveAndFlush(any(ServiceTypeSuggestion.class))).thenThrow(race);
+
+        assertThatThrownBy(() -> service.editPendingName(id, "Омбре"))
+                .isInstanceOfSatisfying(CatalogRequestConflictException.class, ex -> assertThat(ex.getCode())
+                        .isEqualTo(CatalogRequestConflictException.Code.DUPLICATE_PENDING));
+    }
+
+    @Test
+    @DisplayName("should_throwTypeExists_when_activeServiceTypeHasName")
+    void should_throwTypeExists_when_activeServiceTypeHasName() {
+        UUID id = UUID.randomUUID();
+        lockedPending(id);
+        when(suggestionRepository.existsOtherPendingByCategoryNameAndSuggestedNameIgnoreCase(CATEGORY, "Стрижка", id))
+                .thenReturn(false);
+        when(promotionService.activeTypeExists(CATEGORY, "Стрижка")).thenReturn(true);
+
+        assertThatThrownBy(() -> service.editPendingName(id, "Стрижка"))
+                .isInstanceOfSatisfying(CatalogRequestConflictException.class, ex -> assertThat(ex.getCode())
+                        .isEqualTo(CatalogRequestConflictException.Code.TYPE_EXISTS));
+        verify(suggestionRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("should_throw400_when_canonicalNameExceeds100AfterNfkc")
+    void should_throw400_when_canonicalNameExceeds100AfterNfkc() {
+        UUID id = UUID.randomUUID();
+        lockedPending(id);
+        String ligatures = "\uFB01".repeat(100); // 100 raw chars, NFKC → 200 ("fi" × 100)
+
+        assertThatThrownBy(() -> service.editPendingName(id, ligatures))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        ex -> assertThat(ex.getStatus()).isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST));
+        verify(suggestionRepository, never()).saveAndFlush(any());
     }
 }

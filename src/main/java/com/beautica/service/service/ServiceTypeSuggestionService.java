@@ -2,6 +2,8 @@ package com.beautica.service.service;
 
 import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.CatalogRequestConflictException;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
@@ -60,6 +62,8 @@ public class ServiceTypeSuggestionService {
     static final String PENDING_DEDUP_INDEX = "ux_service_type_suggestion_pending_dedup";
     private static final String DUPLICATE_PENDING_MESSAGE = "A matching suggestion is already pending review";
     private static final String REVIEW_PATH = "/api/v1/service-types/suggestions/review?token=";
+    /** SVC-08 cap on a portal-edited suggested name (B502), re-checked after canonicalisation. */
+    private static final int MAX_EDITED_NAME_LENGTH = 100;
 
     private final ServiceTypeSuggestionRepository suggestionRepository;
     private final TokenGenerator tokenGenerator;
@@ -197,6 +201,60 @@ public class ServiceTypeSuggestionService {
 
     private static BusinessException duplicatePending() {
         return new BusinessException(HttpStatus.CONFLICT, DUPLICATE_PENDING_MESSAGE);
+    }
+
+    /** B502 — the suggested name before and after a portal edit (for the caller's audit row). */
+    public record NameChange(String categoryName, String before, String after) {}
+
+    /**
+     * B502 (SVC-55) — the platform operator corrects the suggested name while the suggestion is PENDING. The name goes
+     * through the SAME validator as {@link #submitSuggestion} ({@code ServiceCatalogService.canonicalSuggestedName}:
+     * NFKC, space-collapse, SVC-07 allow-list → 400). The outstanding email token stays valid (track D2), so the link
+     * then approves the corrected name. The row is locked, so a concurrent approve/reject serialises with the edit.
+     *
+     * @throws NotFoundException               no suggestion with this id
+     * @throws CatalogRequestConflictException {@code REQUEST_NOT_PENDING} when already decided;
+     *                                         {@code DUPLICATE_PENDING} when another PENDING suggestion in the category
+     *                                         has the name (pre-check or the V197 index); {@code TYPE_EXISTS} when an
+     *                                         active service type in the category already has it
+     */
+    @Transactional
+    public NameChange editPendingName(UUID suggestionId, String rawName) {
+        ServiceTypeSuggestion suggestion = suggestionRepository.findByIdForUpdate(suggestionId)
+                .orElseThrow(() -> new NotFoundException("Request not found"));
+        if (!suggestion.isPending()) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING);
+        }
+        String name = ServiceCatalogService.canonicalSuggestedName(rawName);
+        // SVC-08 on the CANONICAL form: the DTO's @Size(max = 100) runs before NFKC, which can lengthen (ﬁ → fi),
+        // and canonicalSuggestedName only re-checks the 255 column cap.
+        if (name.length() > MAX_EDITED_NAME_LENGTH) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Name must be at most 100 characters");
+        }
+        String category = suggestion.getCategoryName();
+        if (suggestionRepository.existsOtherPendingByCategoryNameAndSuggestedNameIgnoreCase(
+                category, name, suggestionId)) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.DUPLICATE_PENDING);
+        }
+        if (promotionService.activeTypeExists(category, name)) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.TYPE_EXISTS);
+        }
+        String before = suggestion.getSuggestedName();
+        suggestion.renamePending(name);
+        flushRename(suggestion);
+        return new NameChange(category, before, name);
+    }
+
+    /** Flushes now so a lost race on {@value #PENDING_DEDUP_INDEX} is the same 409 as the pre-check, not a 500. */
+    private void flushRename(ServiceTypeSuggestion suggestion) {
+        try {
+            suggestionRepository.saveAndFlush(suggestion);
+        } catch (DataIntegrityViolationException ex) {
+            if (isPendingDedupViolation(ex)) {
+                throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.DUPLICATE_PENDING);
+            }
+            throw ex;
+        }
     }
 
     /**

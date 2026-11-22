@@ -1242,7 +1242,8 @@ public class ServiceCatalogService {
      * {@code ""} so callers can default it to the type name.
      */
     @Nullable
-    private static String canonicalName(@Nullable String name) {
+    // Package-private (B502): CategoryRequestService.editPendingName reuses it for a request's display name.
+    static String canonicalName(@Nullable String name) {
         String canonical = normaliseNameForm(name);
         if (canonical == null) {
             return null;
@@ -2181,7 +2182,9 @@ public class ServiceCatalogService {
      * and the strip empties it, so the blank check re-runs here (400, never a blank row). Re-checks
      * the 255-char column cap (NFKC can lengthen) and the post-normalisation allow-list.
      */
-    private static String canonicalSuggestedName(@Nullable String name) {
+    // Package-private (B502): the SAME validator for the portal's suggested-name edit
+    // (ServiceTypeSuggestionService.editPendingName) and a category request's initial service name.
+    static String canonicalSuggestedName(@Nullable String name) {
         String canonical = normaliseNameForm(name);
         if (canonical == null || canonical.isEmpty()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Name is required");

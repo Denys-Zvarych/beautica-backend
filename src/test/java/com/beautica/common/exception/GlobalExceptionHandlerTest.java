@@ -1306,6 +1306,27 @@ class GlobalExceptionHandlerTest {
                 .isEqualTo("Portfolio photo limit reached");
     }
 
+    // ── catalog-admin request edit (B502) ──────────────────────────────────────
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(CatalogRequestConflictException.Code.class)
+    @DisplayName("handleCatalogRequestConflict — 409 with the code under data.code and a fixed message")
+    void should_return409WithCatalogRequestCode_when_catalogRequestEditRefused(
+            CatalogRequestConflictException.Code code) {
+        var ex = new CatalogRequestConflictException(code);
+
+        ResponseEntity<ApiResponse<CatalogRequestConflictResponse>> response = handler.handleCatalogRequestConflict(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().data().code()).isEqualTo(code.name());
+        assertThat(response.getBody().errors()).as("the code lives in data, errors stays absent").isNull();
+        assertThat(response.getBody().message())
+                .as("fixed copy, never ex.getMessage()")
+                .isNotEqualTo(ex.getMessage())
+                .isNotBlank();
+    }
+
     // ── guest reschedule cap (Phase 431, D4b) ──────────────────────────────────
 
     @Test

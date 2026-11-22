@@ -2,6 +2,8 @@ package com.beautica.service.service;
 
 import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.CatalogRequestConflictException;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
@@ -198,6 +200,63 @@ public class CategoryRequestService {
     @Transactional
     public DecisionOutcome reject(String rawToken, String reason) {
         return decide(rawToken, false, reason);
+    }
+
+    /** B502 — the editable fields before and after a portal edit (for the caller's audit row). */
+    public record NameChange(String displayNameBefore, String displayNameAfter,
+                             String initialServiceNameBefore, String initialServiceNameAfter) {}
+
+    /**
+     * B502 (SVC-55) — the platform operator corrects the requested display name (and optionally the carried initial
+     * service name) while the request is PENDING. The wire {@code name} never changes (track D4); the outstanding
+     * email token stays valid (track D2). The display name follows the service-name rules (SVC-07 allow-list, SVC-08
+     * 100 chars, {@code ServiceCatalogService.canonicalName}); the initial service name goes through the suggestion
+     * validator it eventually feeds ({@code canonicalSuggestedName}). {@code initialServiceName}: {@code null} keeps
+     * the current value, a blank string clears it. Pending rows are not cached, so nothing is evicted.
+     *
+     * @throws NotFoundException               no category row with this id
+     * @throws CatalogRequestConflictException {@code REQUEST_NOT_PENDING} when the row is not a PENDING request
+     */
+    @Transactional
+    public NameChange editPendingName(Long categoryId, String rawDisplayName, String rawInitialServiceName) {
+        PlatformCategory category = platformCategoryRepository.findByIdForUpdate(categoryId)
+                .orElseThrow(() -> new NotFoundException("Request not found"));
+        if (!category.isPending()) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING);
+        }
+        String displayName = ServiceCatalogService.canonicalName(rawDisplayName);
+        if (displayName == null || displayName.isEmpty()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Name is required");
+        }
+        String initialBefore = category.getInitialServiceName();
+        String initialAfter = resolveInitialServiceName(rawInitialServiceName, initialBefore);
+        String displayBefore = category.getDisplayName();
+        category.editPendingRequest(displayName, initialAfter);
+        flushEdit(category);
+        return new NameChange(displayBefore, displayName, initialBefore, initialAfter);
+    }
+
+    /**
+     * Flushes now (same as the suggestion edit) so a constraint violation surfaces inside the service: a
+     * {@value #NAME_UNIQUE_CONSTRAINT} hit maps to the request 409 instead of a 500 at commit. The wire name is never
+     * changed here, so that branch is defensive.
+     */
+    private void flushEdit(PlatformCategory category) {
+        try {
+            platformCategoryRepository.saveAndFlush(category);
+        } catch (DataIntegrityViolationException ex) {
+            if (isNameUniqueViolation(ex)) {
+                throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.DUPLICATE_PENDING);
+            }
+            throw ex;
+        }
+    }
+
+    private static String resolveInitialServiceName(String raw, String current) {
+        if (raw == null) {
+            return current;
+        }
+        return raw.isBlank() ? null : ServiceCatalogService.canonicalSuggestedName(raw);
     }
 
     /**

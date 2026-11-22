@@ -78,6 +78,20 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
      */
     Optional<PlatformCategory> findByName(String name);
 
+    /**
+     * B502 — the row a catalog-admin request edit mutates, locked ({@code FOR UPDATE}) so the edit serialises with a
+     * concurrent email-link approve/reject ({@link #findByTokenHashForUpdate}).
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select c from PlatformCategory c where c.id = :id")
+    Optional<PlatformCategory> findByIdForUpdateNoLockTimeout(@Param("id") Long id);
+
+    /** {@link #findByIdForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default Optional<PlatformCategory> findByIdForUpdate(Long id) {
+        applyTransactionLockTimeout();
+        return findByIdForUpdateNoLockTimeout(id);
+    }
+
     /** Phase 372 — batch display-name lookup for suggestion feed items (one statement per page). */
     List<PlatformCategory> findByNameIn(Collection<String> names);
 

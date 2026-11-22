@@ -353,6 +353,27 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * B502 (SVC-55) — distinct 409 for a refused catalog-admin request edit: the
+     * {@link CatalogRequestConflictResponse} body carries {@code REQUEST_NOT_PENDING} / {@code DUPLICATE_PENDING} /
+     * {@code TYPE_EXISTS} under {@code data.code}, which {@link #handleBusiness}'s genericised CONFLICT branch would
+     * otherwise drop. The message is fixed here, never {@code ex.getMessage()}. A new code; no existing body changes.
+     */
+    @ExceptionHandler(CatalogRequestConflictException.class)
+    public ResponseEntity<ApiResponse<CatalogRequestConflictResponse>> handleCatalogRequestConflict(
+            CatalogRequestConflictException ex) {
+        log.debug("Catalog request edit refused: {}", ex.getCode());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false,
+                        new CatalogRequestConflictResponse(ex.getCode().name()),
+                        switch (ex.getCode()) {
+                            case REQUEST_NOT_PENDING -> "Request is no longer pending";
+                            case DUPLICATE_PENDING -> "A matching request is already pending";
+                            case TYPE_EXISTS -> "A service type with this name already exists";
+                        }));
+    }
+
+    /**
      * Phase 431 — distinct 409 for the guest-booking reschedule cap (5 provider reschedules per guest
      * booking/visit per rolling 24 h): the {@link RescheduleLimitReachedResponse} body carries
      * {@code RESCHEDULE_LIMIT_REACHED} under {@code data.code}, which {@link #handleBusiness}'s

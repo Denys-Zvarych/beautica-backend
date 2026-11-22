@@ -60,4 +60,37 @@ public interface ServiceTypeSuggestionRepository extends JpaRepository<ServiceTy
     boolean existsPendingByCategoryNameAndSuggestedNameIgnoreCase(
             @Param("categoryName") String categoryName,
             @Param("suggestedName") String suggestedName);
+
+    /**
+     * B502 — the row a catalog-admin name edit mutates, locked ({@code FOR UPDATE}) so the edit serialises with a
+     * concurrent email-link approve/reject ({@link #findByTokenHashForUpdate}); the loser then sees the new status.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select s from ServiceTypeSuggestion s where s.id = :id")
+    Optional<ServiceTypeSuggestion> findByIdForUpdateNoLockTimeout(@Param("id") UUID id);
+
+    /** {@link #findByIdForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default Optional<ServiceTypeSuggestion> findByIdForUpdate(UUID id) {
+        applyTransactionLockTimeout();
+        return findByIdForUpdateNoLockTimeout(id);
+    }
+
+    /**
+     * B502 — the rename pre-check: another PENDING suggestion (not {@code excludedId}) with the same category slug and
+     * case-insensitive name. Same {@code LOWER(...)} key as V197's {@code ux_service_type_suggestion_pending_dedup},
+     * which stays the real guard (the service translates its violation to the same 409).
+     */
+    @Query("""
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM ServiceTypeSuggestion s
+                 WHERE s.status = com.beautica.service.entity.ServiceTypeSuggestionStatus.PENDING
+                   AND s.categoryName = :categoryName
+                   AND LOWER(s.suggestedName) = LOWER(:suggestedName)
+                   AND s.id <> :excludedId
+            ) THEN true ELSE false END
+            """)
+    boolean existsOtherPendingByCategoryNameAndSuggestedNameIgnoreCase(
+            @Param("categoryName") String categoryName,
+            @Param("suggestedName") String suggestedName,
+            @Param("excludedId") UUID excludedId);
 }

@@ -201,6 +201,22 @@ public class PlatformCategory {
         return this.status == PlatformCategoryStatus.PENDING;
     }
 
+    /**
+     * B502 (SVC-55) — corrects the requested display name (and, optionally, the carried initial service name) of a
+     * PENDING request. The wire {@code name} never changes (track D4). The token stays valid (track D2). Caller has
+     * already validated and canonicalised both values.
+     *
+     * @param initialServiceName the new value, {@code null} to clear it
+     * @throws IllegalStateException when the request is no longer PENDING (the service checks first)
+     */
+    public void editPendingRequest(String displayName, String initialServiceName) {
+        if (!isPending()) {
+            throw new IllegalStateException("Only a PENDING category request can be edited");
+        }
+        this.displayName = displayName;
+        this.initialServiceName = initialServiceName;
+    }
+
     private void clearToken() {
         this.tokenHash = null;
         this.tokenExpiresAt = null;
