@@ -647,4 +647,161 @@ class ProviderClientServiceTest {
         assertThat(policy.phoneFor(null)).as("unverified/absent").isNull();
         assertThat(policy.phoneFor(null)).isNull();
     }
+
+    // ── B507 list: the total rides on the page query (perf audit) ────────────
+
+    @Test
+    @DisplayName("listClients: the total comes from the page rows - one statement, no count query")
+    void should_takeTotalFromPageRows_when_listingClients() {
+        com.beautica.client.provider.repository.ClientListRowProjection row =
+                mock(com.beautica.client.provider.repository.ClientListRowProjection.class);
+        when(row.getTotal()).thenReturn(41L);
+        when(row.getAnchorBookingId()).thenReturn(bookingId);
+        when(row.getClientId()).thenReturn(userId);
+        when(repository.pageBySalon(eq(salonId), any(), eq(null), eq(20), eq(0L))).thenReturn(List.of(row));
+        when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        var page = service.listClients(new SalonScope(salonId, null), null,
+                org.springframework.data.domain.PageRequest.of(0, 20));
+
+        assertThat(page.getTotalElements()).isEqualTo(41);
+        assertThat(page.getContent()).hasSize(1);
+        assertThat(page.getContent().get(0).userId()).isEqualTo(userId);
+        verify(repository).pageBySalon(eq(salonId), any(), eq(null), eq(20), eq(0L));
+        verifyNoMoreInteractions(repository);
+    }
+
+    @Test
+    @DisplayName("listClients: a page past the end is the one placeholder row - empty content, total kept")
+    void should_returnEmptyContentWithTotal_when_onlyThePlaceholderRowComesBack() {
+        com.beautica.client.provider.repository.ClientListRowProjection placeholder =
+                mock(com.beautica.client.provider.repository.ClientListRowProjection.class);
+        when(placeholder.getTotal()).thenReturn(7L);
+        when(placeholder.getAnchorBookingId()).thenReturn(null);
+        when(repository.pageByMaster(eq(masterId), any(), eq(null), eq(5), eq(25L))).thenReturn(List.of(placeholder));
+        when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        var page = service.listClients(new MasterScope(masterId, null), null,
+                org.springframework.data.domain.PageRequest.of(5, 5));
+
+        assertThat(page.getContent()).isEmpty();
+        assertThat(page.getTotalElements()).isEqualTo(7);
+    }
+
+    // ── B507 list: block + rating mapping (audit cycle 2) ────────────────────
+
+    private com.beautica.client.provider.repository.ClientListRowProjection listRow(UUID clientId, String guestPhone,
+                                                                                   String verifiedPhone) {
+        com.beautica.client.provider.repository.ClientListRowProjection p =
+                mock(com.beautica.client.provider.repository.ClientListRowProjection.class);
+        lenient().when(p.getTotal()).thenReturn(1L);
+        lenient().when(p.getAnchorBookingId()).thenReturn(UUID.randomUUID());
+        lenient().when(p.getClientId()).thenReturn(clientId);
+        lenient().when(p.getGuestPhone()).thenReturn(guestPhone);
+        lenient().when(p.getVerifiedPhone()).thenReturn(verifiedPhone);
+        lenient().when(p.getGuestName()).thenReturn("Гість");
+        lenient().when(p.getFirstName()).thenReturn("Анна");
+        return p;
+    }
+
+    private List<com.beautica.client.provider.dto.ClientListItemResponse> list(
+            com.beautica.client.provider.repository.ClientListRowProjection... rows) {
+        when(repository.pageBySalon(eq(salonId), any(), eq(null), eq(20), eq(0L))).thenReturn(List.of(rows));
+        return service.listClients(new SalonScope(salonId, null), null, PageRequest.of(0, 20)).getContent();
+    }
+
+    @Test
+    @DisplayName("listClients: a guest phone that cannot be hashed is not blocked and never reaches the block lookup")
+    void should_listGuestUnblocked_when_guestPhoneFailsToHash() {
+        when(phoneHasher.tryHash(PHONE)).thenReturn(Optional.empty());
+        when(clientBlockService.blockedAmong(any(), eq(List.of()), eq(List.of())))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        var rows = list(listRow(null, PHONE, null));
+
+        assertThat(rows).singleElement().satisfies(r -> {
+            assertThat(r.kind()).isEqualTo(ClientKind.GUEST);
+            assertThat(r.blocked()).isFalse();
+        });
+        verify(clientBlockService).blockedAmong(any(), eq(List.of()), eq(List.of()));
+    }
+
+    @Test
+    @DisplayName("listClients: a guest row without a phone is listed unblocked and the hasher is never called")
+    void should_listGuestUnblocked_when_guestHasNoPhone() {
+        when(clientBlockService.blockedAmong(any(), eq(List.of()), eq(List.of())))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        var rows = list(listRow(null, null, null));
+
+        assertThat(rows).singleElement().satisfies(r -> {
+            assertThat(r.kind()).isEqualTo(ClientKind.GUEST);
+            assertThat(r.blocked()).isFalse();
+            assertThat(r.displayName()).isEqualTo("Гість");
+        });
+        verifyNoInteractions(phoneHasher);
+    }
+
+    @Test
+    @DisplayName("listClients: a registered row is blocked by its account block OR its verified-phone block (one "
+            + "lookup for both); an unverified account is never hashed")
+    void should_mergeAccountAndVerifiedPhoneBlocks_when_listingRegisteredRows() {
+        UUID byAccount = UUID.randomUUID();
+        UUID byPhone = UUID.randomUUID();
+        UUID free = UUID.randomUUID();
+        String freePhone = "+380671112233";
+        HashedPhone blockedHash = mock(HashedPhone.class);
+        HashedPhone freeHash = mock(HashedPhone.class);
+        when(phoneHasher.tryHash(PHONE)).thenReturn(Optional.of(blockedHash));
+        when(phoneHasher.tryHash(freePhone)).thenReturn(Optional.of(freeHash));
+        when(clientBlockService.blockedAmong(any(), eq(List.of(byAccount, byPhone, free)),
+                eq(List.of(blockedHash, freeHash))))
+                .thenReturn(new BlockedAmong(Set.of(byAccount), Set.of(blockedHash)));
+
+        var rows = list(listRow(byAccount, null, null), listRow(byPhone, null, PHONE), listRow(free, null, freePhone));
+
+        assertThat(rows).extracting(r -> r.userId(), r -> r.blocked())
+                .containsExactly(org.assertj.core.groups.Tuple.tuple(byAccount, true),
+                        org.assertj.core.groups.Tuple.tuple(byPhone, true),
+                        org.assertj.core.groups.Tuple.tuple(free, false));
+        verify(clientBlockService).blockedAmong(any(), anyCollection(), anyCollection());
+        verify(phoneHasher, never()).tryHash(null);
+    }
+
+    @Test
+    @DisplayName("listClients: a registered verified phone that cannot be hashed falls back to the account block only")
+    void should_useAccountBlockOnly_when_verifiedPhoneFailsToHash() {
+        UUID c = UUID.randomUUID();
+        when(phoneHasher.tryHash(PHONE)).thenReturn(Optional.empty());
+        when(clientBlockService.blockedAmong(any(), eq(List.of(c)), eq(List.of())))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        var rows = list(listRow(c, null, PHONE));
+
+        assertThat(rows).singleElement().satisfies(r -> assertThat(r.blocked()).isFalse());
+    }
+
+    @Test
+    @DisplayName("listClients: review count 0 with a stale non-null avg lists ratingAvg null; count > 0 keeps the avg")
+    void should_hideStaleAverage_when_reviewCountIsZero() {
+        UUID stale = UUID.randomUUID();
+        UUID rated = UUID.randomUUID();
+        var staleRow = listRow(stale, null, null);
+        when(staleRow.getReviewCount()).thenReturn(0);
+        lenient().when(staleRow.getAvgRating()).thenReturn(new BigDecimal("4.50"));
+        var ratedRow = listRow(rated, null, null);
+        when(ratedRow.getReviewCount()).thenReturn(2);
+        when(ratedRow.getAvgRating()).thenReturn(new BigDecimal("3.50"));
+        when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        var rows = list(staleRow, ratedRow);
+
+        assertThat(rows.get(0).ratingAvg()).as("stale avg hidden").isNull();
+        assertThat(rows.get(0).ratingCount()).isZero();
+        assertThat(rows.get(1).ratingAvg()).isEqualByComparingTo("3.50");
+        assertThat(rows.get(1).ratingCount()).isEqualTo(2);
+    }
 }

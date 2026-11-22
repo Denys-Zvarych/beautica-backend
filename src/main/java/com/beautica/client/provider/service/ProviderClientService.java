@@ -108,25 +108,17 @@ public class ProviderClientService {
         int limit = pageable.getPageSize();
         long offset = pageable.getOffset();
 
-        List<ClientRow> rows;
-        long total;
-        switch (scope) {
-            case SalonScope(UUID salonId, UUID masterId) when masterId == null -> {
-                rows = repository.pageBySalon(salonId, now, escapedQuery, limit, offset)
-                        .stream().map(ClientRow::of).toList();
-                total = repository.countBySalon(salonId, now, escapedQuery);
-            }
-            case SalonScope(UUID salonId, UUID masterId) -> {
-                rows = repository.pageBySalonAndMaster(salonId, masterId, now, escapedQuery, limit, offset)
-                        .stream().map(ClientRow::of).toList();
-                total = repository.countBySalonAndMaster(salonId, masterId, now, escapedQuery);
-            }
-            case MasterScope(UUID masterId, UUID ignoredSalonId) -> {
-                rows = repository.pageByMaster(masterId, now, escapedQuery, limit, offset)
-                        .stream().map(ClientRow::of).toList();
-                total = repository.countByMaster(masterId, now, escapedQuery);
-            }
-        }
+        List<ClientListRowProjection> page = switch (scope) {
+            case SalonScope(UUID salonId, UUID masterId) when masterId == null ->
+                    repository.pageBySalon(salonId, now, escapedQuery, limit, offset);
+            case SalonScope(UUID salonId, UUID masterId) ->
+                    repository.pageBySalonAndMaster(salonId, masterId, now, escapedQuery, limit, offset);
+            case MasterScope(UUID masterId, UUID ignoredSalonId) ->
+                    repository.pageByMaster(masterId, now, escapedQuery, limit, offset);
+        };
+        // One statement: the total rides on every row; an empty page is one placeholder row (anchor null).
+        long total = page.isEmpty() || page.get(0).getTotal() == null ? 0 : page.get(0).getTotal();
+        List<ClientRow> rows = page.stream().filter(p -> p.getAnchorBookingId() != null).map(ClientRow::of).toList();
         return new PageImpl<>(toResponses(scope, rows), pageable, total);
     }
 

@@ -364,8 +364,8 @@ class SalonAdminBookingViewIT extends AbstractIntegrationTest {
         assertThat(data.path("clientFirstName").asText()).isEqualTo("Guesta");
         assertThat(data.path("clientLastName").asText()).isEqualTo("Visitor");
         assertThat(data.path("providerCanReviewClient").asBoolean()).as("guest is not rateable").isFalse();
-        // Phase 386 (user rule 2026-10-22): the assigned admin is in the guest-phone audience.
-        assertThat(data.path("guestPhone").asText()).isEqualTo("+380501234567");
+        // GST-80 / CLI-D08 (2026-11-21): booking detail carries no phone for any role (client card only).
+        assertThat(data.path("guestPhone").isNull()).isTrue();
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────────

@@ -15,10 +15,24 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.data.domain.PageRequest;
+import com.beautica.client.provider.dto.ClientCardResponse;
+import com.beautica.client.provider.dto.ClientListItemResponse;
+import com.beautica.client.provider.repository.ProviderClientRepository;
+import com.beautica.client.provider.service.ClientPhonePolicy;
+import com.beautica.client.provider.service.ClientRef;
+import com.beautica.client.provider.service.ClientScope.SalonScope;
+import com.beautica.client.provider.service.ProviderClientService;
+import com.beautica.moderation.service.ClientBlockService;
+import com.beautica.review.service.ClientRatingSummaryService;
+import java.time.Clock;
+import java.time.ZoneOffset;
 
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -52,6 +66,10 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
     @Autowired private TransactionTemplate transactionTemplate;
     @Autowired private com.beautica.client.service.ClientPhoneAttachService attachService;
     @Autowired private EntityManagerFactory entityManagerFactory;
+    @Autowired private ProviderClientRepository providerClientRepository;
+    @Autowired private ClientBlockService clientBlockService;
+    @Autowired private ClientPhonePolicy clientPhonePolicy;
+    @Autowired private ClientRatingSummaryService clientRatingSummaryService;
 
     private ProviderClientFixtures fx;
 
@@ -529,7 +547,42 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
         assertThat(visitsA).hasSize(2);
         assertThat(guestOnlyA.path("stats").path("totalVisits").asInt()).as("B's row of the same phone excluded")
                 .isEqualTo(1);
-        assertNotFound(fx.get(token, guestCard(s.salonId(), guestA) + "?masterId=" + masterB));
+        // CLI-74 (audit fix): the anchor is checked salon-wide, so A's anchor under chip B shows B's row only.
+        JsonNode guestOnlyB = ok(fx.get(token, guestCard(s.salonId(), guestA) + "?masterId=" + masterB));
+        assertThat(guestOnlyB.path("stats").path("totalVisits").asInt()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("CLI-74 audit fix: guest anchored on master B, chip A -> card, visits and ratings 200 narrowed to A; "
+            + "an out-of-salon anchor and a master who never served the guest stay 404")
+    void should_resolveGuestSalonWide_when_anchorIsWithAnotherMasterThanTheChip() throws Exception {
+        Salon s = fx.salon();
+        Salon foreign = fx.salon();
+        UUID masterB = (UUID) fx.secondMaster(s.salonId(), "Друга")[0];
+        UUID masterC = (UUID) fx.secondMaster(s.salonId(), "Третя")[0];
+        UUID olderA = fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Гість", "А", "COMPLETED", fx.at(-9));
+        UUID anchorB = fx.guestBooking(masterB, s.salonId(), GUEST_PHONE, "Гість", "Б", "COMPLETED", fx.at(-3));
+        UUID foreignAnchor = fx.guestBooking(foreign.masterId(), foreign.salonId(), GUEST_PHONE, "Гість", "Ф",
+                "COMPLETED", fx.at(-2));
+        String token = fx.token(s.ownerEmail());
+        String chipA = "?masterId=" + s.masterId();
+
+        JsonNode card = ok(fx.get(token, guestCard(s.salonId(), anchorB) + chipA));
+        List<JsonNode> visits = visitRows(fx.get(token, guestCard(s.salonId(), anchorB) + "/visits" + chipA));
+        ResponseEntity<String> ratings = fx.get(token, guestCard(s.salonId(), anchorB) + "/ratings" + chipA);
+
+        assertThat(card.path("stats").path("totalVisits").asInt()).isEqualTo(1);
+        assertThat(card.path("guestBookingId").asText()).as("anchor of the narrowed card").isEqualTo(olderA.toString());
+        assertThat(servedIds(card)).containsExactly(masterB.toString(), s.masterId().toString());
+        assertThat(visits).hasSize(1);
+        assertThat(visits.get(0).path("visitKey").asText()).isEqualTo(olderA.toString());
+        assertThat(ratings.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertNotFound(fx.get(token, guestCard(s.salonId(), foreignAnchor) + chipA));
+        assertNotFound(fx.get(token, guestCard(s.salonId(), foreignAnchor) + "/visits" + chipA));
+        assertNotFound(fx.get(token, guestCard(s.salonId(), foreignAnchor) + "/ratings" + chipA));
+        assertNotFound(fx.get(token, guestCard(s.salonId(), anchorB) + "?masterId=" + masterC));
+        assertNotFound(fx.get(token, guestCard(s.salonId(), anchorB) + "/visits?masterId=" + masterC));
+        assertNotFound(fx.get(token, guestCard(s.salonId(), anchorB) + "/ratings?masterId=" + masterC));
     }
 
     @Test
@@ -940,5 +993,100 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
         assertThat(visits.get(0).path("visitKey").asText()).isEqualTo(visit.toString());
         assertThat(visits.get(0).path("items").findValuesAsText("bookingId")).containsExactly(inScope.toString());
         assertThat(visits.toString()).doesNotContain(anonymised.toString());
+    }
+
+    // ── audit cycle 2: boundaries, self-delete, independent-master block ─────────
+
+    @Test
+    @DisplayName("boundary: with the clock fixed on a CONFIRMED booking's exact start, list and card count it as the "
+            + "last visit (<= now), never the next (> now)")
+    void should_treatABookingStartingExactlyNowAsLastNotNext_when_clockIsFixedOnIt() {
+        Salon s = fx.salon();
+        UUID c = fx.client("Межа", "Часу");
+        Instant now = fx.at(1);
+        Instant later = fx.at(3);
+        fx.booking(s.masterId(), s.salonId(), c, "CONFIRMED", now);
+        fx.booking(s.masterId(), s.salonId(), c, "CONFIRMED", later);
+        ProviderClientService fixedNow = new ProviderClientService(providerClientRepository, clientBlockService,
+                phoneHasher, clientPhonePolicy, clientRatingSummaryService, Clock.fixed(now, ZoneOffset.UTC),
+                objectMapper);
+        SalonScope scope = new SalonScope(s.salonId(), null);
+
+        ClientListItemResponse row = fixedNow.listClients(scope, null, PageRequest.of(0, 20)).getContent().get(0);
+        ClientCardResponse card = fixedNow.getCard(scope, new ClientRef.Registered(c));
+
+        assertThat(row.lastVisitAt().toInstant()).as("list last").isEqualTo(now);
+        assertThat(row.nextVisitAt().toInstant()).as("list next").isEqualTo(later);
+        assertThat(card.lastVisitAt().toInstant()).as("card last").isEqualTo(now);
+        assertThat(card.nextVisitAt().toInstant()).as("card next").isEqualTo(later);
+        assertThat(card.stats().upcomingVisits()).as("upcoming counts only the later one").isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("self-delete: the deleted client's old userId card, visits and ratings and its detached booking used "
+            + "as a guest anchor are all the uniform 404")
+    void should_return404_when_clientDeletedTheAccount() throws Exception {
+        Salon s = fx.salon();
+        String clientEmail = fx.email("selfdel");
+        UUID c = fx.user(clientEmail, "CLIENT", null, "Видаляю", "Себе");
+        UUID booking = fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-5));
+        clientReview(booking, c, s.masterId(), s.salonId(), 4, "VISIBLE");
+        String owner = fx.token(s.ownerEmail());
+        assertThat(fx.get(owner, userCard(s.salonId(), c)).getStatusCode()).as("card before the delete")
+                .isEqualTo(HttpStatus.OK);
+        HttpHeaders auth = new HttpHeaders();
+        auth.setBearerAuth(fx.token(clientEmail));
+
+        ResponseEntity<Void> deleted = restTemplate.exchange("/api/v1/users/me", HttpMethod.DELETE,
+                new HttpEntity<>(auth), Void.class);
+
+        assertThat(deleted.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(jdbcTemplate.queryForObject("SELECT client_detached_at IS NOT NULL FROM bookings WHERE id = ?",
+                Boolean.class, booking)).as("booking detached").isTrue();
+        ResponseEntity<String> unknown = fx.get(owner, userCard(s.salonId(), UUID.randomUUID()));
+        List<ResponseEntity<String>> responses = List.of(
+                fx.get(owner, userCard(s.salonId(), c)),
+                fx.get(owner, userCard(s.salonId(), c) + "/visits"),
+                fx.get(owner, userCard(s.salonId(), c) + "/ratings"),
+                fx.get(owner, guestCard(s.salonId(), booking)),
+                fx.get(owner, guestCard(s.salonId(), booking) + "/visits"),
+                fx.get(owner, guestCard(s.salonId(), booking) + "/ratings"),
+                fx.get(fx.token(s.masterEmail()), ME_URL + "/users/" + c),
+                fx.get(fx.token(s.masterEmail()), ME_URL + "/guests/" + booking));
+        for (ResponseEntity<String> resp : responses) {
+            assertNotFound(resp);
+            assertThat(withoutRequestId(resp)).isEqualTo(withoutRequestId(unknown));
+        }
+    }
+
+    @Test
+    @DisplayName("independent master: the card's blocked flag follows the master's own block, for a registered client "
+            + "and a guest; another master's block is ignored")
+    void should_flagBlockedOnCard_when_independentMasterBlockedTheClient() throws Exception {
+        Independent a = fx.independent();
+        Independent other = fx.independent();
+        UUID blockedClient = fx.client("Блок", "Майстра");
+        UUID freeClient = fx.client("Вільна", "Клієнтка");
+        fx.booking(a.masterId(), null, blockedClient, "COMPLETED", fx.at(-9));
+        fx.booking(a.masterId(), null, freeClient, "COMPLETED", fx.at(-8));
+        UUID blockedGuest = fx.guestBooking(a.masterId(), null, GUEST_PHONE, "Гість", "Блок", "COMPLETED", fx.at(-7));
+        UUID otherBlockedGuest = fx.guestBooking(a.masterId(), null, "+380677778899", "Гість", "Чужий", "COMPLETED",
+                fx.at(-6));
+        PhoneHasher.HashedPhone guestHash = phoneHasher.hash(GUEST_PHONE);
+        PhoneHasher.HashedPhone otherHash = phoneHasher.hash("+380677778899");
+        jdbcTemplate.update("INSERT INTO client_blocks (id, blocker_master_id, blocked_user_id, display_name) "
+                + "VALUES (?, ?, ?, 'Клієнт')", UUID.randomUUID(), a.masterId(), blockedClient);
+        jdbcTemplate.update("INSERT INTO client_blocks (id, blocker_master_id, phone_hash, phone_last4, display_name) "
+                + "VALUES (?, ?, ?, ?, 'Гість')", UUID.randomUUID(), a.masterId(), guestHash.hash(), guestHash.last4());
+        jdbcTemplate.update("INSERT INTO client_blocks (id, blocker_master_id, phone_hash, phone_last4, display_name) "
+                + "VALUES (?, ?, ?, ?, 'Гість')", UUID.randomUUID(), other.masterId(), otherHash.hash(),
+                otherHash.last4());
+        String token = fx.token(a.email());
+
+        assertThat(ok(fx.get(token, ME_URL + "/users/" + blockedClient)).path("blocked").asBoolean(false)).isTrue();
+        assertThat(ok(fx.get(token, ME_URL + "/guests/" + blockedGuest)).path("blocked").asBoolean(false)).isTrue();
+        assertThat(ok(fx.get(token, ME_URL + "/users/" + freeClient)).path("blocked").asBoolean(true)).isFalse();
+        assertThat(ok(fx.get(token, ME_URL + "/guests/" + otherBlockedGuest)).path("blocked").asBoolean(true))
+                .as("another master's block").isFalse();
     }
 }

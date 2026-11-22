@@ -460,8 +460,8 @@ class ProviderClientControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("18: at most page + count + blocks statements, independent of the page size")
-    void should_issueAtMostFourStatements_when_listing() throws Exception {
+    @DisplayName("18: at most page (total included) + blocks statements, independent of the page size")
+    void should_issueAtMostThreeStatements_when_listing() throws Exception {
         Salon s = fx.salon();
         for (int i = 0; i < 6; i++) {
             fx.booking(s.masterId(), s.salonId(), fx.client("Клієнт" + i, "Статистика"), "COMPLETED", fx.at(-30 + i));
@@ -482,7 +482,27 @@ class ProviderClientControllerIT extends AbstractIntegrationTest {
         assertThat(rows(small)).hasSize(2);
         assertThat(rows(large)).hasSize(12);
         assertThat(smallPage).as("statements for a 2-row page").isEqualTo(largePage);
-        assertThat(largePage).as("page + count + blocks + the one @authz salon-access lookup").isLessThanOrEqualTo(4);
+        assertThat(largePage).as("page (carries the total) + blocks + the one @authz salon-access lookup")
+                .isLessThanOrEqualTo(3);
+        assertThat(json(large).path("data").path("totalElements").asLong()).isEqualTo(12);
+    }
+
+    @Test
+    @DisplayName("18b: the total rides on the page query - a page past the end is empty but still carries it")
+    void should_carryTotal_when_pageIsPastTheEnd() throws Exception {
+        Salon s = fx.salon();
+        for (int i = 0; i < 3; i++) {
+            fx.booking(s.masterId(), s.salonId(), fx.client("Клієнт" + i, "Порожня"), "COMPLETED", fx.at(-10 + i));
+        }
+        String token = fx.token(s.ownerEmail());
+
+        ResponseEntity<String> past = salonList(token, s.salonId(), "page=5&size=2");
+        ResponseEntity<String> filteredOut = fx.get(token, SALON_URL.formatted(s.salonId()) + "?q={q}", "Нікого");
+
+        assertThat(rows(past)).isEmpty();
+        assertThat(json(past).path("data").path("totalElements").asLong()).isEqualTo(3);
+        assertThat(rows(filteredOut)).isEmpty();
+        assertThat(json(filteredOut).path("data").path("totalElements").asLong()).isZero();
     }
 
     @Test
@@ -500,6 +520,22 @@ class ProviderClientControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("19b: first name and surname come from the SAME latest booking - never a mixed name")
+    void should_takeNameFromOneBooking_when_latestBookingHasNoSurname() throws Exception {
+        Salon s = fx.salon();
+        fx.guestBooking(s.masterId(), s.salonId(), "LINK", GUEST_PHONE, "Олена", "Коваль", "COMPLETED", fx.at(-9));
+        fx.guestBooking(s.masterId(), s.salonId(), "LINK", GUEST_PHONE, "Марія", null, "COMPLETED", fx.at(-3));
+        String token = fx.token(s.ownerEmail());
+
+        List<JsonNode> rows = rows(salonList(token, s.salonId(), null));
+        List<JsonNode> byOldSurname = rows(fx.get(token, SALON_URL.formatted(s.salonId()) + "?q={q}", "Коваль"));
+
+        assertThat(rows).hasSize(1);
+        assertThat(rows.get(0).path("displayName").asText()).isEqualTo("Марія");
+        assertThat(byOldSurname).as("search matches the shown name, not a stale surname").isEmpty();
+    }
+
+    @Test
     @DisplayName("20: blank, whitespace-only and empty q are 400 (the client must omit q, never send it empty)")
     void should_return400_when_qIsBlankWhitespaceOrEmpty() throws Exception {
         Salon s = fx.salon();
@@ -513,6 +549,57 @@ class ProviderClientControllerIT extends AbstractIntegrationTest {
             assertThat(json(resp).path("success").asBoolean(true)).as("body=%s", resp.getBody()).isFalse();
         }
         assertThat(rows(salonList(token, s.salonId(), null))).as("omitted q lists everyone").hasSize(1);
+    }
+
+    @Test
+    @DisplayName("15b: q of exactly 50 chars is accepted (51 is 400, case 15); a control char inside the text is 400")
+    void should_acceptFiftyCharQ_and_rejectMidStringControlChar() throws Exception {
+        Salon s = fx.salon();
+        String longSurname = "Б".repeat(45);
+        fx.booking(s.masterId(), s.salonId(), fx.client("Анна", longSurname), "COMPLETED", fx.at(-5));
+        String token = fx.token(s.ownerEmail());
+        String fifty = "Анна " + longSurname;
+        assertThat(fifty).hasSize(50);
+
+        List<JsonNode> matched = rows(fx.get(token, SALON_URL.formatted(s.salonId()) + "?q={q}", fifty));
+        ResponseEntity<String> control = fx.get(token, SALON_URL.formatted(s.salonId()) + "?q={q}", "ан\u0001на");
+
+        assertThat(matched).extracting(r -> r.path("displayName").asText()).containsExactly("Анна " + longSurname);
+        assertThat(control.getStatusCode()).as(control.getBody()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(json(control).path("success").asBoolean(true)).isFalse();
+    }
+
+    @Test
+    @DisplayName("17b: a provider with no clients gets 200 with an empty content list and totalElements 0")
+    void should_returnEmptyPageBody_when_providerHasNoClients() throws Exception {
+        Salon s = fx.salon();
+        Independent a = fx.independent();
+
+        for (ResponseEntity<String> resp : List.of(salonList(fx.token(s.ownerEmail()), s.salonId(), null),
+                fx.get(fx.token(s.masterEmail()), ME_URL), fx.get(fx.token(a.email()), ME_URL))) {
+            JsonNode page = json(resp).path("data");
+
+            assertThat(resp.getStatusCode()).as(resp.getBody()).isEqualTo(HttpStatus.OK);
+            assertThat(page.path("data").isArray()).as(resp.getBody()).isTrue();
+            assertThat(page.path("data")).as(resp.getBody()).isEmpty();
+            assertThat(page.path("totalElements").asLong(-1)).as(resp.getBody()).isZero();
+        }
+    }
+
+    @Test
+    @DisplayName("13c: a registered row with review_count 0 but a stale non-null avg_rating lists ratingAvg null, count 0")
+    void should_listNullRating_when_reviewCountIsZeroButAvgIsStale() throws Exception {
+        Salon s = fx.salon();
+        UUID c = fx.client("Застаріла", "Оцінка");
+        jdbcTemplate.update("UPDATE users SET avg_rating = 4.50, review_count = 0 WHERE id = ?", c);
+        fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-5));
+
+        ResponseEntity<String> resp = salonList(fx.token(s.ownerEmail()), s.salonId(), null);
+        JsonNode row = rows(resp).get(0);
+
+        assertThat(row.path("ratingAvg").isNull()).as(resp.getBody()).isTrue();
+        assertThat(row.path("ratingCount").asInt(-1)).isZero();
+        assertThat(resp.getBody()).doesNotContain("4.5");
     }
 
     @Test

@@ -141,16 +141,16 @@ class GuestLinkBookingProviderViewIT extends AbstractIntegrationTest {
     // ── single-service booking ───────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("real salon-master LINK booking with a comment: owner and admin see comment AND phone; "
-            + "the performing salon master sees the comment but NO phone")
-    void should_showCommentToAllAndPhoneOnlyToOwnerAdmin_when_guestBooksSalonMasterOverLink() throws Exception {
+    @DisplayName("real salon-master LINK booking with a comment: owner, admin and the performing "
+            + "salon master see the comment and NO phone (GST-80)")
+    void should_showCommentToAllAndPhoneToNoOne_when_guestBooksSalonMasterOverLink() throws Exception {
         UUID id = UUID.fromString(created(guestBook("\"serviceId\":\"" + firstService + "\"", 3,
                 ",\"clientComment\":\"" + NOTE + "\"")).path("bookingId").asText());
 
         for (String token : List.of(ownerToken, adminToken)) {
             JsonNode detail = data(get("/api/v1/bookings/" + id, token));
             assertThat(detail.path("clientComment").asText()).isEqualTo(NOTE);
-            assertThat(detail.path("guestPhone").asText()).isEqualTo(GUEST_PHONE);
+            assertThat(detail.path("guestPhone").isNull()).isTrue();
         }
         ResponseEntity<String> performing = get("/api/v1/bookings/" + id, performingMasterToken);
         assertThat(data(performing).path("clientComment").asText()).isEqualTo(NOTE);
@@ -191,8 +191,8 @@ class GuestLinkBookingProviderViewIT extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("real multi-service LINK visit: the note is on the visit payload for every provider, the visit payload "
-            + "never carries the phone, and each child's detail follows the phone rule")
-    void should_keepPhoneOffVisitPayloadButOnChildDetail_when_guestBooksVisitOverLink() throws Exception {
+            + "never carries the phone, and no child's detail does either (GST-80)")
+    void should_keepPhoneOffVisitPayloadAndChildDetail_when_guestBooksVisitOverLink() throws Exception {
         JsonNode visit = created(guestBook("\"masterServiceIds\":[\"" + firstService + "\",\"" + secondService + "\"]", 4,
                 ",\"clientComment\":\"" + NOTE + "\""));
         UUID appointmentId = UUID.fromString(visit.path("appointmentId").asText());
@@ -206,8 +206,7 @@ class GuestLinkBookingProviderViewIT extends AbstractIntegrationTest {
             assertThat(appointment.getBody()).as("visit payload never carries the guest phone").doesNotContain(GUEST_DIGITS);
         }
         for (UUID child : children) {
-            assertThat(data(get("/api/v1/bookings/" + child, ownerToken)).path("guestPhone").asText())
-                    .isEqualTo(GUEST_PHONE);
+            assertThat(data(get("/api/v1/bookings/" + child, ownerToken)).path("guestPhone").isNull()).isTrue();
             ResponseEntity<String> asMaster = get("/api/v1/bookings/" + child, performingMasterToken);
             assertThat(asMaster.getBody()).doesNotContain(GUEST_DIGITS);
         }

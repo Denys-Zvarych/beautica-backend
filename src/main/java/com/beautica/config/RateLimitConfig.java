@@ -226,6 +226,17 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.notification-feed-capacity:60}")
     private long notificationFeedCapacity;
 
+    /**
+     * Per-AUTHENTICATED-USER cap (60 s window) shared by the twelve provider client reads (B507 list, B508 card +
+     * visits, B526 ratings; salon and independent-master routes, user and guest variants) — consumed by
+     * {@link BookingRateLimitFilter}. Each is an aggregate over the provider's booking history; own bucket so a busy
+     * client tab never contends with the salon board or the notification poll. Sizing 120/min: one card open spends
+     * ~3 tokens (card + first visits page + list refresh), so 40 card opens a minute — beyond any human browsing.
+     * Overridden in {@code application-test.yml} (ITs drive many reads as one token).
+     */
+    @Value("${app.rate-limit.provider-client-read-capacity:120}")
+    private long providerClientReadCapacity;
+
     // ══════════════════════════════════════════════════════════════════════════════════════════
     // ACCEPTED RISK — 2026-09-15, architect sign-off (wish-list hull audit, cycle 2, perf LOW).
     // GET /api/v1/favorites/** — and GET /api/v1/favorites/services in particular — carries NO
@@ -936,6 +947,16 @@ public class RateLimitConfig {
     }
 
     /**
+     * Per-user bucket (see {@link #providerClientReadCapacity}) shared by the twelve provider client reads, consumed
+     * by {@link BookingRateLimitFilter}.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> providerClientReadBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, providerClientReadCapacity, ONE_MINUTE);
+    }
+
+    /**
      * Per-user bucket (see {@link #contentReportCapacity}) consumed by {@code ContentReportService} (bound by
      * field name {@code contentReportBuckets}). {@code expireAfterAccess} gives the usual 5-minute grace past the
      * 24-hour window.
@@ -1505,7 +1526,7 @@ public class RateLimitConfig {
                 staffBookingSmsBuckets(), selfDeleteBuckets(), salonMasterServicesReadBuckets(),
                 salonBoardReadBuckets(), notificationFeedBuckets(), catalogueBrowsePrincipalBuckets(),
                 catalogueBrowseBuckets(), catalogueBrowseAuthenticatedIpBuckets(), bookingLinkMutationBuckets(),
-                objectMapper);
+                providerClientReadBuckets(), objectMapper);
     }
 
     /**

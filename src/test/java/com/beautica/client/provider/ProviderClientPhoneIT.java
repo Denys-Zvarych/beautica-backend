@@ -92,7 +92,7 @@ class ProviderClientPhoneIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("detail + card: IM, owner and admin see the VERIFIED registered phone; guestPhone stays null")
+    @DisplayName("IM, owner and admin see the VERIFIED registered phone on the card only; booking detail carries none (CLI-D08)")
     void should_showVerifiedPhone_when_viewerIsAudience() throws Exception {
         Salon s = fx.salon();
         Independent indep = fx.independent();
@@ -113,8 +113,9 @@ class ProviderClientPhoneIT extends AbstractIntegrationTest {
         details.put("admin detail", adminDetail);
         details.put("independent master detail", soloDetail);
         details.forEach((who, detail) -> {
-            assertThat(detail.path("clientPhone").asText()).as(who + " clientPhone").isEqualTo(VERIFIED_PHONE);
-            assertThat(absent(detail.path("guestPhone"))).as(who + " guestPhone legacy semantics").isTrue();
+            assertThat(absent(detail.path("clientPhone"))).as(who + " clientPhone").isTrue();
+            assertThat(absent(detail.path("guestPhone"))).as(who + " guestPhone").isTrue();
+            assertThat(detail.toString()).as(who + " body").doesNotContain(VERIFIED_PHONE.substring(4));
         });
         Map<String, JsonNode> cards = new LinkedHashMap<>();
         cards.put("owner card", ownerCard);
@@ -178,16 +179,17 @@ class ProviderClientPhoneIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("guest booking: clientPhone and guestPhone both carry the guest phone; the card shows it (unchanged)")
-    void should_keepGuestBehaviour_when_guestBooking() throws Exception {
+    @DisplayName("guest booking: booking detail carries no phone (GST-80); the card shows it")
+    void should_showGuestPhoneOnCardOnly_when_guestBooking() throws Exception {
         Salon s = fx.salon();
         UUID b = fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Гість", "Салону", "COMPLETED", fx.at(-5));
 
         JsonNode detail = ok(fx.get(fx.token(s.ownerEmail()), BOOKINGS + "/" + b));
         JsonNode card = ok(fx.get(fx.token(s.ownerEmail()), SALON_URL.formatted(s.salonId()) + "/guests/" + b));
 
-        assertThat(detail.path("guestPhone").asText()).isEqualTo(GUEST_PHONE);
-        assertThat(detail.path("clientPhone").asText()).isEqualTo(GUEST_PHONE);
+        assertThat(absent(detail.path("guestPhone"))).isTrue();
+        assertThat(absent(detail.path("clientPhone"))).isTrue();
+        assertThat(detail.toString()).doesNotContain(GUEST_PHONE.substring(4));
         assertThat(card.path("phone").asText()).isEqualTo(GUEST_PHONE);
     }
 

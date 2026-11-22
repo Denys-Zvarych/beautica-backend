@@ -70,18 +70,18 @@ public class ClientPassportCacheEvictor {
         evictPassport(event.clientUserId());
     }
 
-    /**
-     * A review authored by the client changes {@code reviewsWritten}.
-     *
-     * <p>Keyed on {@link ReviewCreatedEvent#clientId()} — the AUTHOR — not {@code masterId}.
-     * The master's own passport is unaffected: providers do not have one.
-     */
     /** B527 — bookings attached to the account by phone (CLI-62) move its passport and timeline. */
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onBookingsAttached(ClientBookingsAttachedEvent event) {
         evictPassport(event.clientUserId());
     }
 
+    /**
+     * A review authored by the client changes {@code reviewsWritten}.
+     *
+     * <p>Keyed on {@link ReviewCreatedEvent#clientId()} — the AUTHOR — not {@code masterId}.
+     * The master's own passport is unaffected: providers do not have one.
+     */
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onReviewCreated(ReviewCreatedEvent event) {
         evictPassport(event.clientId());

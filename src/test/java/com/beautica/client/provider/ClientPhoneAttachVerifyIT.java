@@ -439,6 +439,37 @@ class ClientPhoneAttachVerifyIT extends AbstractPhoneIdentityIT {
     }
 
     @Test
+    @DisplayName("CLI-63: after the attach the client cancels the attached future LINK booking and reviews the attached "
+            + "past LINK booking in the app, exactly like an APP booking")
+    void should_letTheClientCancelAndReview_when_linkBookingsWereAttached() throws Exception {
+        ProviderClientFixtures.Salon s = fx.salon();
+        String phone = newPhone();
+        UUID future = fx.guestBooking(s.masterId(), s.salonId(), "LINK", phone, "Іванна", "Коваль", "CONFIRMED",
+                fx.at(futureDay++));
+        UUID past = fx.guestBooking(s.masterId(), s.salonId(), "LINK", phone, "Іванна", "Коваль", "COMPLETED",
+                fx.at(-4));
+        String token = json(register(phone, "CLIENT")).at("/data/auth/accessToken").asText();
+        UUID account = userIdOfPhone(phone);
+        assertAttached(List.of(future, past), account, "PHONE_VERIFIED");
+
+        ResponseEntity<String> cancelled = exchangeAs(token, HttpMethod.PATCH, "/api/v1/bookings/" + future + "/cancel",
+                Map.of("cancellationReason", "CLIENT_CANCELLED"));
+        JsonNode before = json(exchangeAs(token, HttpMethod.GET, "/api/v1/bookings/" + past, null)).path("data");
+        ResponseEntity<String> reviewed = postAs(token, "/api/v1/reviews",
+                Map.of("bookingId", past.toString(), "rating", 5, "comment", "Чудово"));
+        JsonNode after = json(exchangeAs(token, HttpMethod.GET, "/api/v1/bookings/" + past, null)).path("data");
+
+        assertThat(cancelled.getStatusCode()).as(cancelled.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, future))
+                .isEqualTo("CANCELLED");
+        assertThat(before.path("canReview").asBoolean(false)).as("canReview before, body=%s", before).isTrue();
+        assertThat(reviewed.getStatusCode()).as(reviewed.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(jdbcTemplate.queryForObject("SELECT client_id FROM reviews WHERE booking_id = ?", UUID.class, past))
+                .isEqualTo(account);
+        assertThat(after.path("canReview").asBoolean(true)).as("one review per booking").isFalse();
+    }
+
+    @Test
     @DisplayName("V260 attached CHECK arm: a blank guest_name is rejected on an attached LINK and an attached STAFF row, "
             + "a null guest_name on an attached LINK row")
     void should_rejectBlankGuestName_when_theRowIsAttached() {

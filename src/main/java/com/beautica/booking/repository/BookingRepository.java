@@ -2270,26 +2270,28 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     /**
      * B527 audit cycle 3 — the retry sweep's work list: up to {@code limit} phones that are the verified phone of an active
      * CLIENT account AND still carry attachable guest / walk-in rows (same predicates as {@link #attachGuestRowsByPhone}
-     * and V261). Drives from the verified CLIENT accounts ({@code ux_users_verified_phone}, V244) with an {@code EXISTS}
-     * probe into {@code idx_bookings_guest_phone_open} (V199, partial on the same open-guest predicate), so the normal
-     * no-match case costs one index probe per verified client rather than a scan of every unattached guest row.
+     * and V261). Drives from the DISTINCT open guest phones ({@code idx_bookings_guest_phone_open}, V199, partial on the
+     * same open-guest predicate; booking_source is re-checked on the heap) and joins each to a verified CLIENT account through
+     * {@code ux_users_verified_phone} (V244, partial on {@code phone_verified_at IS NOT NULL}), so the cost tracks the
+     * number of open guest phones, never the number of verified clients. The verified phone is unique (V244), so a phone
+     * joins at most one account and the result has no duplicates - the same set the per-user EXISTS form returned.
      * {@code ORDER BY random()} (applied to the already-filtered phones only) rotates the selection so phones that keep
      * failing cannot fill every run and starve the rest; the 30-minute cadence makes random fair. Phones only — the
      * caller never logs them.
      */
     @Query(value = """
             SELECT u.phone_number
-              FROM users u
+              FROM (SELECT DISTINCT b.guest_phone
+                      FROM bookings b
+                     WHERE b.guest_phone IS NOT NULL
+                       AND b.client_id IS NULL
+                       AND b.guest_pii_anonymised_at IS NULL
+                       AND b.client_detached_at IS NULL
+                       AND b.booking_source IN ('LINK', 'STAFF')) open_phones
+              JOIN users u ON u.phone_number = open_phones.guest_phone
+                          AND u.phone_verified_at IS NOT NULL
              WHERE u.role = 'CLIENT'
                AND u.is_active
-               AND u.phone_verified_at IS NOT NULL
-               AND EXISTS (SELECT 1
-                             FROM bookings b
-                            WHERE b.guest_phone = u.phone_number
-                              AND b.client_id IS NULL
-                              AND b.guest_pii_anonymised_at IS NULL
-                              AND b.client_detached_at IS NULL
-                              AND b.booking_source IN ('LINK', 'STAFF'))
              ORDER BY random()
              LIMIT :limit
             """, nativeQuery = true)
