@@ -86,13 +86,10 @@ import java.util.UUID;
  * provider, the salon owner, and — since phase 356 — an assigned, active {@code SALON_ADMIN} of the
  * booking's salon; {@code enforceCanViewBooking} never admits a CLIENT actor onto a null-client
  * booking) still has a name to put on their calendar.
- * {@code guestPhone} (phase 386, user decision 2026-10-22) IS surfaced to part of the provider side — but only on the
- * booking DETAIL read, only to an INDEPENDENT_MASTER (their own booking), the SALON_OWNER or an assigned SALON_ADMIN
- * (never to a SALON_MASTER, even the performing one, and never to a client), only for a guest
- * booking ({@code client_id IS NULL}), and only until phase 373 anonymises/erases it (then it reads {@code null}). It
- * is attached by {@link #withProviderVisibleGuestPhone} and never by {@link #from}, so every list, feed, create and
- * reschedule response carries {@code null}. HARD RULE: a REGISTERED user's phone never reaches a provider — the field
- * is sourced only from {@code booking.guestPhone}, never from a {@code User}. {@code clientAvatarUrl} has NO guest
+ * {@code guestPhone} / {@code clientPhone} are ALWAYS {@code null} (GST-80, GST-D14, CLI-D08, BOOK-78, user
+ * 2026-11-21: booking detail carries no phone for any role; the phone lives only on the provider client card). The
+ * two components stay in the record only so old app builds keep parsing the same OpenAPI shape; nothing populates
+ * them. {@code clientAvatarUrl} has NO guest
  * fallback and is always {@code null} for a guest booking: there is no account, hence no uploaded
  * photo, and nothing to fall back TO — unlike the name, which falls back to the OTP-verified
  * {@code guestName}/{@code guestSurname}. Guest cards render the generic glyph.
@@ -495,18 +492,10 @@ public record BookingDetailResponse(
                         + "an unreviewed registered client; NULL for a guest/no-client booking "
                         + "(no account, so 'unknown' rather than 'zero').")
         Integer clientReviewCount,
-        // Phase 386. Appended LAST like every field above. Populated ONLY by withProviderVisibleGuestPhone, which
-        // GET /bookings/{id} calls after the provider-audience gate; every other construction site passes null.
+        // Phase 386 field, retired by GST-80 / CLI-D08 (2026-11-21): always null, kept for old app builds.
         @Schema(types = {"string", "null"}, nullable = true, format = "phone",
-                description = "E.164 phone of the GUEST who booked through a link (or the walk-in phone a staff "
-                        + "member typed), for the provider's tap-to-call. NON-NULL ONLY when ALL hold: this is the "
-                        + "booking DETAIL read (GET /bookings/{id}), the viewer's ROLE is INDEPENDENT_MASTER "
-                        + "(their own link's booking), SALON_OWNER or an assigned SALON_ADMIN of the salon - a "
-                        + "SALON_MASTER NEVER sees it, even as the performing master - and NOT the owning "
-                        + "client, the booking is a guest booking (client_id IS NULL) and it has not been "
-                        + "anonymised/erased. NULL on every list/feed row, on the create and reschedule "
-                        + "responses, for a client viewer, and ALWAYS for a booking made by a registered "
-                        + "account: a registered user's phone is never exposed to any provider.")
+                description = "Retired (GST-80, CLI-D08): ALWAYS null. Booking detail carries no phone for any "
+                        + "role; the client's phone is on the provider client card only. Kept for old app builds.")
         String guestPhone,
         // Phase 397 (mobile 425 inputs). Appended LAST like every field above. Populated ONLY by withClientBlockState,
         // which GET /bookings/{id} calls for a blocker-role viewer; every other construction site passes false/null/false.
@@ -521,14 +510,10 @@ public record BookingDetailResponse(
                 + "answer 400/403/404): a provider viewer in scope, and a registered client or a link guest with a "
                 + "verified phone. False for a STAFF walk-in, an erased guest, list rows and non-provider viewers.")
         boolean clientBlockable,
-        // B518 (GST-D14, GST-80). Appended LAST. Populated ONLY by the two provider-visible withers on the detail read.
+        // B518 field, retired by GST-80 / CLI-D08 (2026-11-21): always null, kept for old app builds.
         @Schema(types = {"string", "null"}, nullable = true, format = "phone",
-                description = "E.164 phone of the booking's client, for the provider's tap-to-call: the guest's phone "
-                        + "for a guest booking, or the registered client's SMS-VERIFIED phone (never an unverified "
-                        + "one). NON-NULL ONLY on the booking DETAIL read (GET /bookings/{id}) for an "
-                        + "INDEPENDENT_MASTER, SALON_OWNER or assigned SALON_ADMIN - a SALON_MASTER NEVER sees it. "
-                        + "NULL on every list/feed row, on create and reschedule responses and for a client viewer. "
-                        + "guestPhone keeps its legacy guest-only semantics for old app builds.")
+                description = "Retired (GST-80, CLI-D08): ALWAYS null. Booking detail carries no phone for any "
+                        + "role; the client's phone is on the provider client card only. Kept for old app builds.")
         String clientPhone
 ) {
 
@@ -548,52 +533,6 @@ public record BookingDetailResponse(
                 appointmentId, clientAvatarUrl, awaitingClosure, masterAvgRating, masterReviewCount, salonId,
                 categoryKey, reviewByClient, clientAvgRating, clientReviewCount, guestPhone,
                 blockId != null, blockId, blockable, clientPhone);
-    }
-
-    /**
-     * Phase 386 HARD RULE — the ONLY place {@code guestPhone} is ever populated, and it is null by construction for
-     * a registered client's booking: the value is read from {@code booking.getGuestPhone()} (the E.164 the GUEST
-     * gave) and only when {@code booking.getClient() == null}. It is never read from a {@code User}, the account
-     * row, a token or an OTP — a registered user's phone has no path into this DTO. The caller must already have
-     * passed {@code AuthorizationService#enforceCanViewBooking} and established the viewer is not the owning client
-     * (the audience gate lives in {@code BookingService#getBooking}); this wither enforces the data-side half.
-     *
-     * @param booking the hydrated booking this response was built from
-     * @return a copy with {@code guestPhone} set for a guest booking, otherwise {@code this} unchanged
-     */
-    public BookingDetailResponse withProviderVisibleGuestPhone(Booking booking) {
-        String phone = booking.getClient() == null ? booking.getGuestPhone() : null;
-        if (phone == null) {
-            return this;
-        }
-        return withPhones(phone, phone);
-    }
-
-    /**
-     * B518 (GST-D14, GST-80) - attaches {@code clientPhone} for a REGISTERED client's booking, and only when the
-     * account's phone is SMS-verified ({@code users.phone_verified_at IS NOT NULL}); an unverified number is never
-     * read onto the wire. {@code guestPhone} stays null (legacy semantics). The caller has already applied the
-     * audience gate ({@code AuthorizationService#isGuestPhoneAudience}) in {@code BookingService#getBooking}.
-     */
-    public BookingDetailResponse withProviderVisibleRegisteredPhone(Booking booking) {
-        User client = booking.getClient();
-        if (client == null || client.getPhoneVerifiedAt() == null || client.getPhoneNumber() == null) {
-            return this;
-        }
-        return withPhones(guestPhone, client.getPhoneNumber());
-    }
-
-    /** The single positional-constructor copy for the phone withers: only guestPhone and clientPhone differ. */
-    private BookingDetailResponse withPhones(String newGuestPhone, String newClientPhone) {
-        return new BookingDetailResponse(
-                id, clientId, masterId, masterServiceId, serviceName, status, startsAt, endsAt, priceAtBooking,
-                priceMaxAtBooking, durationMinutesAtBooking, createdAt, clientFirstName, clientLastName,
-                masterFirstName, masterLastName, masterProfessionalTitle, clientComment, providerComment,
-                clientCancellationNote, masterAvatarUrl, masterType, salonName, cityLabel,
-                districtLabel, street, buildingNo, locationNote, categoryName, canReview, providerCanReviewClient,
-                appointmentId, clientAvatarUrl, awaitingClosure, masterAvgRating, masterReviewCount, salonId,
-                categoryKey, reviewByClient, clientAvgRating, clientReviewCount, newGuestPhone,
-                clientBlocked, clientBlockId, clientBlockable, newClientPhone);
     }
 
     /**
@@ -811,14 +750,13 @@ public record BookingDetailResponse(
                 // zero-review normalisation reuses masterAvgRatingOrNull, not a parallel helper.
                 client != null ? masterAvgRatingOrNull(client.getReviewCount(), client.getAvgRating()) : null,
                 client != null ? client.getReviewCount() : null,
-                // Phase 386: null here ALWAYS — the provider-visible guest phone is attached afterwards, and only by
-                // the detail read (withProviderVisibleGuestPhone), never by a factory list callers share.
+                // guestPhone: null ALWAYS (GST-80 / CLI-D08 - booking detail carries no phone for any role).
                 null,
                 // Phase 397: block state is attached afterwards by the detail read only (withClientBlockState).
                 false,
                 null,
                 false,
-                // B518: clientPhone is attached afterwards by the detail read only, like guestPhone.
+                // clientPhone: null ALWAYS (GST-80 / CLI-D08).
                 null
         );
     }

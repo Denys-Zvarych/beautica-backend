@@ -49,8 +49,10 @@ final class ClientCardSql {
 
     // ── SALON scope narrowed by ?masterId= (owner/admin master mode): the identity rows are read salon-wide into
     //    `salon_scoped` (the chip row's source) and `scoped` narrows them to the master, so the card aggregate sees
-    //    exactly the rows SALON_MASTER_WHERE selected before. The guest anchor keeps SALON_MASTER_WHERE: the anchor
-    //    must still be the master's own booking, else the uniform 404. ──
+    //    exactly the rows SALON_MASTER_WHERE selects. The guest anchor is checked SALON-wide (CLI-74: the list's
+    //    guestBookingId is the latest salon booking, any master; owner/admin see the salon anyway, no new disclosure);
+    //    an anchor outside the salon is still the uniform 404, and a guest with no booking of that master is too
+    //    (empty `scoped`), exactly like the registered variant. ──
     private static final String NARROW_TO_MASTER = """
             , scoped AS (SELECT id, visit_key, status, starts_at, guest_name, guest_surname, master_id
                            FROM salon_scoped WHERE master_id = :masterId)
@@ -59,18 +61,24 @@ final class ClientCardSql {
     private static final String GUEST_SALON_WIDE = GUEST_ANCHOR_END + "salon_scoped AS (" + SCOPED_COLS;
 
     // ── card ──
+    // The anchor = the newest scope row; the guest name + surname come from ONE row, the newest that carries a name
+    // (never a mixed «Марія Петренко»). Two top-1 reads of the (single-client, multiply-referenced hence materialised)
+    // `scoped` CTE instead of three per-aggregate array builds.
     private static final String CARD_AGG = """
-            SELECT COUNT(DISTINCT visit_key) AS totalVisits,
-                   COUNT(DISTINCT visit_key) FILTER (WHERE status = 'COMPLETED') AS completedVisits,
-                   COUNT(DISTINCT visit_key) FILTER (WHERE status = 'CONFIRMED' AND starts_at > :now) AS upcomingVisits,
-                   MIN(starts_at) AS firstVisitAt,
-                   MAX(starts_at) FILTER (WHERE starts_at <= :now AND status IN ('COMPLETED','CONFIRMED')) AS lastVisitAt,
-                   MIN(starts_at) FILTER (WHERE starts_at >  :now AND status = 'CONFIRMED') AS nextVisitAt,
-                   (ARRAY_AGG(id ORDER BY starts_at DESC, id DESC))[1] AS anchorBookingId,
-                   (ARRAY_AGG(guest_name ORDER BY starts_at DESC) FILTER (WHERE guest_name IS NOT NULL))[1] AS guestName,
-                   (ARRAY_AGG(guest_surname ORDER BY starts_at DESC)
-                        FILTER (WHERE guest_surname IS NOT NULL))[1] AS guestSurname
-              FROM scoped
+            SELECT agg.*, lt.id AS anchorBookingId, nm.guest_name AS guestName, nm.guest_surname AS guestSurname
+              FROM (SELECT COUNT(DISTINCT visit_key) AS totalVisits,
+                           COUNT(DISTINCT visit_key) FILTER (WHERE status = 'COMPLETED') AS completedVisits,
+                           COUNT(DISTINCT visit_key) FILTER (WHERE status = 'CONFIRMED' AND starts_at > :now)
+                               AS upcomingVisits,
+                           MIN(starts_at) AS firstVisitAt,
+                           MAX(starts_at) FILTER (WHERE starts_at <= :now AND status IN ('COMPLETED','CONFIRMED'))
+                               AS lastVisitAt,
+                           MIN(starts_at) FILTER (WHERE starts_at >  :now AND status = 'CONFIRMED') AS nextVisitAt
+                      FROM scoped) agg
+              LEFT JOIN LATERAL (SELECT id FROM scoped ORDER BY starts_at DESC, id DESC LIMIT 1) lt ON TRUE
+              LEFT JOIN LATERAL (SELECT guest_name, guest_surname FROM scoped
+                                  WHERE guest_name IS NOT NULL OR guest_surname IS NOT NULL
+                                  ORDER BY starts_at DESC, id DESC LIMIT 1) nm ON TRUE
             """;
 
     // ── served-by masters (CLI-73), one extra column of the SALON card statements (no statement of its own: it
@@ -130,7 +138,7 @@ final class ClientCardSql {
 
     static final String CARD_GUEST_SALON = GUEST_OPEN_ANCHOR + SALON_WHERE + GUEST_CLOSE_ANCHOR + SALON_WHERE
             + GUEST_CLOSE + CARD_GUEST_HEAD + SERVED_FROM_SCOPED + CARD_GUEST_FROM;
-    static final String CARD_GUEST_SALON_MASTER = GUEST_OPEN_ANCHOR + SALON_MASTER_WHERE + GUEST_SALON_WIDE
+    static final String CARD_GUEST_SALON_MASTER = GUEST_OPEN_ANCHOR + SALON_WHERE + GUEST_SALON_WIDE
             + SALON_WHERE + GUEST_CLOSE + NARROW_TO_MASTER + CARD_GUEST_HEAD + SERVED_FROM_SALON_SCOPED
             + CARD_GUEST_FROM;
     static final String CARD_GUEST_MASTER = GUEST_OPEN_ANCHOR + MASTER_WHERE + GUEST_CLOSE_ANCHOR + MASTER_WHERE
@@ -157,7 +165,8 @@ final class ClientCardSql {
 
     static final String VISITS_GUEST_SALON =
             GUEST_OPEN_ANCHOR + SALON_WHERE + GUEST_CLOSE_ANCHOR + SALON_WHERE + GUEST_CLOSE + VISITS_PAGE_SELECT;
-    static final String VISITS_GUEST_SALON_MASTER = GUEST_OPEN_ANCHOR + SALON_MASTER_WHERE + GUEST_CLOSE_ANCHOR
+    // Anchor salon-wide, rows narrowed to the master (see NARROW_TO_MASTER).
+    static final String VISITS_GUEST_SALON_MASTER = GUEST_OPEN_ANCHOR + SALON_WHERE + GUEST_CLOSE_ANCHOR
             + SALON_MASTER_WHERE + GUEST_CLOSE + VISITS_PAGE_SELECT;
     static final String VISITS_GUEST_MASTER =
             GUEST_OPEN_ANCHOR + MASTER_WHERE + GUEST_CLOSE_ANCHOR + MASTER_WHERE + GUEST_CLOSE + VISITS_PAGE_SELECT;

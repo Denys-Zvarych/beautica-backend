@@ -200,9 +200,9 @@ class PublicSalonGuestAppStoryIT extends AbstractIntegrationTest {
     // ── 4. phone visibility (386) ───────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("phase 386: owner sees the guest phone on BOTH masters' bookings; each performing salon master gets "
-            + "null and the digits never appear in the body")
-    void should_showPhoneToOwnerButNotSalonMasters_when_guestBookedTwoMasters() throws Exception {
+    @DisplayName("GST-80: neither the owner nor either performing salon master gets the guest phone on booking "
+            + "detail; the digits never appear in the masters' bodies")
+    void should_showPhoneToNoOneOnDetail_when_guestBookedTwoMasters() throws Exception {
         JsonNode page = info();
         String token = guestTokenProvider.generate(guestPhone);
         UUID bookingA = bookingId(created(book(masterA, coverageRef(page, def1, masterA), LocalTime.of(12, 0), token)));
@@ -215,8 +215,7 @@ class PublicSalonGuestAppStoryIT extends AbstractIntegrationTest {
             ResponseEntity<String> owner = detail(bookingId, ownerToken);
             ResponseEntity<String> master = detail(bookingId, performerToken.get(bookingId));
 
-            assertThat(okJson(owner).path("data").path("guestPhone").asText()).as("owner, booking %s", bookingId)
-                    .isEqualTo(guestPhone);
+            assertThat(okJson(owner).path("data").path("guestPhone").isNull()).as("owner, booking %s", bookingId).isTrue();
             assertThat(okJson(master).path("data").path("guestPhone").isNull()).as("master, booking %s", bookingId)
                     .isTrue();
             assertThat(master.getBody()).doesNotContain(guestPhone.substring(4));

@@ -141,18 +141,20 @@ public class ClientPhoneAttachService {
      * Phase doc § 3 said "same transaction"; this is the deliberate deviation (orchestrator decision 2026-11-20).
      */
     public void attachAfterCommit(User verified, AttachReason reason) {
+        // Every caller verifies the phone inside a transaction (UserPhoneService#verifyLocked via TransactionTemplate,
+        // PhoneRegistrationService#register MANDATORY). Without one there is no commit to wait for, and attaching at
+        // once could reference a user row no other transaction can see yet - fail loudly instead.
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            throw new IllegalStateException("attachAfterCommit requires an active transaction");
+        }
         UUID clientId = verified.getId();
         String phone = verified.getPhoneNumber();
-        if (TransactionSynchronizationManager.isSynchronizationActive()) {
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    submitAttach(clientId, phone, reason);
-                }
-            });
-        } else {
-            submitAttach(clientId, phone, reason);
-        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                submitAttach(clientId, phone, reason);
+            }
+        });
     }
 
     private void submitAttach(UUID clientId, String phoneE164, AttachReason reason) {

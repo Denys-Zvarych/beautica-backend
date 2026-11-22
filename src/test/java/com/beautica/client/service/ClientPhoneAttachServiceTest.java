@@ -123,6 +123,31 @@ class ClientPhoneAttachServiceTest {
         return status;
     }
 
+    /** Runs {@code attachAfterCommit} inside a simulated caller transaction, then fires its afterCommit callbacks. */
+    private static void attachInCommittedTransaction(ClientPhoneAttachService target, User user) {
+        org.springframework.transaction.support.TransactionSynchronizationManager.initSynchronization();
+        try {
+            target.attachAfterCommit(user, AttachReason.PHONE_VERIFIED);
+            org.springframework.transaction.support.TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(org.springframework.transaction.support.TransactionSynchronization::afterCommit);
+        } finally {
+            org.springframework.transaction.support.TransactionSynchronizationManager.clearSynchronization();
+        }
+    }
+
+    @Test
+    @DisplayName("INFO audit: attachAfterCommit with no active transaction throws IllegalStateException and attaches nothing")
+    void should_throwIllegalState_when_attachAfterCommitCalledWithoutTransaction() {
+        User user = mock(User.class);
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(
+                        () -> service.attachAfterCommit(user, AttachReason.PHONE_VERIFIED))
+                .isInstanceOf(IllegalStateException.class);
+
+        verify(bookingRepository, never()).acquireWalkInPhoneLock(any());
+        verify(transactionManager, never()).getTransaction(any());
+    }
+
     @Test
     @DisplayName("audit LOW: attachAfterCommit attaches in its own REQUIRES_NEW transaction after re-resolving the owner under the lock")
     void should_attachInANewTransactionAfterReResolvingTheOwner_when_attachAfterCommit() {
@@ -131,7 +156,7 @@ class ClientPhoneAttachServiceTest {
         when(userRepository.findAttachableClientByVerifiedPhone(PHONE)).thenReturn(Optional.of(user));
         when(bookingRepository.attachGuestRowsByPhone(PHONE, user.getId(), "PHONE_VERIFIED", NOW)).thenReturn(2);
 
-        service.attachAfterCommit(user, AttachReason.PHONE_VERIFIED);
+        attachInCommittedTransaction(service, user);
 
         org.mockito.ArgumentCaptor<org.springframework.transaction.TransactionDefinition> def =
                 org.mockito.ArgumentCaptor.forClass(org.springframework.transaction.TransactionDefinition.class);
@@ -157,7 +182,7 @@ class ClientPhoneAttachServiceTest {
                 .thenThrow(new org.springframework.dao.CannotAcquireLockException("lock timeout"));
 
         org.assertj.core.api.Assertions.assertThatCode(
-                () -> service.attachAfterCommit(user, AttachReason.PHONE_VERIFIED)).doesNotThrowAnyException();
+                () -> attachInCommittedTransaction(service, user)).doesNotThrowAnyException();
 
         verify(transactionManager).rollback(status);
         verify(transactionManager, never()).commit(any());
@@ -173,7 +198,7 @@ class ClientPhoneAttachServiceTest {
         stubNewTransaction();
         when(userRepository.findAttachableClientByVerifiedPhone(PHONE)).thenReturn(Optional.of(other));
 
-        service.attachAfterCommit(user, AttachReason.PHONE_VERIFIED);
+        attachInCommittedTransaction(service, user);
 
         verify(appointmentRepository, never()).attachGuestVisitsByPhone(any(), any(), any(), any());
         verify(bookingRepository, never()).attachGuestRowsByPhone(any(), any(), any(), any());
@@ -187,7 +212,7 @@ class ClientPhoneAttachServiceTest {
         stubNewTransaction();
         when(userRepository.findAttachableClientByVerifiedPhone(PHONE)).thenReturn(Optional.empty());
 
-        service.attachAfterCommit(user, AttachReason.PHONE_VERIFIED);
+        attachInCommittedTransaction(service, user);
 
         verify(bookingRepository, never()).attachGuestRowsByPhone(any(), any(), any(), any());
         verify(appointmentRepository, never()).attachGuestVisitsByPhone(any(), any(), any(), any());
@@ -205,7 +230,7 @@ class ClientPhoneAttachServiceTest {
         when(bookingRepository.attachGuestRowsByPhone(PHONE, user.getId(), "PHONE_VERIFIED", NOW)).thenReturn(3);
         when(bookingRepository.findAttachableGuestPhones(200)).thenReturn(java.util.List.of(PHONE));
 
-        service.attachAfterCommit(user, AttachReason.PHONE_VERIFIED);
+        attachInCommittedTransaction(service, user);
         verify(bookingRepository, never()).attachGuestRowsByPhone(any(), any(), any(), any());
 
         int attached = service.sweep(200);
@@ -260,7 +285,7 @@ class ClientPhoneAttachServiceTest {
         User user = verifiedAccount();
 
         org.assertj.core.api.Assertions.assertThatCode(
-                () -> rejecting.attachAfterCommit(user, AttachReason.PHONE_VERIFIED)).doesNotThrowAnyException();
+                () -> attachInCommittedTransaction(rejecting, user)).doesNotThrowAnyException();
 
         verify(bookingRepository, never()).acquireWalkInPhoneLock(any());
     }

@@ -52,7 +52,15 @@ final class ClientRatingSql {
     static final String EXISTS_USER_SALON_MASTER = EXISTS_OPEN + SALON_MASTER_WHERE + EXISTS_USER_CLOSE;
     static final String EXISTS_USER_MASTER = EXISTS_OPEN + MASTER_WHERE + EXISTS_USER_CLOSE;
     static final String EXISTS_GUEST_SALON = EXISTS_OPEN + SALON_WHERE + EXISTS_GUEST_CLOSE;
-    static final String EXISTS_GUEST_SALON_MASTER = EXISTS_OPEN + SALON_MASTER_WHERE + EXISTS_GUEST_CLOSE;
+    // ?masterId= mode mirrors the card (ClientCardSql NARROW_TO_MASTER): the anchor is checked salon-wide, then a guest
+    // booking with the anchor's phone must exist with that master; an anchor outside the salon is the uniform 404.
+    static final String EXISTS_GUEST_SALON_MASTER = "WITH anchor AS (SELECT b.guest_phone FROM bookings b\n"
+            + SALON_WHERE + """
+               AND b.id = :bookingId AND b.client_id IS NULL AND b.guest_phone IS NOT NULL
+               AND b.guest_pii_anonymised_at IS NULL)
+            """ + EXISTS_OPEN + SALON_MASTER_WHERE + """
+               AND b.client_id IS NULL AND b.guest_phone = (SELECT guest_phone FROM anchor)
+               AND b.guest_pii_anonymised_at IS NULL AND b.client_detached_at IS NULL)""";
     static final String EXISTS_GUEST_MASTER = EXISTS_OPEN + MASTER_WHERE + EXISTS_GUEST_CLOSE;
 
     static final String COUNT_SALON = COUNT_SELECT + SALON_WHERE + FILTER;

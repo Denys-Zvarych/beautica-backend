@@ -249,28 +249,10 @@ public class BookingService {
         BookingDetailResponse detail = enrichSingle(booking, canReview, providerCanReviewClient, now,
                 reviewByClient.filter(view -> view.rating() != null)
                         .map(BookingService::toClientAuthoredReview).orElse(null));
-        // Phase 386 D1/D2 (audience per the 2026-10-22 user rule) - the guest's phone, on THIS read only. The audience
-        // is decided explicitly by ROLE: INDEPENDENT_MASTER, SALON_OWNER, SALON_ADMIN. A SALON_MASTER never sees it
-        // (even as the performing master), nor does a CLIENT; the owning-client probe is kept as a second, independent
-        // guard. The guest wither re-checks booking.getClient() == null; a registered client's phone enters only via the
-        // B518 verified-only wither below.
-        // Evaluated ONLY for a guest booking (client_id IS NULL, an in-memory FK read, no proxy load): the role read
-        // touches the SecurityContext, which a registered-client booking never needs (direct non-HTTP service calls
-        // carry none) and which adds no statement. The owning-client probe stays as a second, independent guard (free for a
-        // guest booking: null client short-circuits before any role read).
-        // B518 (GST-D14, GST-80): a registered client's phone joins the same audience gate, but ONLY when it is
-        // SMS-verified. The in-memory verified check runs first so an unverified (or phone-less) registered booking
-        // never touches the SecurityContext; the wither re-checks verification, so the data half cannot be skipped.
-        BookingDetailResponse withPhone = detail;
-        if (booking.getClient() == null) {
-            if (authz.isGuestPhoneAudience() && !authz.isOwningClientViewer(actorUserId, booking)) {
-                withPhone = detail.withProviderVisibleGuestPhone(booking);
-            }
-        } else if (booking.getClient().getPhoneVerifiedAt() != null
-                && authz.isGuestPhoneAudience() && !authz.isOwningClientViewer(actorUserId, booking)) {
-            withPhone = detail.withProviderVisibleRegisteredPhone(booking);
-        }
-        return withClientBlockState(actorUserId, booking, withPhone);
+        // GST-80 / GST-D14 / CLI-D08 / BOOK-78 (user 2026-11-21): booking detail carries NO phone for any role - the
+        // client's phone lives only on the provider client card (ClientPhonePolicy). guestPhone / clientPhone stay on
+        // the DTO (always null) so old app builds keep parsing the same OpenAPI shape.
+        return withClientBlockState(actorUserId, booking, detail);
     }
 
     /**

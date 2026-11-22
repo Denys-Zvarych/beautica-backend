@@ -89,7 +89,7 @@ class CatalogueBrowseBearerDeferralTest {
         LoadingCache<String, Bucket> generous = AuthRateLimitFilterTestFactory.bucketsOf(1_000_000);
         bookingRateLimitFilter = new BookingRateLimitFilter(
                 generous, generous, generous, generous, generous, generous, generous, generous,
-                perPrincipalBuckets, perIpBuckets, authenticatedIpBuckets, generous, new ObjectMapper());
+                perPrincipalBuckets, perIpBuckets, authenticatedIpBuckets, generous, generous, new ObjectMapper());
     }
 
     @AfterEach

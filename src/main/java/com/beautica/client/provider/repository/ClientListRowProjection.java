@@ -15,6 +15,9 @@ import java.util.UUID;
  */
 public interface ClientListRowProjection {
 
+    /** The filtered total, on every row (including the one placeholder row of an empty page). */
+    Long getTotal();
+
     /** Null for a guest. */
     UUID getClientId();
 
@@ -27,6 +30,7 @@ public interface ClientListRowProjection {
 
     Long getCompletedVisits();
 
+    /** Null only on the placeholder row of an empty page. */
     UUID getAnchorBookingId();
 
     String getGuestName();

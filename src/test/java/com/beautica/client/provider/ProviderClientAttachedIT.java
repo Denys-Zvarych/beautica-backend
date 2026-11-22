@@ -132,9 +132,8 @@ class ProviderClientAttachedIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("12: booking detail of an attached row — clientPhone is the account's verified phone, guestPhone null "
-            + "(IM, owner, admin); a SALON_MASTER sees neither")
-    void should_showAccountPhoneOnDetail_when_rowIsAttached() throws Exception {
+    @DisplayName("12: booking detail of an attached row carries no phone for any role (GST-80 / CLI-D08: card only)")
+    void should_showNoPhoneOnDetail_when_rowIsAttached() throws Exception {
         Salon s = fx.salon();
         Independent indep = fx.independent();
         UUID account = verifiedClient("Петро", "Сидоренко", PHONE);
@@ -150,12 +149,11 @@ class ProviderClientAttachedIT extends AbstractIntegrationTest {
         JsonNode solo = ok(fx.get(fx.token(indep.email()), BOOKINGS + "/" + soloStaff));
         JsonNode master = ok(fx.get(fx.token(s.masterEmail()), BOOKINGS + "/" + salonLink));
 
-        for (JsonNode detail : List.of(owner, admin, solo)) {
-            assertThat(detail.path("clientPhone").asText()).isEqualTo(PHONE);
+        for (JsonNode detail : List.of(owner, admin, solo, master)) {
+            assertThat(detail.path("clientPhone").isMissingNode() || detail.path("clientPhone").isNull()).isTrue();
             assertThat(detail.path("guestPhone").isMissingNode() || detail.path("guestPhone").isNull()).isTrue();
+            assertThat(detail.toString()).doesNotContain(PHONE.substring(4));
         }
-        assertThat(master.path("clientPhone").isMissingNode() || master.path("clientPhone").isNull()).isTrue();
-        assertThat(master.path("guestPhone").isMissingNode() || master.path("guestPhone").isNull()).isTrue();
         assertThat(account).isNotNull();
     }
 

@@ -13,7 +13,8 @@ import java.util.UUID;
 /**
  * B507 — read-only native aggregate behind the provider client list. Repository methods are UNSCOPED: the caller (the
  * service, from a {@code ClientScope} the resolver authorised) supplies the salon / master ids. Three scope variants
- * as three methods, each with its count twin; {@code q} is trimmed + LIKE-escaped by the service (null = no filter).
+ * as three methods; each page carries the filtered total on every row (always >= 1 row, see {@link ClientListSql});
+ * {@code q} is trimmed + LIKE-escaped by the service (null = no filter).
  * Served by the existing booking partition indexes (D4, no migration).
  */
 public interface ProviderClientRepository extends Repository<Booking, UUID> {
@@ -23,26 +24,15 @@ public interface ProviderClientRepository extends Repository<Booking, UUID> {
             @Param("salonId") UUID salonId, @Param("now") OffsetDateTime now, @Param("q") String q,
             @Param("limit") int limit, @Param("offset") long offset);
 
-    @Query(value = ClientListSql.COUNT_SALON, nativeQuery = true)
-    long countBySalon(@Param("salonId") UUID salonId, @Param("now") OffsetDateTime now, @Param("q") String q);
-
     @Query(value = ClientListSql.PAGE_SALON_MASTER, nativeQuery = true)
     List<ClientListRowProjection> pageBySalonAndMaster(
             @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("now") OffsetDateTime now,
             @Param("q") String q, @Param("limit") int limit, @Param("offset") long offset);
 
-    @Query(value = ClientListSql.COUNT_SALON_MASTER, nativeQuery = true)
-    long countBySalonAndMaster(
-            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("now") OffsetDateTime now,
-            @Param("q") String q);
-
     @Query(value = ClientListSql.PAGE_MASTER, nativeQuery = true)
     List<ClientListRowProjection> pageByMaster(
             @Param("masterId") UUID masterId, @Param("now") OffsetDateTime now, @Param("q") String q,
             @Param("limit") int limit, @Param("offset") long offset);
-
-    @Query(value = ClientListSql.COUNT_MASTER, nativeQuery = true)
-    long countByMaster(@Param("masterId") UUID masterId, @Param("now") OffsetDateTime now, @Param("q") String q);
 
     // ── B508: client card (one aggregate row, always returned; totalVisits 0 = unknown / out of scope) ──
 

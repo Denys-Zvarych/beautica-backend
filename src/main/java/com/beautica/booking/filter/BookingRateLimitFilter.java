@@ -257,6 +257,17 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     private static final String NOTIFICATIONS_PATH = "/api/v1/notifications";
     private static final String NOTIFICATIONS_PATH_PREFIX = NOTIFICATIONS_PATH + "/";
 
+    /**
+     * B507/B508/B526 — the twelve provider client reads ({@code GET /api/v1/salons/&#123;salonId&#125;/clients/**}
+     * and {@code GET /api/v1/masters/me/clients/**}: list, card, visits, ratings, user and guest variants) share ONE
+     * per-user bucket ({@code RateLimitConfig#providerClientReadCapacity}). Each is an aggregate over the provider's
+     * whole booking history, so an unthrottled loop is a cheap DB-load lever. Matched as {@code /clients} exactly or a
+     * {@code "/"}-bounded prefix beneath it, so a sibling route can never be swallowed into this budget.
+     */
+    private static final String SALONS_PATH_PREFIX = "/api/v1/salons/";
+    private static final String MASTERS_ME_CLIENTS_PATH = "/api/v1/masters/me/clients";
+    private static final String CLIENTS_SEGMENT = "clients";
+
     // Resolves the DECODED + NORMALIZED request path for rule matching (see resolveMatchPath).
     // urlDecode + removeSemicolonContent are UrlPathHelper defaults; set explicitly so the
     // security-critical decode step is self-documenting and cannot be silently disabled by a
@@ -298,6 +309,9 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     /** {@code Retry-After} for the notification-feed bucket (phase 334) — matches its 60s window. */
     private static final int NOTIFICATION_FEED_RETRY_AFTER_SECONDS = 60;
 
+    /** {@code Retry-After} for the provider client reads bucket — matches its 60s refill window. */
+    private static final int PROVIDER_CLIENT_READ_RETRY_AFTER_SECONDS = 60;
+
     /**
      * {@code Retry-After} for the deferred catalogue-browse / public-profile reads (B8 regression
      * fix) — matches both the per-principal and the per-IP fallback bucket's 60s refill window,
@@ -330,6 +344,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     private final LoadingCache<String, Bucket> catalogueBrowseBuckets;
     private final LoadingCache<String, Bucket> catalogueBrowseAuthenticatedIpBuckets;
     private final LoadingCache<String, Bucket> bookingLinkMutationBuckets;
+    private final LoadingCache<String, Bucket> providerClientReadBuckets;
     private final ObjectMapper objectMapper;
 
     public BookingRateLimitFilter(
@@ -345,6 +360,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
             LoadingCache<String, Bucket> catalogueBrowseBuckets,
             LoadingCache<String, Bucket> catalogueBrowseAuthenticatedIpBuckets,
             LoadingCache<String, Bucket> bookingLinkMutationBuckets,
+            LoadingCache<String, Bucket> providerClientReadBuckets,
             ObjectMapper objectMapper) {
         this.bookingWriteBuckets = bookingWriteBuckets;
         this.bookingDeclineBuckets = bookingDeclineBuckets;
@@ -358,6 +374,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         this.catalogueBrowseBuckets = catalogueBrowseBuckets;
         this.catalogueBrowseAuthenticatedIpBuckets = catalogueBrowseAuthenticatedIpBuckets;
         this.bookingLinkMutationBuckets = bookingLinkMutationBuckets;
+        this.providerClientReadBuckets = providerClientReadBuckets;
         this.objectMapper = objectMapper;
     }
 
@@ -521,6 +538,10 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         if (isNotificationsPath(path)) {
             return new BucketRoute(notificationFeedBuckets, NOTIFICATION_FEED_RETRY_AFTER_SECONDS);
         }
+        // The twelve provider client reads (B507/B508/B526) share ONE per-user bucket.
+        if (HttpMethod.GET.matches(method) && isProviderClientReadPath(path)) {
+            return new BucketRoute(providerClientReadBuckets, PROVIDER_CLIENT_READ_RETRY_AFTER_SECONDS);
+        }
         // POST /bookings (single-service create) and POST /appointments (BE-3 multi-service visit
         // create) share the bookingWriteBuckets budget: both take the per-client advisory lock, so a
         // visit create is one token on the same threat model as a single-service create.
@@ -666,6 +687,21 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
      */
     private static boolean isNotificationsPath(String path) {
         return NOTIFICATIONS_PATH.equals(path) || path.startsWith(NOTIFICATIONS_PATH_PREFIX);
+    }
+
+    /**
+     * True for {@code /api/v1/masters/me/clients[/**]} and {@code /api/v1/salons/&#123;salonId&#125;/clients[/**]}
+     * (non-empty salon segment) — see {@link #CLIENTS_SEGMENT}'s javadoc.
+     */
+    private static boolean isProviderClientReadPath(String path) {
+        if (MASTERS_ME_CLIENTS_PATH.equals(path) || path.startsWith(MASTERS_ME_CLIENTS_PATH + "/")) {
+            return true;
+        }
+        if (!path.startsWith(SALONS_PATH_PREFIX)) {
+            return false;
+        }
+        String[] segments = path.substring(SALONS_PATH_PREFIX.length()).split("/", -1);
+        return segments.length >= 2 && !segments[0].isEmpty() && CLIENTS_SEGMENT.equals(segments[1]);
     }
 
     /**

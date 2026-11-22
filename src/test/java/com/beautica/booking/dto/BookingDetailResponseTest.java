@@ -714,7 +714,7 @@ class BookingDetailResponseTest {
                 .isNull();
     }
 
-    // ── phase 386: provider-visible guest phone ───────────────────────────────────────────────
+    // ── GST-80 / CLI-D08: booking detail carries no phone (phase 386 / B518 withers retired) ───────────────────────────────────────────────
 
     private static final String GUEST_PHONE = "+380671234567";
     private static final String ACCOUNT_PHONE = "+380991112233";
@@ -731,31 +731,44 @@ class BookingDetailResponseTest {
     }
 
     @Test
-    @DisplayName("withProviderVisibleGuestPhone sets the booking's guestPhone for a guest booking (client_id NULL)")
-    void should_setGuestPhone_when_guestBookingHasOne() {
+    @DisplayName("GST-80 / CLI-D08: a guest booking's detail carries no phone at all - neither field, nor in the JSON")
+    void should_carryNoPhone_when_guestBookingHasOne() throws Exception {
         when(booking.getClient()).thenReturn(null);
-        when(booking.getGuestPhone()).thenReturn(GUEST_PHONE);
-        var base = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
+        lenient().when(booking.getGuestPhone()).thenReturn(GUEST_PHONE);
 
-        var detail = base.withProviderVisibleGuestPhone(booking);
+        var detail = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
-        assertThat(detail.guestPhone()).isEqualTo(GUEST_PHONE);
+        assertThat(detail.guestPhone()).isNull();
+        assertThat(detail.clientPhone()).isNull();
+        String json = new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules()
+                .writeValueAsString(detail);
+        assertThat(json).doesNotContain(GUEST_PHONE.substring(4));
     }
 
     @Test
-    @DisplayName("HARD RULE: a registered client's booking stays null even if a guest phone value is somehow on the row, "
-            + "and the account's phone number never appears anywhere in the serialized response")
-    void should_keepGuestPhoneNull_when_bookingHasRegisteredClient() throws Exception {
-        when(clientUser.getPhoneNumber()).thenReturn(ACCOUNT_PHONE);
-        lenient().when(booking.getGuestPhone()).thenReturn(GUEST_PHONE);
-        var base = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
+    @DisplayName("GST-80 / CLI-D08: a verified registered client's phone never appears in the detail or its JSON")
+    void should_carryNoPhone_when_registeredClientIsVerified() throws Exception {
+        lenient().when(clientUser.getPhoneNumber()).thenReturn(ACCOUNT_PHONE);
+        lenient().when(clientUser.getPhoneVerifiedAt()).thenReturn(java.time.Instant.now());
 
-        var detail = base.withProviderVisibleGuestPhone(booking);
+        var detail = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(detail.guestPhone()).isNull();
+        assertThat(detail.clientPhone()).isNull();
         String json = new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules()
                 .writeValueAsString(detail);
-        assertThat(json).doesNotContain(ACCOUNT_PHONE.substring(4)).doesNotContain(GUEST_PHONE.substring(4));
+        assertThat(json).doesNotContain(ACCOUNT_PHONE.substring(4));
+    }
+
+    @Test
+    @DisplayName("GST-80 / CLI-D08: the record exposes no method that could attach a phone")
+    void should_exposeNoPhoneWither_when_inspectingTheRecord() {
+        var phoneWithers = java.util.Arrays.stream(BookingDetailResponse.class.getDeclaredMethods())
+                .map(java.lang.reflect.Method::getName)
+                .filter(name -> name.startsWith("with") && name.toLowerCase(java.util.Locale.ROOT).contains("phone"))
+                .toList();
+
+        assertThat(phoneWithers).isEmpty();
     }
 
     @Test
@@ -770,59 +783,15 @@ class BookingDetailResponseTest {
     }
 
     @Test
-    @DisplayName("B518: withProviderVisibleRegisteredPhone sets clientPhone only for a verified phone; guestPhone stays null")
-    void should_setClientPhoneOnlyWhenVerified_when_registeredWither() {
-        lenient().when(clientUser.getPhoneNumber()).thenReturn(ACCOUNT_PHONE);
-        var base = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
-
-        when(clientUser.getPhoneVerifiedAt()).thenReturn(null);
-        assertThat(base.withProviderVisibleRegisteredPhone(booking).clientPhone()).isNull();
-
-        when(clientUser.getPhoneVerifiedAt()).thenReturn(java.time.Instant.now());
-        var detail = base.withProviderVisibleRegisteredPhone(booking);
-        assertThat(detail.clientPhone()).isEqualTo(ACCOUNT_PHONE);
-        assertThat(detail.guestPhone()).isNull();
-    }
-
-    @Test
-    @DisplayName("a guest booking without a phone (anonymised/erased, or never set) keeps guestPhone null")
-    void should_keepGuestPhoneNull_when_guestPhoneAbsent() {
-        when(booking.getClient()).thenReturn(null);
-        when(booking.getGuestPhone()).thenReturn(null);
-        var base = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
-
-        assertThat(base.withProviderVisibleGuestPhone(booking).guestPhone()).isNull();
-    }
-
-    @Test
-    @DisplayName("the wither changes ONLY guestPhone (+ B518 clientPhone) - every other component is carried over unchanged")
-    void should_carryEveryOtherComponentOver_when_guestPhoneAttached() throws Exception {
-        when(booking.getClient()).thenReturn(null);
-        when(booking.getGuestName()).thenReturn("Оксана");
-        when(booking.getGuestPhone()).thenReturn(GUEST_PHONE);
-        var base = BookingDetailResponse.from(booking, true, true, "Київ", "Шевченківський", NOW, null);
-
-        var detail = base.withProviderVisibleGuestPhone(booking);
-
-        for (var component : BookingDetailResponse.class.getRecordComponents()) {
-            Object expected = component.getName().equals("guestPhone") || component.getName().equals("clientPhone")
-                    ? GUEST_PHONE
-                    : component.getAccessor().invoke(base);
-            assertThat(component.getAccessor().invoke(detail)).as(component.getName()).isEqualTo(expected);
-        }
-    }
-
-    @Test
-    @DisplayName("toString never prints the phone (nor the notes): masked, with identity and status only")
+    @DisplayName("toString never prints the phone (nor the notes): identity and status only")
     void should_redactGuestPhone_when_toStringCalled() {
         when(booking.getClient()).thenReturn(null);
-        when(booking.getGuestPhone()).thenReturn(GUEST_PHONE);
-        var detail = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null)
-                .withProviderVisibleGuestPhone(booking);
+        lenient().when(booking.getGuestPhone()).thenReturn(GUEST_PHONE);
+        var detail = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         String text = detail.toString();
 
         assertThat(text).doesNotContain(GUEST_PHONE).doesNotContain("671234567")
-                .doesNotContain("great service").contains("+380***").contains(bookingId.toString());
+                .doesNotContain("great service").contains(bookingId.toString());
     }
 }
