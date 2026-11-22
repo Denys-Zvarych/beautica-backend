@@ -26,7 +26,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Phase 386 - the guest's phone on {@code GET /bookings/{id}} for the provider side, and the HARD RULE that a
+ * GST-80 / CLI-D08 (2026-11-21, supersedes phase 386) - {@code GET /bookings/{id}} carries no phone for any role, and the HARD RULE that a
  * REGISTERED user's phone never reaches any provider on any surface. Real Postgres, real security chain.
  *
  * <p>The raw digits are scanned for in whole response bodies (not just the field), so a leak through any other
@@ -34,7 +34,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @Import(TestSecurityConfig.class)
 @ExtendWith(OutputCaptureExtension.class)
-@DisplayName("Guest phone is provider-visible on booking detail only; a registered user's phone never is (Phase 386)")
+@DisplayName("Booking detail carries no phone for any role (GST-80 / CLI-D08); a registered user's phone never leaks")
 class GuestPhoneProviderVisibilityIT extends AbstractIntegrationTest {
 
     private static final String GUEST_PHONE = "+380671234567";
@@ -165,12 +165,12 @@ class GuestPhoneProviderVisibilityIT extends AbstractIntegrationTest {
     // ── guest bookings: the phone reaches exactly the provider side ───────────────────────────
 
     @Test
-    @DisplayName("LINK guest booking: the salon owner and the assigned admin see the phone on detail")
-    void should_showPhone_when_ownerOrAdminOpensLinkGuestBookingDetail() throws Exception {
+    @DisplayName("LINK guest booking: the salon owner and the assigned admin get NO phone on detail (GST-80)")
+    void should_returnNoPhone_when_ownerOrAdminOpensLinkGuestBookingDetail() throws Exception {
         UUID id = insertLinkGuestBooking();
 
         for (String token : List.of(ownerToken, adminToken)) {
-            assertThat(data(detail(id, token)).path("guestPhone").asText()).isEqualTo(GUEST_PHONE);
+            assertThat(data(detail(id, token)).path("guestPhone").isNull()).isTrue();
         }
     }
 
@@ -186,18 +186,18 @@ class GuestPhoneProviderVisibilityIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("staff walk-in (client_id NULL): the owner and the assigned admin see the phone the staff member typed")
-    void should_showPhone_when_ownerOrAdminOpensWalkInDetail() throws Exception {
+    @DisplayName("staff walk-in (client_id NULL): the owner and the assigned admin get NO phone on detail (GST-80)")
+    void should_returnNoPhone_when_ownerOrAdminOpensWalkInDetail() throws Exception {
         UUID id = insertWalkIn();
 
         for (String token : List.of(ownerToken, adminToken)) {
-            assertThat(data(detail(id, token)).path("guestPhone").asText()).isEqualTo(GUEST_PHONE);
+            assertThat(data(detail(id, token)).path("guestPhone").isNull()).isTrue();
         }
     }
 
     @Test
-    @DisplayName("performing INDEPENDENT master sees the phone of their guest booking")
-    void should_showPhone_when_independentMasterOpensTheirGuestBooking() throws Exception {
+    @DisplayName("performing INDEPENDENT master gets NO phone on their guest booking detail (GST-80)")
+    void should_returnNoPhone_when_independentMasterOpensTheirGuestBooking() throws Exception {
         String email = "gp-indep-" + System.nanoTime() + "@beautica.test";
         UUID masterId = fx.createIndependentMaster(email);
         UUID serviceId = fx.createIndependentMasterService(masterId);
@@ -210,7 +210,7 @@ class GuestPhoneProviderVisibilityIT extends AbstractIntegrationTest {
                         + "500.00, 60, 0, 'LINK', 'Оксана', ?, ?, NOW(), NOW())",
                 id, masterId, serviceId, GUEST_PHONE, UUID.randomUUID());
 
-        assertThat(data(detail(id, fx.tokenFor(email))).path("guestPhone").asText()).isEqualTo(GUEST_PHONE);
+        assertThat(data(detail(id, fx.tokenFor(email))).path("guestPhone").isNull()).isTrue();
     }
 
     @Test
@@ -331,7 +331,7 @@ class GuestPhoneProviderVisibilityIT extends AbstractIntegrationTest {
 
         assertThat(created.getStatusCode()).as(created.getBody()).isEqualTo(HttpStatus.CREATED);
         UUID bookingId = UUID.fromString(objectMapper.readTree(created.getBody()).path("bookingId").asText());
-        assertThat(data(detail(bookingId, pages.tokenOf(master))).path("guestPhone").asText()).isEqualTo(GUEST_PHONE);
+        assertThat(data(detail(bookingId, pages.tokenOf(master))).path("guestPhone").isNull()).isTrue();
         assertThat(created.getBody()).as("the create response never echoes the phone").doesNotContain(GUEST_DIGITS);
         assertThat(outboxRepository.findAll()).isNotEmpty().allSatisfy(entry ->
                 assertThat(String.valueOf(entry.getPayload())).doesNotContain(GUEST_DIGITS));

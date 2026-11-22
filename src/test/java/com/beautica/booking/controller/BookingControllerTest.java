@@ -164,7 +164,9 @@ class BookingControllerTest {
                 // guestPhone (phase 386 additive) — null: a registered client's booking
                 null,
                 // clientBlocked / clientBlockId / clientBlockable (phase 397 additive) — literal stub
-                false, null, false
+                false, null, false,
+                // clientPhone (B518 additive) — null on the stub
+                null
         );
     }
 

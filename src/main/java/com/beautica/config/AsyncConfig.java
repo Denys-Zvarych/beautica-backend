@@ -1012,6 +1012,48 @@ public class AsyncConfig implements AsyncConfigurer {
         return new SyncTaskExecutor();
     }
 
+    static final int CLIENT_PHONE_ATTACH_POOL_SIZE = 2;
+    static final int CLIENT_PHONE_ATTACH_QUEUE_CAPACITY = 100;
+
+    /**
+     * Pool for the after-commit retroactive phone attach ({@code ClientPhoneAttachService#attachAfterCommit}, B527 audit
+     * cycle 2). An {@code AFTER_COMMIT} callback runs on the committing thread while it still holds its pooled Hikari
+     * connection, so the attach's {@code REQUIRES_NEW} transaction pinned a SECOND connection per verification. It now
+     * runs here: one lock + two UPDATEs per task, on a thread that holds no connection of its own.
+     *
+     * <p>{@code AbortPolicy}, deliberately: a rejected task is logged by the caller and left for the 30-minute sweep
+     * ({@code ClientPhoneAttachSweepJob}), which attaches the same rows under the same per-phone lock — nothing is lost,
+     * and running it on the caller would re-introduce the second connection. Bounded queue, {@code core == max}.
+     *
+     * <p><b>Shutdown.</b> {@code waitForTasksToCompleteOnShutdown} with NO {@code awaitTerminationSeconds} (so no
+     * {@code *_SHUTDOWN_GRACE_SECONDS} is added to the {@code RailwayConfigTest} sum): millisecond-scale statements; a cut
+     * task is picked up by the next sweep. No {@link DelegatingSecurityContextTaskExecutor}: the task is id-driven.
+     * {@code @Profile("!test")} — see {@link #syncClientPhoneAttachExecutor()}.
+     */
+    @Bean(name = "clientPhoneAttachExecutor")
+    @Profile("!test")
+    public TaskExecutor clientPhoneAttachExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(CLIENT_PHONE_ATTACH_POOL_SIZE);
+        executor.setMaxPoolSize(CLIENT_PHONE_ATTACH_POOL_SIZE);
+        executor.setAllowCoreThreadTimeOut(true);
+        executor.setKeepAliveSeconds(60);
+        executor.setQueueCapacity(CLIENT_PHONE_ATTACH_QUEUE_CAPACITY);
+        executor.setThreadNamePrefix("client-phone-attach-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setTaskDecorator(taskContextDecorator());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.initialize();
+        return executor;
+    }
+
+    /** Test-profile counterpart of {@link #clientPhoneAttachExecutor()}: runs INLINE so ITs stay deterministic (§M). */
+    @Bean(name = "clientPhoneAttachExecutor")
+    @Profile("test")
+    public TaskExecutor syncClientPhoneAttachExecutor() {
+        return new SyncTaskExecutor();
+    }
+
     /** {@link #telegramDetailsExecutor()} sizing: one Telegram send at a time, a small bounded backlog. */
     static final int TELEGRAM_DETAILS_POOL_SIZE = 1;
     static final int TELEGRAM_DETAILS_QUEUE_CAPACITY = 50;

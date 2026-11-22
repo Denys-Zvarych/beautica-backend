@@ -40,7 +40,7 @@ class BookingBlockGuardTest {
 
     private final UUID masterId = UUID.randomUUID();
     private final UUID salonId = UUID.randomUUID();
-    private final UUID clientId = UUID.randomUUID();
+    private final com.beautica.user.User client = org.mockito.Mockito.mock(com.beautica.user.User.class);
 
     private BookingBlockGuard guard() {
         return new BookingBlockGuard(clientBlockService, phoneHasher);
@@ -65,9 +65,9 @@ class BookingBlockGuardTest {
     @Test
     @DisplayName("blocked account at a salon master → BOOKING_UNAVAILABLE with salon wording")
     void should_reject_when_salonMasterBookingInBlockedSalon() {
-        when(clientBlockService.isClientBlocked(BlockScope.salon(salonId), clientId)).thenReturn(true);
+        when(clientBlockService.isClientBlocked(BlockScope.salon(salonId), client)).thenReturn(true);
 
-        assertThatThrownBy(() -> guard().requireClientMayBook(salonMaster(), clientId))
+        assertThatThrownBy(() -> guard().requireClientMayBook(salonMaster(), client))
                 .isInstanceOf(BookingUnavailableException.class)
                 .hasMessage(BookingUnavailableException.SALON_MESSAGE);
         verify(clientBlockService, never()).isGuestPhoneBlocked(any(), any());
@@ -76,9 +76,9 @@ class BookingBlockGuardTest {
     @Test
     @DisplayName("blocked account at an independent master → master wording")
     void should_rejectWithMasterWording_when_independentMasterBlockedClient() {
-        when(clientBlockService.isClientBlocked(BlockScope.master(masterId), clientId)).thenReturn(true);
+        when(clientBlockService.isClientBlocked(BlockScope.master(masterId), client)).thenReturn(true);
 
-        assertThatThrownBy(() -> guard().requireClientMayBook(independentMaster(), clientId))
+        assertThatThrownBy(() -> guard().requireClientMayBook(independentMaster(), client))
                 .isInstanceOf(BookingUnavailableException.class)
                 .hasMessage(BookingUnavailableException.MASTER_MESSAGE);
     }
@@ -86,7 +86,7 @@ class BookingBlockGuardTest {
     @Test
     @DisplayName("not blocked → passes")
     void should_pass_when_clientNotBlocked() {
-        assertThatCode(() -> guard().requireClientMayBook(independentMaster(), clientId)).doesNotThrowAnyException();
+        assertThatCode(() -> guard().requireClientMayBook(independentMaster(), client)).doesNotThrowAnyException();
     }
 
     @Test
@@ -98,7 +98,7 @@ class BookingBlockGuardTest {
         assertThatThrownBy(() -> guard().requireGuestMayBook(salonMaster(), PHONE))
                 .isInstanceOf(BookingUnavailableException.class)
                 .hasMessage(BookingUnavailableException.SALON_MESSAGE);
-        verify(clientBlockService, never()).isClientBlocked(any(), any());
+        verify(clientBlockService, never()).isClientBlocked(any(), any(com.beautica.user.User.class));
     }
 
     @Test

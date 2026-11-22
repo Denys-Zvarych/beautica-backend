@@ -1,8 +1,11 @@
 package com.beautica.user.phone;
 
 import com.beautica.auth.PhoneRegistrationService;
+import com.beautica.auth.Role;
 import com.beautica.auth.phoneotp.PhoneOtpPurpose;
 import com.beautica.auth.phoneotp.PhoneOtpService;
+import com.beautica.booking.enums.AttachReason;
+import com.beautica.client.service.ClientPhoneAttachService;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.common.exception.IdentityException;
 import com.beautica.common.exception.NotFoundException;
@@ -48,6 +51,7 @@ public class UserPhoneService {
     private final UserProfileCacheEvictor userProfileCacheEvictor;
     private final CurrentPasswordCheck currentPasswordCheck;
     private final ContactChangeNotifier contactChangeNotifier;
+    private final ClientPhoneAttachService clientPhoneAttachService;
     private final TransactionTemplate transactionTemplate;
     private final Clock clock;
 
@@ -56,6 +60,7 @@ public class UserPhoneService {
                             UserProfileCacheEvictor userProfileCacheEvictor,
                             CurrentPasswordCheck currentPasswordCheck,
                             ContactChangeNotifier contactChangeNotifier,
+                            ClientPhoneAttachService clientPhoneAttachService,
                             PlatformTransactionManager transactionManager,
                             Clock clock) {
         this.phoneOtpService = phoneOtpService;
@@ -63,6 +68,7 @@ public class UserPhoneService {
         this.userProfileCacheEvictor = userProfileCacheEvictor;
         this.currentPasswordCheck = currentPasswordCheck;
         this.contactChangeNotifier = contactChangeNotifier;
+        this.clientPhoneAttachService = clientPhoneAttachService;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.clock = clock;
     }
@@ -119,6 +125,11 @@ public class UserPhoneService {
         }
         user.markPhoneVerified(phone, clock.instant());
         PhoneRegistrationService.saveClaimingPhone(userRepository, user);
+        if (user.getRole() == Role.CLIENT) {
+            // B527 (CLI-62): add AND change attach — rows already attached under the old phone stay (D4); only the new
+            // phone's guest / walk-in bookings attach after this commit, in their own transaction (audit LOW).
+            clientPhoneAttachService.attachAfterCommit(user, AttachReason.PHONE_VERIFIED);
+        }
         userProfileCacheEvictor.evictAfterCommit(userId);
         if (change) {
             contactChangeNotifier.phoneChanged(user);

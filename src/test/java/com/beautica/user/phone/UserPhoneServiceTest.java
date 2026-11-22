@@ -55,6 +55,7 @@ class UserPhoneServiceTest {
     private static final String PASSWORD_HASH = ENCODER.encode(PASSWORD);
 
     @Mock private PhoneOtpService phoneOtpService;
+    @Mock private com.beautica.client.service.ClientPhoneAttachService clientPhoneAttachService;
     @Mock private UserRepository userRepository;
     @Mock private UserProfileCacheEvictor userProfileCacheEvictor;
     @Mock private ContactChangeNotifier contactChangeNotifier;
@@ -69,6 +70,7 @@ class UserPhoneServiceTest {
         Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
         service = new UserPhoneService(phoneOtpService, userRepository, userProfileCacheEvictor,
                 new CurrentPasswordCheck(encoder, new LoginFailureLimiter(clock)), contactChangeNotifier,
+                clientPhoneAttachService,
                 org.mockito.Mockito.mock(org.springframework.transaction.PlatformTransactionManager.class), clock);
     }
 
@@ -201,6 +203,50 @@ class UserPhoneServiceTest {
         assertThat(user.getPhoneNumber()).isEqualTo(NEW_PHONE);
         verify(phoneOtpService, never()).recordFailedAttempt(anyString(), any(), any());
         verifyNoInteractions(contactChangeNotifier);
+    }
+
+    @Test
+    @DisplayName("B527: a CLIENT's verified add / change attaches the guest and walk-in bookings of the new number")
+    void should_attachBookingsOfTheNewPhone_when_clientVerifies() {
+        User user = verifiedUser();
+        stubAccount(user);
+        when(phoneOtpService.consumeCode(NEW_PHONE, "123456", PhoneOtpPurpose.PHONE_CHANGE, USER_ID))
+                .thenReturn(true);
+        when(userRepository.saveAndFlush(user)).thenReturn(user);
+
+        service.verifyCode(USER_ID, NEW_PHONE, "123456", PASSWORD);
+
+        verify(clientPhoneAttachService).attachAfterCommit(org.mockito.ArgumentMatchers.any(com.beautica.user.User.class), org.mockito.ArgumentMatchers.eq(com.beautica.booking.enums.AttachReason.PHONE_VERIFIED));
+    }
+
+    @Test
+    @DisplayName("B527: a provider account's verified phone attaches nothing (CLIENT only, D6)")
+    void should_notAttachAnything_when_accountIsNotAClient() {
+        User user = User.registerWithVerifiedPhone(OLD_PHONE, PASSWORD_HASH, Role.INDEPENDENT_MASTER, "Olena", null,
+                null, NOW.minusSeconds(3600));
+        ReflectionTestUtils.setField(user, "id", USER_ID);
+        stubAccount(user);
+        when(phoneOtpService.consumeCode(NEW_PHONE, "123456", PhoneOtpPurpose.PHONE_CHANGE, USER_ID))
+                .thenReturn(true);
+        when(userRepository.saveAndFlush(user)).thenReturn(user);
+
+        service.verifyCode(USER_ID, NEW_PHONE, "123456", PASSWORD);
+
+        verifyNoInteractions(clientPhoneAttachService);
+    }
+
+    @Test
+    @DisplayName("B527: a wrong code attaches nothing")
+    void should_notAttach_when_codeDoesNotMatch() {
+        User user = verifiedUser();
+        stubAccount(user);
+        when(phoneOtpService.consumeCode(eq(NEW_PHONE), eq("000000"), eq(PhoneOtpPurpose.PHONE_CHANGE), eq(USER_ID)))
+                .thenReturn(false);
+
+        assertThatThrownBy(() -> service.verifyCode(USER_ID, NEW_PHONE, "000000", PASSWORD))
+                .isInstanceOf(VerificationException.class);
+
+        verifyNoInteractions(clientPhoneAttachService);
     }
 
     @Test

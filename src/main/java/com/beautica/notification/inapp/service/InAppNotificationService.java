@@ -318,9 +318,12 @@ public class InAppNotificationService {
             // Row 1 / 1w — walk-ins notify ONLY the performing master (owner/admins excluded even
             // when they are the salon's staff, per the architect's "board already shows it" ruling);
             // client/APP/LINK creates notify the whole provider set.
-            case BOOKING_CREATED -> walkIn
+            // B527 (NTF-67): a booking attached to a client account (guest link / walk-in matched by verified phone)
+            // also reaches that client — the registered-client path (feed + push, "Вас записано"). The provider
+            // set is unchanged. An APP create names the client as the actor, so the uniform actor-removal drops them.
+            case BOOKING_CREATED -> withClient(walkIn
                     ? recipientResolver.masterOnly(master)
-                    : recipientResolver.providerSet(master, salon);
+                    : recipientResolver.providerSet(master, salon), clientId);
             // Row 2 — client-initiated cancel; the client is always the actor, so it is excluded by
             // the uniform actor-removal step the two public callers perform, never by this switch.
             case BOOKING_CANCELLED_BY_CLIENT -> recipientResolver.providerSet(master, salon);
@@ -336,6 +339,13 @@ public class InAppNotificationService {
             default -> throw new IllegalArgumentException(
                     "notifyBookingEvent/notifyVisitEvent does not support " + type);
         };
+    }
+
+    private static Set<UUID> withClient(Set<UUID> providers, UUID clientId) {
+        if (clientId != null) {
+            providers.add(clientId);
+        }
+        return providers;
     }
 
     private Set<UUID> declineRecipients(Master master, UUID clientId) {
@@ -377,7 +387,8 @@ public class InAppNotificationService {
             Booking booking, boolean initiatedByProvider, Instant newStart, UUID actorUserId) {
         writeReschedule(
                 booking.getMaster(), booking.getSalon(), clientIdOf(booking),
-                booking.getBookingSource() == BookingSource.STAFF,
+                // B527: a walk-in attached to a client account (client != null) follows the registered path (NTF-67).
+                booking.getBookingSource() == BookingSource.STAFF && booking.getClient() == null,
                 booking.getId(), initiatedByProvider, newStart, actorUserId);
     }
 

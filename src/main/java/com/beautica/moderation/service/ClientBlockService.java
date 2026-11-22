@@ -13,12 +13,15 @@ import com.beautica.common.security.PhoneHasher.HashedPhone;
 import com.beautica.common.util.UkrainianPhoneNormalizer;
 import com.beautica.config.RateLimitConfig;
 import com.beautica.moderation.dto.BlockDisplayNames;
+import com.beautica.moderation.entity.ClientBlock;
 import com.beautica.moderation.dto.BlockResponse;
 import com.beautica.moderation.dto.ClientBlockState;
+import com.beautica.moderation.repository.ClientBlockKeyRow;
 import com.beautica.moderation.repository.ClientBlockListRow;
 import com.beautica.moderation.repository.ClientBlockRepository;
 import com.beautica.moderation.service.ClientBlockScopeResolver.ActorScopes;
 import com.beautica.user.User;
+import com.beautica.user.UserRepository;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bucket;
 import lombok.RequiredArgsConstructor;
@@ -32,9 +35,13 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.temporal.ChronoUnit;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -43,17 +50,17 @@ import java.util.UUID;
  * notified of the block itself (D5); the future bookings a NEW block cancels ({@link ClientBlockFacade}, phase 398
  * user decision 2026-10-28) reach them only as the ordinary neutral provider-decline notice.
  *
- * <p>Target derivation, always from a booking in the caller's scope — ONE identity per type (user decision
- * 2026-10-28, supersedes D2/D5 phone part):
+ * <p>Target derivation, always from a booking in the caller's scope:
  * <ul>
- *   <li>registered client (APP booking) → {@code blocked_user_id} only. The profile phone is unverified and is
- *       never hashed or stored (no {@code phone_hash}, no {@code phone_last4});</li>
+ *   <li>registered client (APP booking, or — B527 — a guest / walk-in booking attached to the account by its verified
+ *       phone) → {@code blocked_user_id} only; the account's VERIFIED phone is never stored on the row;</li>
  *   <li>LINK guest → the HMAC of the OTP-verified {@code guest_phone} + its last four digits;</li>
- *   <li>STAFF walk-in, or a guest whose phone was already erased → 400 (no verified identity).</li>
+ *   <li>STAFF walk-in without an account, or a guest whose phone was already erased → 400 (no verified identity).</li>
  * </ul>
- * Matching follows the same key: a CLIENT target matches CLIENT rows by user id, a GUEST target matches GUEST rows by
- * phone hash, and nothing links one type to the other — on POST idempotency, on the detail block state and in the
- * phase-398 probes alike. Names, phones and hashes are never logged.
+ * Matching (B527, D7 — one person, one answer): a registered client counts as blocked when its account row OR the
+ * phone-hash row of its VERIFIED phone exists in the scope ({@link #isClientBlocked}, {@link #blockStateFor}, the list /
+ * card flag in {@code ProviderClientService}); {@link #unblock} of a registered client deletes both. A GUEST target
+ * matches GUEST rows by phone hash only. Rows are never updated. Names, phones and hashes are never logged.
  *
  * <p>POST and DELETE each spend one token of the caller's {@code clientBlockWriteBuckets} budget (429 when empty).
  */
@@ -73,6 +80,7 @@ public class ClientBlockService {
     private final BookingRepository bookingRepository;
     private final ClientBlockScopeResolver scopeResolver;
     private final PhoneHasher phoneHasher;
+    private final UserRepository userRepository;
 
     /** Per-user block/unblock budget; bound by bean name ({@code RateLimitConfig#clientBlockWriteBuckets}). */
     private final LoadingCache<String, Bucket> clientBlockWriteBuckets;
@@ -111,7 +119,8 @@ public class ClientBlockService {
     }
 
     /** The identity a booking resolves to: exactly one of {@code userId} (CLIENT) / {@code phone} (GUEST). */
-    record BlockTarget(@Nullable UUID userId, @Nullable HashedPhone phone, String displayName) {
+    record BlockTarget(@Nullable UUID userId, @Nullable HashedPhone phone, String displayName,
+                       @Nullable HashedPhone verifiedPhone) {
 
         BlockTarget {
             if ((userId == null) == (phone == null)) {
@@ -119,12 +128,13 @@ public class ClientBlockService {
             }
         }
 
-        static BlockTarget client(UUID userId, String displayName) {
-            return new BlockTarget(Objects.requireNonNull(userId), null, displayName);
+        /** {@code verifiedPhone}: the account's VERIFIED phone hash (B527 D7), {@code null} when it has none. */
+        static BlockTarget client(UUID userId, String displayName, @Nullable HashedPhone verifiedPhone) {
+            return new BlockTarget(Objects.requireNonNull(userId), null, displayName, verifiedPhone);
         }
 
         static BlockTarget guest(HashedPhone phone, String displayName) {
-            return new BlockTarget(null, Objects.requireNonNull(phone), displayName);
+            return new BlockTarget(null, Objects.requireNonNull(phone), displayName, null);
         }
 
         byte[] phoneHash() {
@@ -190,14 +200,32 @@ public class ClientBlockService {
         consumeRateLimitToken(actorId);
         ActorScopes scopes = scopeResolver.forActor(actorId, role);
         int deleted = 0;
+        Optional<ClientBlock> row = Optional.empty();
         if (scopes.masterId() != null) {
+            row = clientBlockRepository.findInMasterScope(blockId, scopes.masterId());
             deleted = clientBlockRepository.deleteInMasterScope(blockId, scopes.masterId());
         } else if (!scopes.salonIds().isEmpty()) {
+            row = clientBlockRepository.findInSalonScopes(blockId, scopes.salonIds());
             deleted = clientBlockRepository.deleteInSalonScope(blockId, scopes.salonIds());
         }
         if (deleted > 0) {
             log.info("Client block {} removed", blockId);
+            row.ifPresent(this::clearVerifiedPhoneRow);
         }
+    }
+
+    /**
+     * B527 (D7) — unblocking a registered client also clears the phone-hash row of the account's verified phone in the
+     * same scope, so one unblock lifts the person whichever of the two rows blocked them.
+     */
+    private void clearVerifiedPhoneRow(ClientBlock removed) {
+        if (removed.getBlockedUserId() == null) {
+            return;
+        }
+        userRepository.findVerifiedPhoneById(removed.getBlockedUserId())
+                .flatMap(phoneHasher::tryHash)
+                .ifPresent(phone -> clientBlockRepository.deleteGuestPhoneInScope(
+                        removed.getBlockerMasterId(), removed.getBlockerSalonId(), phone.hash()));
     }
 
     /**
@@ -218,10 +246,39 @@ public class ClientBlockService {
         return new ClientBlockState(true, findBlockId(scope.get(), target.get()).orElse(null));
     }
 
-    /** Phase 398 (app create) — is this registered account blocked in this scope. CLIENT rows only. */
+    /**
+     * Phase 398 (app create) + B527 D7 — is this registered account blocked in this scope: its account row, or (one
+     * person, one answer) the phone-hash row of its VERIFIED phone. The second leg costs a PK lookup and one probe, and
+     * only runs when the account row is absent.
+     */
     @Transactional(readOnly = true)
     public boolean isClientBlocked(BlockScope scope, UUID userId) {
-        return clientBlockRepository.findIdByBlockedUser(scope.masterId(), scope.salonId(), userId).isPresent();
+        if (clientBlockRepository.findIdByBlockedUser(scope.masterId(), scope.salonId(), userId).isPresent()) {
+            return true;
+        }
+        return userRepository.findVerifiedPhoneById(userId)
+                .flatMap(phoneHasher::tryHash)
+                .map(phone -> clientBlockRepository
+                        .findIdByGuestPhone(scope.masterId(), scope.salonId(), phone.hash()).isPresent())
+                .orElse(false);
+    }
+
+    /**
+     * Same answer as {@link #isClientBlocked(BlockScope, UUID)} for a caller that already holds the {@code client}
+     * entity: the verified phone is read from it (no PK lookup) and the account row + phone-hash row are probed in ONE
+     * statement; an account without a verified (hashable) phone costs the single account-row probe.
+     */
+    @Transactional(readOnly = true)
+    public boolean isClientBlocked(BlockScope scope, User client) {
+        Optional<HashedPhone> phone = client.getPhoneVerifiedAt() == null
+                ? Optional.empty()
+                : phoneHasher.tryHash(client.getPhoneNumber());
+        if (phone.isEmpty()) {
+            return clientBlockRepository.findIdByBlockedUser(scope.masterId(), scope.salonId(), client.getId())
+                    .isPresent();
+        }
+        return clientBlockRepository.findIdByUserOrGuestPhone(
+                scope.masterId(), scope.salonId(), client.getId(), phone.get().hash()).isPresent();
     }
 
     /**
@@ -234,6 +291,58 @@ public class ClientBlockService {
     @Transactional(readOnly = true)
     public boolean isGuestPhoneBlocked(BlockScope scope, HashedPhone phone) {
         return clientBlockRepository.findIdByGuestPhone(scope.masterId(), scope.salonId(), phone.hash()).isPresent();
+    }
+
+    /** B507 — the subset of a batch that is blocked: account ids, and the guest phones (as the caller passed them). */
+    public record BlockedAmong(Set<UUID> userIds, Set<HashedPhone> phones) {
+
+        static final BlockedAmong NONE = new BlockedAmong(Set.of(), Set.of());
+
+        public BlockedAmong {
+            userIds = Set.copyOf(userIds);
+            phones = Set.copyOf(phones);
+        }
+
+        public boolean isUserBlocked(UUID userId) {
+            return userIds.contains(userId);
+        }
+
+        public boolean isPhoneBlocked(HashedPhone phone) {
+            return phones.contains(phone);
+        }
+    }
+
+    /**
+     * B507 (provider client list) — which of these accounts / guest phones are blocked in this scope, in ONE
+     * {@code client_blocks} statement whatever the batch size (empty inputs: none). Per-type identity as everywhere
+     * else: accounts match CLIENT rows by id, phones match GUEST rows by hash, never across. The single-lookup probes
+     * above are unchanged.
+     */
+    @Transactional(readOnly = true)
+    public BlockedAmong blockedAmong(BlockScope scope, Collection<UUID> userIds, Collection<HashedPhone> phones) {
+        if (userIds.isEmpty() && phones.isEmpty()) {
+            return BlockedAmong.NONE;
+        }
+        List<byte[]> hashes = phones.stream().map(HashedPhone::hash).toList();
+        List<ClientBlockKeyRow> rows = clientBlockRepository.findBlockedAmong(
+                scope.masterId(), scope.salonId(), userIds, hashes);
+        Set<UUID> blockedUsers = new HashSet<>();
+        Set<String> blockedHashes = new HashSet<>();
+        HexFormat hex = HexFormat.of();
+        for (ClientBlockKeyRow row : rows) {
+            if (row.blockedUserId() != null) {
+                blockedUsers.add(row.blockedUserId());
+            } else if (row.phoneHash() != null) {
+                blockedHashes.add(hex.formatHex(row.phoneHash()));
+            }
+        }
+        Set<HashedPhone> blockedPhones = new HashSet<>();
+        for (HashedPhone phone : phones) {
+            if (blockedHashes.contains(hex.formatHex(phone.hash()))) {
+                blockedPhones.add(phone);
+            }
+        }
+        return new BlockedAmong(blockedUsers, blockedPhones);
     }
 
     /**
@@ -250,17 +359,25 @@ public class ClientBlockService {
     }
 
     private Optional<BlockTarget> targetOf(Booking booking) {
-        if (booking.getBookingSource() == BookingSource.STAFF) {
-            return Optional.empty();
-        }
+        // B527: client first — a STAFF walk-in attached to a client account (CLI-62) is blockable as that ACCOUNT
+        // (MOD-27 registered branch); a STAFF row without an account still has no verified identity (400).
         User client = booking.getClient();
         if (client != null) {
             return Optional.of(BlockTarget.client(client.getId(),
-                    BlockDisplayNames.snapshot(client.getFirstName(), client.getLastName())));
+                    BlockDisplayNames.snapshot(client.getFirstName(), client.getLastName()),
+                    verifiedPhoneHashOf(client)));
+        }
+        if (booking.getBookingSource() == BookingSource.STAFF) {
+            return Optional.empty();
         }
         return phoneHasher.tryHash(booking.getGuestPhone())
                 .map(phone -> BlockTarget.guest(phone,
                         BlockDisplayNames.snapshot(booking.getGuestName(), booking.getGuestSurname())));
+    }
+
+    /** B527 (D7) — the hash of the account's VERIFIED phone; an unverified legacy number was never a block identity. */
+    private @Nullable HashedPhone verifiedPhoneHashOf(User client) {
+        return client.isPhoneVerified() ? phoneHasher.tryHash(client.getPhoneNumber()).orElse(null) : null;
     }
 
     /** A GUEST target's phone already normalised in {@link #targetOf} (tryHash), so toE164 cannot throw here. */
@@ -273,7 +390,14 @@ public class ClientBlockService {
     /** The per-type key: CLIENT target → CLIENT rows by user id; GUEST target → GUEST rows by phone hash. */
     private Optional<UUID> findBlockId(BlockScope scope, BlockTarget target) {
         if (target.userId() != null) {
-            return clientBlockRepository.findIdByBlockedUser(scope.masterId(), scope.salonId(), target.userId());
+            Optional<UUID> account = clientBlockRepository.findIdByBlockedUser(
+                    scope.masterId(), scope.salonId(), target.userId());
+            if (account.isPresent() || target.verifiedPhone() == null) {
+                return account;
+            }
+            // B527 D7: the account's verified-phone hash blocks the same person (account row preferred above).
+            return clientBlockRepository.findIdByGuestPhone(
+                    scope.masterId(), scope.salonId(), target.verifiedPhone().hash());
         }
         return clientBlockRepository.findIdByGuestPhone(scope.masterId(), scope.salonId(), target.phoneHash());
     }

@@ -1841,8 +1841,8 @@ public class AuthorizationService {
      *   <li>{@code SALON_MASTER} - NEVER, even as the performing master of that very booking;</li>
      *   <li>{@code CLIENT} and anything else - never.</li>
      * </ul>
-     * Only the role half of the decision lives here; the data half (a registered user's phone is never read) lives in
-     * {@code BookingDetailResponse#withProviderVisibleGuestPhone}.
+     * Only the role half of the decision lives here; since GST-80 / CLI-D08 (2026-11-21) its one consumer is the
+     * provider client card ({@code ClientPhonePolicy}) - booking detail carries no phone for any role.
      */
     public boolean isGuestPhoneAudience() {
         Role actorRole = roleFromCurrentAuthentication();

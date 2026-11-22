@@ -226,6 +226,17 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.notification-feed-capacity:60}")
     private long notificationFeedCapacity;
 
+    /**
+     * Per-AUTHENTICATED-USER cap (60 s window) shared by the twelve provider client reads (B507 list, B508 card +
+     * visits, B526 ratings; salon and independent-master routes, user and guest variants) — consumed by
+     * {@link BookingRateLimitFilter}. Each is an aggregate over the provider's booking history; own bucket so a busy
+     * client tab never contends with the salon board or the notification poll. Sizing 120/min: one card open spends
+     * ~3 tokens (card + first visits page + list refresh), so 40 card opens a minute — beyond any human browsing.
+     * Overridden in {@code application-test.yml} (ITs drive many reads as one token).
+     */
+    @Value("${app.rate-limit.provider-client-read-capacity:120}")
+    private long providerClientReadCapacity;
+
     // ══════════════════════════════════════════════════════════════════════════════════════════
     // ACCEPTED RISK — 2026-09-15, architect sign-off (wish-list hull audit, cycle 2, perf LOW).
     // GET /api/v1/favorites/** — and GET /api/v1/favorites/services in particular — carries NO
@@ -695,6 +706,16 @@ public class RateLimitConfig {
 
     private static final Duration STAFF_BOOKING_SMS_WINDOW = Duration.ofSeconds(60);
 
+    // B527 audit — per-ACTOR cap on staff walk-in creates. A create whose phone resolves to an existing CLIENT account
+    // answers "attached", so an unbounded loop of walk-ins is a phone-number -> "is a Beautica client" oracle. A bucket
+    // charged only on a match would leak the same bit through its own 429, so it is charged on EVERY create in
+    // StaffBookingService (after the per-phone cap). The route's flat bucket (10/60s) is sized for SMS spend and cannot
+    // see the match. 30 per hour per staff user: ample for a day's keying-in, too few to enumerate a number range.
+    @Value("${app.rate-limit.staff-walk-in-create-capacity:30}")
+    private long staffWalkInCreateCapacity;
+
+    private static final Duration STAFF_WALK_IN_CREATE_WINDOW = Duration.ofHours(1);
+
     /**
      * Per-user cap for {@code DELETE /api/v1/users/me} (Phase 300, perf/security finding 2, 2026-09
      * audit — MEDIUM, raised independently by both auditors). Before this the endpoint had NO rate
@@ -923,6 +944,16 @@ public class RateLimitConfig {
     public LoadingCache<String, Bucket> notificationFeedBuckets() {
         return bucketCache(
                 DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, notificationFeedCapacity, ONE_MINUTE);
+    }
+
+    /**
+     * Per-user bucket (see {@link #providerClientReadCapacity}) shared by the twelve provider client reads, consumed
+     * by {@link BookingRateLimitFilter}.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> providerClientReadBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, providerClientReadCapacity, ONE_MINUTE);
     }
 
     /**
@@ -1392,6 +1423,16 @@ public class RateLimitConfig {
                 STAFF_BOOKING_SMS_WINDOW);
     }
 
+    /** Per-staff-actor bucket (see {@link #staffWalkInCreateCapacity}); consumed by {@code WalkInCreateBudget}. */
+    @Bean
+    public LoadingCache<String, Bucket> staffWalkInCreateBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                STAFF_WALK_IN_CREATE_WINDOW.plus(EVICTION_GRACE),
+                staffWalkInCreateCapacity,
+                STAFF_WALK_IN_CREATE_WINDOW);
+    }
+
     /**
      * Per-user bucket (see {@link #selfDeleteCapacity} field javadoc) for
      * {@code DELETE /api/v1/users/me}, consumed by {@link BookingRateLimitFilter}'s flat
@@ -1485,7 +1526,7 @@ public class RateLimitConfig {
                 staffBookingSmsBuckets(), selfDeleteBuckets(), salonMasterServicesReadBuckets(),
                 salonBoardReadBuckets(), notificationFeedBuckets(), catalogueBrowsePrincipalBuckets(),
                 catalogueBrowseBuckets(), catalogueBrowseAuthenticatedIpBuckets(), bookingLinkMutationBuckets(),
-                objectMapper);
+                providerClientReadBuckets(), objectMapper);
     }
 
     /**

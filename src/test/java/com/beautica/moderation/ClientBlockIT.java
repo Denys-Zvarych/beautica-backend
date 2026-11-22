@@ -37,6 +37,12 @@ class ClientBlockIT extends AbstractModerationIT {
     @Autowired
     private EntityManagerFactory emf;
 
+    @Autowired
+    private com.beautica.moderation.service.ClientBlockService clientBlockService;
+
+    @Autowired
+    private com.beautica.user.UserRepository userRepository;
+
     // ── V210/V211 constraints + cascades ────────────────────────────────────
 
     @Test
@@ -447,5 +453,33 @@ class ClientBlockIT extends AbstractModerationIT {
         jdbcTemplate.update("INSERT INTO client_blocks (id, blocker_salon_id, phone_hash, phone_last4, display_name) "
                         + "VALUES (?, ?, ?, ?, 'Гість Г.')",
                 UUID.randomUUID(), salonId, phoneHasher.hash(phone).hash(), phone.substring(phone.length() - 4));
+    }
+
+    // ── B527 audit (perf MEDIUM): isClientBlocked(scope, User) is ONE statement ──────────────────────────────
+
+    @Test
+    @DisplayName("isClientBlocked(scope, User): ONE statement for a verified-phone account, blocked or not (no PK read)")
+    void should_issueExactlyOneStatement_when_isClientBlockedGetsAUserWithAVerifiedPhone() {
+        SalonFixture salon = createSalon();
+        UUID client = createUser(unique("client"), "CLIENT", null);
+        jdbcTemplate.update("UPDATE users SET phone_number = ?, phone_verified_at = now() WHERE id = ?",
+                GUEST_PHONE, client);
+        com.beautica.user.User user = userRepository.findById(client).orElseThrow();
+        com.beautica.moderation.service.BlockScope scope =
+                com.beautica.moderation.service.BlockScope.salon(salon.salonId());
+        Statistics statistics = HibernateStatistics.enabledOn(emf);
+
+        statistics.clear();
+        boolean before = clientBlockService.isClientBlocked(scope, user);
+        long notBlockedStatements = statistics.getPrepareStatementCount();
+        insertGuestBlockRow(salon.salonId(), GUEST_PHONE);
+        statistics.clear();
+        boolean after = clientBlockService.isClientBlocked(scope, user);
+        long blockedStatements = statistics.getPrepareStatementCount();
+
+        assertThat(before).isFalse();
+        assertThat(after).as("the phone-hash row of the verified phone blocks the account (D7)").isTrue();
+        assertThat(notBlockedStatements).as("one combined probe, was 3").isEqualTo(1L);
+        assertThat(blockedStatements).isEqualTo(1L);
     }
 }

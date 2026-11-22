@@ -181,15 +181,15 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("phase 386: BookingDetailResponse.guestPhone is a nullable string whose description states the rule")
-    void should_exposeNullableGuestPhone_when_specRendered() throws Exception {
+    @DisplayName("GST-80/CLI-D08: BookingDetailResponse.guestPhone is a retired nullable string documented as always null")
+    void should_documentGuestPhoneAsAlwaysNull_when_specRendered() throws Exception {
         JsonNode guestPhone = spec().path("components").path("schemas").path("BookingDetailResponse")
                 .path("properties").path("guestPhone");
 
         assertThat(guestPhone.isMissingNode()).isFalse();
         assertThat(texts(guestPhone.path("type"))).containsExactlyInAnyOrder("string", "null");
         assertThat(guestPhone.path("description").asText())
-                .contains("GUEST").contains("DETAIL").contains("registered");
+                .contains("ALWAYS null").contains("GST-80").contains("CLI-D08");
         assertThat(texts(spec().path("components").path("schemas").path("BookingDetailResponse").path("required")))
                 .doesNotContain("guestPhone");
     }

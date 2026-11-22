@@ -4,10 +4,9 @@ import com.beautica.common.exception.BookingUnavailableException;
 import com.beautica.common.security.PhoneHasher;
 import com.beautica.master.entity.Master;
 import com.beautica.salon.entity.Salon;
+import com.beautica.user.User;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
-
-import java.util.UUID;
 
 /**
  * Phase 398 — the booking-create gate for provider-to-client blocks (phase 397). One call per create path:
@@ -18,17 +17,16 @@ import java.util.UUID;
  *   <li>LINK guest — {@code GuestBookingService#createFor} (master link + salon link, single service and visit)
  *       → {@link #requireGuestMayBook}: GUEST rows by the HMAC of the OTP-verified token phone (D2).</li>
  * </ul>
- * No cross-type match (D2): a CLIENT block never refuses a guest booking and a GUEST block never refuses an APP
- * booking. STAFF walk-ins never reach this gate (D8).
+ * B527 (D7) — one person, one answer: a CLIENT account counts as blocked when its account row OR the phone-hash row of its
+ * VERIFIED phone is blocked ({@link ClientBlockService#isClientBlocked}); a LINK guest whose phone is a client account's
+ * verified phone is first resolved to that account by {@code GuestBookingService} and refused through
+ * {@link #requireClientMayBook} AND {@link #requireGuestMayBook} (either refuses, MOD-29). STAFF walk-ins never reach
+ * this gate (D8, MOD-28).
  *
  * <p><b>Scope comes from the TARGET master, never the caller</b> (397 re-audit): a master with a salon is booked in
  * that salon's scope (every salon master, the owner-as-master included); a master without one is an independent
  * master's own scope. This mirrors {@code bookings.salon_id = master.getSalon()} set by every create path and the
  * scope {@link ClientBlockScopeResolver#forBooking} writes the block under.
- *
- * <p><b>Accepted residual (option A, 2026-10-28).</b> A blocked registered client can still book through a link as
- * a guest with an OTP-verified phone — identities are per type and the profile phone is never hashed. That is not a
- * bypass: the resulting guest booking is blockable with one tap, after which that phone is refused too.
  *
  * <p>Refusal = {@link BookingUnavailableException} (409 {@code BOOKING_UNAVAILABLE}, neutral wording). Costs one
  * {@code LIMIT 1} indexed id probe per create. Neither the phone nor its hash is logged.
@@ -46,10 +44,10 @@ public class BookingBlockGuard {
         return salon != null ? BlockScope.salon(salon.getId()) : BlockScope.master(master.getId());
     }
 
-    /** D1 — refuses an APP booking when the client's account is blocked in the target's scope. */
-    public void requireClientMayBook(Master target, UUID clientId) {
+    /** D1 + B527 D7 — refuses a booking when the client's account (or its verified-phone hash) is blocked in the target's scope. */
+    public void requireClientMayBook(Master target, User client) {
         BlockScope scope = targetScopeOf(target);
-        if (clientBlockService.isClientBlocked(scope, clientId)) {
+        if (clientBlockService.isClientBlocked(scope, client)) {
             throw unavailable(scope);
         }
     }

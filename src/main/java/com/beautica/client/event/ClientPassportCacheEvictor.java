@@ -70,6 +70,12 @@ public class ClientPassportCacheEvictor {
         evictPassport(event.clientUserId());
     }
 
+    /** B527 — bookings attached to the account by phone (CLI-62) move its passport and timeline. */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void onBookingsAttached(ClientBookingsAttachedEvent event) {
+        evictPassport(event.clientUserId());
+    }
+
     /**
      * A review authored by the client changes {@code reviewsWritten}.
      *

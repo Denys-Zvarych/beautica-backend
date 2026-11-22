@@ -192,6 +192,62 @@ class InAppNotificationServiceTest {
         return ArgumentCaptor.forClass(Collection.class);
     }
 
+    // ── B527 — a booking attached to a client account also reaches that client ─────────────────
+
+    @Test
+    @DisplayName("B527: an attached LINK create (no actor) reaches the provider set AND the client")
+    void should_includeTheClient_when_attachedLinkBookingCreated() {
+        UUID bookingId = UUID.randomUUID();
+        Booking booking = bookingWith(bookingId, userWithId(clientId), master, salon, BookingSource.LINK);
+
+        service.notifyBookingEvent(InAppNotificationType.BOOKING_CREATED, booking, null);
+
+        ArgumentCaptor<Collection<UUID>> recipients = recipientsCaptor();
+        verify(repository, times(1)).insertForRecipients(
+                eq("BOOKING_CREATED"), recipients.capture(), eq(bookingId), isNull(), any(), isNull(), any());
+        assertThat(recipients.getValue()).containsExactlyInAnyOrder(ownerId, masterUserId, clientId);
+    }
+
+    @Test
+    @DisplayName("B527: an attached STAFF walk-in visit reaches the performing master (unchanged) AND the client")
+    void should_includeTheClient_when_attachedWalkInVisitCreated() {
+        UUID appointmentId = UUID.randomUUID();
+        Booking item = bookingWith(UUID.randomUUID(), userWithId(clientId), master, salon, BookingSource.STAFF);
+
+        service.notifyVisitEvent(InAppNotificationType.BOOKING_CREATED, appointmentId, item, ownerId);
+
+        ArgumentCaptor<Collection<UUID>> recipients = recipientsCaptor();
+        verify(repository, times(1)).insertForRecipients(
+                eq("BOOKING_CREATED"), recipients.capture(), isNull(), eq(appointmentId), any(), isNull(), any());
+        assertThat(recipients.getValue()).containsExactlyInAnyOrder(masterUserId, clientId);
+    }
+
+    @Test
+    @DisplayName("B527: a provider reschedule of an attached STAFF booking reaches the client (registered path)")
+    void should_reachTheClient_when_attachedWalkInRescheduledByProvider() {
+        Booking booking = bookingWith(UUID.randomUUID(), userWithId(clientId), master, salon, BookingSource.STAFF);
+
+        service.notifyRescheduled(booking, true, Instant.parse("2026-10-01T12:00:00Z"), ownerId);
+
+        ArgumentCaptor<Collection<UUID>> recipients = recipientsCaptor();
+        verify(repository, times(1)).insertForRecipients(
+                eq("BOOKING_RESCHEDULED"), recipients.capture(), any(), isNull(), any(), isNull(), any());
+        assertThat(recipients.getValue()).containsExactlyInAnyOrder(masterUserId, clientId);
+    }
+
+    @Test
+    @DisplayName("B527: an account-less walk-in reschedule still reaches only the performing master")
+    void should_reachOnlyTheMaster_when_accountlessWalkInRescheduled() {
+        Booking booking = bookingWith(UUID.randomUUID(), null, master, salon, BookingSource.STAFF);
+
+        service.notifyRescheduled(booking, true, Instant.parse("2026-10-01T12:00:00Z"), ownerId);
+
+        ArgumentCaptor<Collection<UUID>> recipients = recipientsCaptor();
+        verify(repository, times(1)).insertForRecipients(
+                eq("BOOKING_RESCHEDULED"), recipients.capture(), any(), isNull(), any(), isNull(), any());
+        assertThat(recipients.getValue()).containsExactly(masterUserId);
+    }
+
     // ── dedup key shapes ────────────────────────────────────────────────────────────────────
 
     @Test

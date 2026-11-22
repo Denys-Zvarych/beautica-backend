@@ -176,7 +176,7 @@ class AppointmentServiceTest {
         when(appointmentRepository.findActiveByClientIdAndIdempotencyKey(CLIENT_ID, IDEMPOTENCY_KEY))
                 .thenReturn(Optional.empty());
         org.mockito.Mockito.doThrow(com.beautica.common.exception.BookingUnavailableException.forSalon())
-                .when(bookingBlockGuard).requireClientMayBook(master, CLIENT_ID);
+                .when(bookingBlockGuard).requireClientMayBook(org.mockito.ArgumentMatchers.eq(master), org.mockito.ArgumentMatchers.any(com.beautica.user.User.class));
 
         assertThatThrownBy(() -> appointmentService.createAppointment(CLIENT_ID, IDEMPOTENCY_KEY, request()))
                 .isInstanceOf(com.beautica.common.exception.BookingUnavailableException.class);
@@ -185,7 +185,7 @@ class AppointmentServiceTest {
                 bookingBlockGuard);
         order.verify(bookingRepository).acquireClientAdvisoryLockWithTimeout(CLIENT_ID);
         order.verify(appointmentRepository).findActiveByClientIdAndIdempotencyKey(CLIENT_ID, IDEMPOTENCY_KEY);
-        order.verify(bookingBlockGuard).requireClientMayBook(master, CLIENT_ID);
+        order.verify(bookingBlockGuard).requireClientMayBook(org.mockito.ArgumentMatchers.eq(master), org.mockito.ArgumentMatchers.any(com.beautica.user.User.class));
         verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
         verify(appointmentRepository, never()).save(any());
     }

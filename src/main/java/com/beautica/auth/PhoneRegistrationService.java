@@ -2,6 +2,8 @@ package com.beautica.auth;
 
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.registration.RegistrationTicketService;
+import com.beautica.booking.enums.AttachReason;
+import com.beautica.client.service.ClientPhoneAttachService;
 import com.beautica.common.exception.IdentityException;
 import com.beautica.common.validation.TermsConsentPayload;
 import com.beautica.master.service.MasterService;
@@ -33,17 +35,20 @@ public class PhoneRegistrationService {
     private final UserRepository userRepository;
     private final MasterService masterService;
     private final AuthResponseBuilder authResponseBuilder;
+    private final ClientPhoneAttachService clientPhoneAttachService;
     private final Clock clock;
 
     public PhoneRegistrationService(RegistrationTicketService ticketService,
                                     UserRepository userRepository,
                                     MasterService masterService,
                                     AuthResponseBuilder authResponseBuilder,
+                                    ClientPhoneAttachService clientPhoneAttachService,
                                     Clock clock) {
         this.ticketService = ticketService;
         this.userRepository = userRepository;
         this.masterService = masterService;
         this.authResponseBuilder = authResponseBuilder;
+        this.clientPhoneAttachService = clientPhoneAttachService;
         this.clock = clock;
     }
 
@@ -74,6 +79,10 @@ public class PhoneRegistrationService {
                 account.role(), account.firstName(), blankToNull(account.lastName()), account.businessName(), now);
         TermsConsentStamp.apply(user, account.consent(), now);
         User saved = saveClaimingPhone(userRepository, user);
+        if (account.role() == Role.CLIENT) {
+            // B527 (CLI-62): the guest / walk-in bookings made under this verified phone become the new account's own.
+            clientPhoneAttachService.attachAfterCommit(saved, AttachReason.PHONE_VERIFIED);
+        }
         if (account.role() == Role.INDEPENDENT_MASTER) {
             masterService.createMasterForIndependentUser(saved.getId());
         }

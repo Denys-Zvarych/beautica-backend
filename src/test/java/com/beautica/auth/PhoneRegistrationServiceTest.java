@@ -50,11 +50,12 @@ class PhoneRegistrationServiceTest {
     /** B12: the caller hashes before its transaction; the service stores this value untouched. */
     private static final String PASSWORD_HASH = new BCryptPasswordEncoder(4).encode("Str0ng!Passw0rd#");
     private PhoneRegistrationService service;
+    @org.mockito.Mock private com.beautica.client.service.ClientPhoneAttachService clientPhoneAttachService;
 
     @BeforeEach
     void setUp() {
         service = new PhoneRegistrationService(ticketService, userRepository,
-                masterService, authResponseBuilder, Clock.fixed(NOW, ZoneOffset.UTC));
+                masterService, authResponseBuilder, clientPhoneAttachService, Clock.fixed(NOW, ZoneOffset.UTC));
     }
 
     private static PhoneRegistrationService.PhoneAccount account(Role role) {
@@ -107,6 +108,41 @@ class PhoneRegistrationServiceTest {
         service.register(account(Role.INDEPENDENT_MASTER));
 
         verify(masterService).createMasterForIndependentUser(any());
+    }
+
+    @Test
+    @DisplayName("should_attachGuestAndWalkInBookings_when_clientRegisters (B527)")
+    void should_attachGuestAndWalkInBookings_when_clientRegisters() {
+        when(ticketService.consume("ticket")).thenReturn(PHONE);
+        when(userRepository.saveAndFlush(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        service.register(account(Role.CLIENT));
+
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(userRepository, clientPhoneAttachService);
+        order.verify(userRepository).saveAndFlush(any(User.class));
+        order.verify(clientPhoneAttachService).attachAfterCommit(org.mockito.ArgumentMatchers.any(com.beautica.user.User.class), org.mockito.ArgumentMatchers.eq(com.beautica.booking.enums.AttachReason.PHONE_VERIFIED));
+    }
+
+    @Test
+    @DisplayName("should_notAttachAnything_when_aProviderRegisters (B527 D6)")
+    void should_notAttachAnything_when_aProviderRegisters() {
+        when(ticketService.consume("ticket")).thenReturn(PHONE);
+        when(userRepository.saveAndFlush(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        service.register(account(Role.INDEPENDENT_MASTER));
+
+        org.mockito.Mockito.verifyNoInteractions(clientPhoneAttachService);
+    }
+
+    @Test
+    @DisplayName("should_notAttach_when_thePhoneIsAlreadyTaken (B527)")
+    void should_notAttach_when_thePhoneIsAlreadyTaken() {
+        when(ticketService.consume("ticket")).thenReturn(PHONE);
+        when(userRepository.existsByVerifiedPhone(PHONE)).thenReturn(true);
+
+        assertThatThrownBy(() -> service.register(account(Role.CLIENT))).isInstanceOf(IdentityException.class);
+
+        org.mockito.Mockito.verifyNoInteractions(clientPhoneAttachService);
     }
 
     @Test

@@ -699,7 +699,87 @@ class ClientBookingReceiptEmailIT extends AbstractWalkInBookingSmsIT {
         assertThat(sentTexts()).as("NTF-D04: never an SMS to a registered client").isEmpty();
     }
 
+    // ── B527 follow-up (NTF-67, NTF-D15): an attached LINK / walk-in create e-mails the client's receipt ──
+
+    @Test
+    @DisplayName("B527: a walk-in attached to a client with a confirmed email → after the drain ONE «Бронювання "
+            + "підтверджено» e-mail + REQUEST .ics to the client, no SMS")
+    void should_emailConfirmationWithIcs_when_walkInAttachedToClientWithConfirmedEmail() throws Exception {
+        // Arrange
+        givePhoneTo(client, E164_PHONE);
+        OffsetDateTime start = tomorrowAtNoon();
+
+        // Act
+        UUID bookingId = firstItemOf(createWalkIn(start));
+        drainWorker.drain();
+
+        // Assert
+        MimeMessage mail = onlyMailTo(client.email());
+        assertThat(mail.getSubject()).isEqualTo(ClientReceiptEmailExpectedCopy.CONFIRMED_SUBJECT);
+        assertThat(BookingIcsExpectedContent.lines(onlyIcs(mail, "REQUEST"))).contains(
+                BookingIcsExpectedContent.uidLine(bookingId), "DTSTART:" + utcStamp(start),
+                BookingIcsExpectedContent.STATUS_CONFIRMED);
+        assertThat(sentTexts()).as("NTF-D04: an attached walk-in never texts the registered client").isEmpty();
+    }
+
+    @Test
+    @DisplayName("B527: a LINK booking attached to a client with a confirmed email → after the drain ONE "
+            + "«Бронювання підтверджено» e-mail + REQUEST .ics to the client")
+    void should_emailConfirmationWithIcs_when_linkBookingAttachedToClientWithConfirmedEmail() throws Exception {
+        // Arrange
+        givePhoneTo(client, LINK_PHONE);
+        OffsetDateTime start = tomorrowAtNoon();
+
+        // Act
+        ResponseEntity<String> resp = createGuestBooking(start);
+        drainWorker.drain();
+
+        // Assert
+        assertThat(resp.getStatusCode()).as("link create body=%s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
+        UUID bookingId = UUID.fromString(readJson(resp.getBody()).path("bookingId").asText());
+        MimeMessage mail = onlyMailTo(client.email());
+        assertThat(mail.getSubject()).isEqualTo(ClientReceiptEmailExpectedCopy.CONFIRMED_SUBJECT);
+        assertThat(BookingIcsExpectedContent.lines(onlyIcs(mail, "REQUEST"))).contains(
+                BookingIcsExpectedContent.uidLine(bookingId), "DTSTART:" + utcStamp(start));
+    }
+
+    @Test
+    @DisplayName("B527: a two-service walk-in attached to a client → exactly ONE receipt row (keyed to the first item) "
+            + "and exactly ONE confirmation e-mail, never one per service")
+    void should_enqueueAndSendOneReceipt_when_attachedWalkInHasTwoServices() throws Exception {
+        // Arrange
+        givePhoneTo(client, E164_PHONE);
+        UUID secondService = insertService(salon.masterId(), "SALON", salon.salonId());
+
+        // Act
+        ResponseEntity<String> resp = createWalkIn(tomorrowAtNoon(), List.of(salon.masterServiceId(), secondService));
+        UUID firstItem = firstItemOf(resp);
+        List<UUID> receiptRows = jdbcTemplate.queryForList(
+                "SELECT aggregate_id FROM notification_outbox WHERE event_type = 'STATUS_CHANGED'", UUID.class);
+        drainWorker.drain();
+
+        // Assert
+        assertThat(readJson(resp.getBody()).path("data").path("items")).as("precondition: a two-item visit")
+                .hasSize(2);
+        assertThat(receiptRows).as("one row per visit, keyed to its first item").containsExactly(firstItem);
+        assertThat(mailsTo(client.email())).extracting(MimeMessage::getSubject)
+                .as("one confirmation for the whole visit")
+                .containsExactly(ClientReceiptEmailExpectedCopy.CONFIRMED_SUBJECT);
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────
+
+    /** Makes {@code user} the CLIENT account that owns {@code e164} as its VERIFIED phone (the B527 attach key). */
+    private void givePhoneTo(SeededUser user, String e164) {
+        jdbcTemplate.update("UPDATE users SET phone_number = ?, phone_verified_at = NOW() WHERE id = ?", e164,
+                user.id());
+    }
+
+    /** The first item's booking id of a walk-in create response, after asserting it was created. */
+    private UUID firstItemOf(ResponseEntity<String> resp) {
+        assertThat(resp.getStatusCode()).as("walk-in create body=%s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
+        return UUID.fromString(readJson(resp.getBody()).path("data").path("items").get(0).path("bookingId").asText());
+    }
 
     private static CancelBookingRequest clientCancel() {
         return new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);

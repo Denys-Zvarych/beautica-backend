@@ -144,16 +144,16 @@ class PublicSalonGuestBookingIT extends AbstractIntegrationTest {
     // ── phone visibility (phase 386) ────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("phase 386: the salon owner sees the guest phone on the salon-route booking; the performing "
-            + "salon master gets null and the digits are nowhere in the body")
-    void should_showPhoneToOwnerOnly_when_bookedThroughSalonRoute() throws Exception {
+    @DisplayName("GST-80: neither the salon owner nor the performing salon master gets the guest phone on the "
+            + "salon-route booking detail; the digits are nowhere in the master's body")
+    void should_showPhoneToNoOne_when_bookedThroughSalonRoute() throws Exception {
         UUID bookingId = UUID.fromString(created(book(masterA, List.of(serviceA), LocalTime.of(10, 0),
                 guestTokenProvider.generate(guestPhone), null)).path("bookingId").asText());
 
         ResponseEntity<String> owner = detail(bookingId, fx.tokenFor(salon.ownerEmail()));
         ResponseEntity<String> master = detail(bookingId, fx.tokenFor(salon.masterEmail()));
 
-        assertThat(objectMapper.readTree(owner.getBody()).path("data").path("guestPhone").asText()).isEqualTo(guestPhone);
+        assertThat(objectMapper.readTree(owner.getBody()).path("data").path("guestPhone").isNull()).isTrue();
         assertThat(master.getStatusCode()).as(master.getBody()).isEqualTo(HttpStatus.OK);
         assertThat(objectMapper.readTree(master.getBody()).path("data").path("guestPhone").isNull()).isTrue();
         assertThat(master.getBody()).doesNotContain(guestPhone.substring(4));

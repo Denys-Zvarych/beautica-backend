@@ -776,7 +776,12 @@ class StaffBookingIT extends AbstractIntegrationTest {
         // CREATE_FIXED_STATEMENTS + 1 there -- this ledger does not duplicate it. Fixed, not per-item:
         // this and its N=10 sibling below moved together, 16 to 14, so the anti-N+1 property the pair
         // exists to pin is unaffected.
-        private static final long CREATE_FIXED_STATEMENTS = 14L;
+        //
+        // Re-baselined (B527, one client identity by phone), 14 -> 15: the walk-in create resolves the CLIENT account that
+        // owns the guest phone ({@code UserRepository#findAttachableClientByVerifiedPhone}) so it can attach the visit
+        // (ONE fixed SELECT, never per item). The per-phone lock that makes it race-safe is the one the SMS budget check
+        // already takes (not a second round trip). The N=10 sibling moves with it, so the anti-N+1 property is unchanged.
+        private static final long CREATE_FIXED_STATEMENTS = 15L;
 
         /**
          * Per-CHAINED-ITEM cost: <b>ZERO</b>. Adding a service to the visit must not add a single
@@ -846,6 +851,55 @@ class StaffBookingIT extends AbstractIntegrationTest {
                             + "and its N=1 sibling asserting the SAME number is what makes the "
                             + "ledger distinguish 0-per-item from 1-per-item at all")
                     .isEqualTo(CREATE_FIXED_STATEMENTS + 10 * CREATE_PER_ITEM_STATEMENTS);
+        }
+
+        /**
+         * B527 follow-up (NTF-67) — an ATTACHED walk-in for an account with a confirmed email costs the fixed baseline
+         * plus the attach's own writes plus exactly ONE more: the client's {@code STATUS_CHANGED} receipt row. Its
+         * no-email sibling below must cost exactly one statement less, which is what pins the receipt at one row per
+         * visit (never per item, never two).
+         *
+         * <p>Measured 2026-11-21: 18 = {@link #CREATE_FIXED_STATEMENTS} (15) + 2 (the attached account's own in-app
+         * path, measured as the no-email sibling's 17) + 1 (the receipt row).
+         */
+        private static final long CREATE_ATTACHED_WITH_RECEIPT_STATEMENTS = 18L;
+
+        @Test
+        @DisplayName("attached walk-in, confirmed email: the pinned cost, one statement more than without an email")
+        void should_issuePinnedStatementCount_when_walkInAttachedToClientWithConfirmedEmail() {
+            long withEmail = attachedCreateStatements(true, 11);
+            long withoutEmail = attachedCreateStatements(false, 12);
+
+            assertThat(withEmail).as("attached walk-in create statements (receipt row included)")
+                    .isEqualTo(CREATE_ATTACHED_WITH_RECEIPT_STATEMENTS);
+            assertThat(withEmail - withoutEmail).as("the receipt is exactly ONE outbox insert").isEqualTo(1L);
+        }
+
+        /** One attached single-service create against a fresh master, for a CLIENT owning the guest phone. */
+        private long attachedCreateStatements(boolean confirmedEmail, int phoneSuffix) {
+            Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
+            statistics.setStatisticsEnabled(true);
+            Seed fresh = seedStatementCountMaster();
+            StaffBookingCommand cmd = singleServiceStatementCountCommand(fresh, phoneSuffix);
+            insertVerifiedPhoneClient(((StaffClientRef.Guest) cmd.client()).phone(), confirmedEmail);
+
+            statistics.clear();
+            AppointmentDetailResponse created = create(fresh, cmd);
+            long statements = statistics.getPrepareStatementCount();
+
+            assertThat(jdbc.queryForObject("SELECT client_id IS NOT NULL FROM bookings WHERE id = ?", Boolean.class,
+                    created.items().get(0).bookingId())).as("precondition: the walk-in attached").isTrue();
+            return statements;
+        }
+
+        private void insertVerifiedPhoneClient(String e164, boolean confirmedEmail) {
+            UUID id = UUID.randomUUID();
+            jdbc.update("INSERT INTO users (id, email, password_hash, role, first_name, last_name, phone_number, "
+                            + "phone_verified_at, is_active, email_verified) "
+                            + "VALUES (?, ?, ?, 'CLIENT', 'Ірина', 'Кравчук', ?, NOW(), true, ?)",
+                    id, "attached-" + id + "@beautica.test",
+                    new org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder(4).encode("test-password"),
+                    e164, confirmedEmail);
         }
 
         /** Isolated per-test master: own salon, own weekly schedule wide enough for a 10×60min chain. */

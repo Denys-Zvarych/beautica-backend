@@ -45,6 +45,28 @@ public interface ClientBlockRepository extends JpaRepository<ClientBlock, UUID> 
             @Param("userId") UUID userId,
             Limit limit);
 
+    /**
+     * B527 (D7) — ONE probe for "is this account blocked in this scope": its CLIENT row by id, or the GUEST row of its
+     * verified phone hash. Both legs are served by the V210 partial uniques as a BitmapOr; {@code LIMIT 1}.
+     * Callers pass a hash only for a verified phone — without one they use {@link #findIdByBlockedUser}.
+     */
+    default Optional<UUID> findIdByUserOrGuestPhone(UUID masterId, UUID salonId, UUID userId, byte[] phoneHash) {
+        return findIdByUserOrGuestPhone(masterId, salonId, userId, phoneHash, Limit.of(1));
+    }
+
+    @Query("""
+            SELECT cb.id FROM ClientBlock cb
+             WHERE (cb.blockerMasterId = :masterId OR cb.blockerSalonId = :salonId)
+               AND (cb.blockedUserId = :userId
+                    OR (cb.blockedUserId IS NULL AND cb.phoneHash = :phoneHash))
+            """)
+    Optional<UUID> findIdByUserOrGuestPhone(
+            @Param("masterId") UUID masterId,
+            @Param("salonId") UUID salonId,
+            @Param("userId") UUID userId,
+            @Param("phoneHash") byte[] phoneHash,
+            Limit limit);
+
     /** The GUEST block of this verified phone hash in this scope (at most one: V210 partial uniques). */
     default Optional<UUID> findIdByGuestPhone(UUID masterId, UUID salonId, byte[] phoneHash) {
         return findIdByGuestPhone(masterId, salonId, phoneHash, Limit.of(1));
@@ -61,6 +83,26 @@ public interface ClientBlockRepository extends JpaRepository<ClientBlock, UUID> 
             @Param("salonId") UUID salonId,
             @Param("phoneHash") byte[] phoneHash,
             Limit limit);
+
+    /**
+     * B507 — batch probe for the provider client list: ONE statement for every CLIENT row among {@code userIds} and
+     * every GUEST row among {@code phoneHashes} in this scope (exactly one of {@code masterId} / {@code salonId} is
+     * non-null; the null one never matches). The two keys stay per-type (never OR'd across types): a CLIENT row is
+     * matched by user id only, a GUEST row (blocked_user_id IS NULL) by hash only. Callers never pass both lists
+     * empty; the page is bounded (&lt;= 50 ids and hashes).
+     */
+    @Query("""
+            SELECT new com.beautica.moderation.repository.ClientBlockKeyRow(cb.blockedUserId, cb.phoneHash)
+              FROM ClientBlock cb
+             WHERE (cb.blockerMasterId = :masterId OR cb.blockerSalonId = :salonId)
+               AND (cb.blockedUserId IN :userIds
+                    OR (cb.blockedUserId IS NULL AND cb.phoneHash IN :phoneHashes))
+            """)
+    List<ClientBlockKeyRow> findBlockedAmong(
+            @Param("masterId") UUID masterId,
+            @Param("salonId") UUID salonId,
+            @Param("userIds") Collection<UUID> userIds,
+            @Param("phoneHashes") Collection<byte[]> phoneHashes);
 
     /**
      * Race-safe insert: a concurrent twin colliding on any V210 partial unique index inserts nothing (0) and the
@@ -135,4 +177,29 @@ public interface ClientBlockRepository extends JpaRepository<ClientBlock, UUID> 
     @Modifying
     @Query("DELETE FROM ClientBlock cb WHERE cb.id = :id AND cb.blockerSalonId IN :salonIds")
     int deleteInSalonScope(@Param("id") UUID id, @Param("salonIds") Collection<UUID> salonIds);
+
+    /**
+     * B527 (D7) — the row {@code id} when it sits in this master's scope; the unblock reads its kind (account /
+     * phone hash) before deleting so a registered client's phone-hash row goes with the account row.
+     */
+    @Query("SELECT cb FROM ClientBlock cb WHERE cb.id = :id AND cb.blockerMasterId = :masterId")
+    Optional<ClientBlock> findInMasterScope(@Param("id") UUID id, @Param("masterId") UUID masterId);
+
+    /** {@link #findInMasterScope} for the salon scopes the caller manages. */
+    @Query("SELECT cb FROM ClientBlock cb WHERE cb.id = :id AND cb.blockerSalonId IN :salonIds")
+    Optional<ClientBlock> findInSalonScopes(@Param("id") UUID id, @Param("salonIds") Collection<UUID> salonIds);
+
+    /**
+     * B527 (D7) — deletes the GUEST (phone-hash) rows of one phone in exactly one block scope: the unblock of a
+     * registered client clears the hash of the account's verified phone beside the account row.
+     */
+    @Modifying
+    @Query("""
+            DELETE FROM ClientBlock cb
+             WHERE cb.blockedUserId IS NULL
+               AND cb.phoneHash = :phoneHash
+               AND (cb.blockerMasterId = :masterId OR cb.blockerSalonId = :salonId)
+            """)
+    int deleteGuestPhoneInScope(
+            @Param("masterId") UUID masterId, @Param("salonId") UUID salonId, @Param("phoneHash") byte[] phoneHash);
 }

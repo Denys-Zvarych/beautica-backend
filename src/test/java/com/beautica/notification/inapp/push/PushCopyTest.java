@@ -173,7 +173,7 @@ class PushCopyTest {
     }
 
     @Test
-    @DisplayName("declined and rescheduled titles differ by audience; the rest do not")
+    @DisplayName("declined, rescheduled and (B527) created titles differ by audience; the rest do not")
     void should_differByAudience_when_declinedOrRescheduled() {
         assertThat(PushCopy.title(InAppNotificationType.BOOKING_DECLINED, true))
                 .isEqualTo("Ваш запис скасовано");
@@ -183,8 +183,12 @@ class PushCopyTest {
                 .isEqualTo("Ваш запис перенесено");
         assertThat(PushCopy.title(InAppNotificationType.BOOKING_RESCHEDULED, false))
                 .isEqualTo("Запис перенесено");
-        assertThat(PushCopy.title(InAppNotificationType.BOOKING_CREATED, true))
-                .isEqualTo(PushCopy.title(InAppNotificationType.BOOKING_CREATED, false));
+        // B527 (NTF-67): an attached guest / walk-in booking also reaches the client — «Вас записано» (the provider
+        // copy is unchanged).
+        assertThat(PushCopy.title(InAppNotificationType.BOOKING_CREATED, true)).isEqualTo("Вас записано");
+        assertThat(PushCopy.title(InAppNotificationType.BOOKING_CREATED, false)).isEqualTo("Новий запис");
+        assertThat(PushCopy.title(InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, true))
+                .isEqualTo(PushCopy.title(InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, false));
     }
 
     @Test

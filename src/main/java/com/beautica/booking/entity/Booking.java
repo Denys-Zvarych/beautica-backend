@@ -3,6 +3,7 @@ package com.beautica.booking.entity;
 import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.GuestConsent;
+import com.beautica.booking.enums.AttachReason;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
@@ -38,6 +39,7 @@ import org.springframework.lang.Nullable;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.util.Objects;
 import java.util.UUID;
 
 @Table(
@@ -82,10 +84,11 @@ import java.util.UUID;
                 @Index(name = "idx_bookings_reminder", columnList = "starts_at"),
                 // partial index (V225): 15-min 2h-reminder sweep; predicate LINK AND CONFIRMED AND reminder_2h_sent=FALSE in V225 only.
                 @Index(name = "idx_bookings_reminder_2h", columnList = "starts_at"),
-                // partial indexes (V240, phase 494): registered-client reminder sweeps; predicates
-                // APP AND CONFIRMED AND reminder_sent / reminder_2h_sent = FALSE in V240 only.
-                @Index(name = "idx_bookings_reminder_app", columnList = "starts_at"),
-                @Index(name = "idx_bookings_reminder_2h_app", columnList = "starts_at"),
+                // partial indexes (V262, phase 527; replace V240's _app + V260's _attached): registered-client
+                // reminder sweeps; predicates (APP OR client_link_reason IS NOT NULL) AND CONFIRMED AND
+                // reminder_sent / reminder_2h_sent = FALSE AND client_id IS NOT NULL in V262 only.
+                @Index(name = "idx_bookings_reminder_registered", columnList = "starts_at"),
+                @Index(name = "idx_bookings_reminder_2h_registered", columnList = "starts_at"),
                 // idx_bookings_master_client_starts_at (V93) served the per-client "latest
                 // booking" LATERAL subquery formerly in FavoriteRepository.findFavoriteMasterRows.
                 // DROPPED by V144 once the favourites category axis was reversed from "last
@@ -239,6 +242,8 @@ import java.util.UUID;
                 // WHERE appointment_id IS NOT NULL AND guest_pii_anonymised_at IS NOT NULL lives in
                 // V199 only; documentation, not enforcement.
                 @Index(name = "idx_bookings_guest_pii_anonymised_visit", columnList = "guest_pii_anonymised_at")
+                // idx_bookings_guest_phone_starts_at (V259) was DROPPED by V263: same rows as
+                // idx_bookings_guest_phone_open above, which now also serves the provider client card guest scope.
         }
 )
 // Root-cause fix (G1, cycle-7 audit 2026-08-03) for the entity-staleness/terminal-state-
@@ -471,6 +476,58 @@ public class Booking extends AuditableEntity {
         this.guestSurname = null;
         this.client = null;
         this.clientDetachedAt = at;
+        if (clientLinkReason != null) {
+            // B527 (CLI-66): a booking that was attached by phone also loses the guest cancel link — the DETACHED arm of
+            // chk_bookings_guest_fields requires cancel_token_hash NULL. guest_phone is already null (attach cleared it),
+            // so the row can never re-attach to a new account that takes the same number.
+            this.cancelTokenHash = null;
+            this.cancelTokenSealed = null;
+        }
+    }
+
+    // ── Phone attach (V260, phase 527) ────────────────────────────────────────
+    //
+    // Set by attachToClient (booking time, before the first persist) or by the native bulk UPDATE of
+    // ClientPhoneAttachService / V261 (retroactive). NULL <=> never attached. Survives a later detach (CLI-66) as the
+    // record that the row was attached; chk_bookings_client_link keeps the pair together.
+    @Nullable
+    @Column(name = "client_linked_at")
+    private Instant clientLinkedAt;
+
+    @Nullable
+    @Enumerated(EnumType.STRING)
+    @Column(name = "client_link_reason", length = 16)
+    private AttachReason clientLinkReason;
+
+    /**
+     * B527 (CLI-62) — attaches this guest / walk-in booking to the CLIENT account that owns its phone: the account
+     * becomes the client, the link is stamped, and {@code guest_phone} is cleared (the account's verified phone is
+     * the one number — D3). Name, surname, consent columns, notes and the cancel token are kept at BOOKING time (the guest just received that link). Rows that already exist
+     * are attached by the bulk UPDATE in the attach service, which NULLs the cancel token (hash + sealed) so an old SMS
+     * link cannot cancel the account's booking.
+     */
+    public void attachToClient(User account, AttachReason reason, Instant at) {
+        if (bookingSource == BookingSource.APP) {
+            throw new IllegalStateException("An APP booking is never attached by phone");
+        }
+        this.client = Objects.requireNonNull(account, "account");
+        this.clientLinkReason = Objects.requireNonNull(reason, "reason");
+        this.clientLinkedAt = Objects.requireNonNull(at, "at");
+        this.guestPhone = null;
+    }
+
+    /**
+     * REV-D04 — a provider may rate only a booking whose client is a registered account AND that was not a STAFF
+     * walk-in: a walk-in is keyed by a phone the staff typed, so rating it (even once attached to the account that owns
+     * that phone) would let a fake walk-in on a victim's number plant a rating. LINK / APP bookings are rateable.
+     */
+    public boolean isRateableByProvider() {
+        return client != null && bookingSource != BookingSource.STAFF;
+    }
+
+    /** {@code true} when this booking was attached to a client account by phone (even if later detached). */
+    public boolean isAttachedByPhone() {
+        return clientLinkReason != null;
     }
 
     // V206: only the SHA-256 of the guest cancel token is stored (CancelTokenHasher); the raw token

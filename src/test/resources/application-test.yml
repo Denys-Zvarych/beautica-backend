@@ -23,6 +23,10 @@ spring:
       '[mail.smtp.writetimeout]': 1000
 
 app:
+  client-phone-attach:
+    sweep:
+      # B527 audit cycle 2 — the 30-min retry sweep never runs mid-test; its tests call ClientPhoneAttachService#sweep directly.
+      enabled: false
   # B514 (AUTH-54) — OFF by default; the App Check ITs set the mode per class.
   auth:
     app-check:
@@ -72,6 +76,10 @@ app:
     # assertions build the filter directly against a hand-built single-slot LoadingCache
     # (bypassing this property entirely), so this override does not neuter that coverage.
     notification-feed-capacity: 100000
+    # Same reasoning for the twelve provider client reads (B507/B508/B526) sharing ONE per-user
+    # bucket: the ProviderClient*IT classes drive many reads as one provider token. The 429 itself
+    # is covered by BookingRateLimitFilterTest against a hand-built single-slot cache.
+    provider-client-read-capacity: 100000
     # Same reasoning: ITs drive many approve/reject review POSTs from 127.0.0.1 (one shared per-IP
     # bucket in production, 20/hr). The 429 behaviour is covered by ReviewPostRateLimitRegressionTest,
     # which builds the filter by hand.

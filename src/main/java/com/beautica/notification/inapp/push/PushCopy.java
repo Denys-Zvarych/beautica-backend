@@ -109,7 +109,8 @@ public final class PushCopy {
 
     public static String title(InAppNotificationType type, boolean clientRecipient) {
         return switch (type) {
-            case BOOKING_CREATED -> "Новий запис";
+            // B527 (NTF-67): an attached guest / walk-in booking also reaches the client (copy must equal the mobile ARB title).
+            case BOOKING_CREATED -> clientRecipient ? "Вас записано" : "Новий запис";
             case BOOKING_CANCELLED_BY_CLIENT -> "Клієнт скасував запис";
             case BOOKING_DECLINED -> clientRecipient ? "Ваш запис скасовано" : "Запис скасовано";
             case BOOKING_NOT_COMPLETED -> "Візит позначено як непроведений";
