@@ -252,15 +252,24 @@ public class BookingService {
         // Phase 386 D1/D2 (audience per the 2026-10-22 user rule) - the guest's phone, on THIS read only. The audience
         // is decided explicitly by ROLE: INDEPENDENT_MASTER, SALON_OWNER, SALON_ADMIN. A SALON_MASTER never sees it
         // (even as the performing master), nor does a CLIENT; the owning-client probe is kept as a second, independent
-        // guard. The wither re-checks booking.getClient() == null, so a registered user's phone has no path in.
+        // guard. The guest wither re-checks booking.getClient() == null; a registered client's phone enters only via the
+        // B518 verified-only wither below.
         // Evaluated ONLY for a guest booking (client_id IS NULL, an in-memory FK read, no proxy load): the role read
         // touches the SecurityContext, which a registered-client booking never needs (direct non-HTTP service calls
         // carry none) and which adds no statement. The owning-client probe stays as a second, independent guard (free for a
         // guest booking: null client short-circuits before any role read).
-        BookingDetailResponse withPhone = booking.getClient() == null && authz.isGuestPhoneAudience()
-                && !authz.isOwningClientViewer(actorUserId, booking)
-                ? detail.withProviderVisibleGuestPhone(booking)
-                : detail;
+        // B518 (GST-D14, GST-80): a registered client's phone joins the same audience gate, but ONLY when it is
+        // SMS-verified. The in-memory verified check runs first so an unverified (or phone-less) registered booking
+        // never touches the SecurityContext; the wither re-checks verification, so the data half cannot be skipped.
+        BookingDetailResponse withPhone = detail;
+        if (booking.getClient() == null) {
+            if (authz.isGuestPhoneAudience() && !authz.isOwningClientViewer(actorUserId, booking)) {
+                withPhone = detail.withProviderVisibleGuestPhone(booking);
+            }
+        } else if (booking.getClient().getPhoneVerifiedAt() != null
+                && authz.isGuestPhoneAudience() && !authz.isOwningClientViewer(actorUserId, booking)) {
+            withPhone = detail.withProviderVisibleRegisteredPhone(booking);
+        }
         return withClientBlockState(actorUserId, booking, withPhone);
     }
 
@@ -378,7 +387,7 @@ public class BookingService {
                 && authz.canProviderReviewClient(actorUserId, booking);
         return providerCanReviewClient(
                 hasProviderAuthority, booking.getStatus(),
-                booking.getClient() != null,
+                booking.isRateableByProvider(),
                 () -> clientReviewRepository.existsByBookingId(booking.getId()));
     }
 
@@ -662,7 +671,9 @@ public class BookingService {
                 // Phase 397: a CLIENT viewer can never block — block state is false/null/false on this path.
                 false,
                 null,
-                false);
+                false,
+                // B518: clientPhone is provider-visible on the detail read only; never on this CLIENT-scoped list.
+                null);
     }
 
     /**
@@ -1283,7 +1294,7 @@ public class BookingService {
         // have flipped a response field. It can only REMOVE a statement, never add one: an actor
         // with no provider authority over any row of the page now skips the query outright.
         List<UUID> reviewCandidateIds = hydrated.stream()
-                .filter(b -> b.getClient() != null && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
+                .filter(b -> b.isRateableByProvider() && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
                 .map(Booking::getId)
                 .filter(withProviderAuthority::contains)
                 .toList();
@@ -1307,7 +1318,7 @@ public class BookingService {
                     // see resolveSalonPageProviderAuthority for why each conjunct is there.
                     boolean hasProviderAuthority = withProviderAuthority.contains(b.getId());
                     boolean providerCanReviewClient = providerCanReviewClient(
-                            hasProviderAuthority, b.getStatus(), b.getClient() != null,
+                            hasProviderAuthority, b.getStatus(), b.isRateableByProvider(),
                             () -> alreadyReviewedByProvider.contains(b.getId()));
                     return BookingDetailResponse.from(
                             b, canReview, providerCanReviewClient,
@@ -1347,7 +1358,7 @@ public class BookingService {
      */
     private Set<UUID> resolveSalonPageProviderAuthority(UUID actorUserId, List<Booking> page) {
         List<Booking> candidates = page.stream()
-                .filter(b -> b.getClient() != null
+                .filter(b -> b.isRateableByProvider()
                         && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
                 .toList();
         if (candidates.isEmpty()) {
@@ -1870,7 +1881,7 @@ public class BookingService {
                     // field, because a client that maps it faithfully can never clear the CTA.
                     boolean providerCanReviewClient = providerCanReviewClient(
                             providerReview.withAuthority().contains(b.getId()),
-                            b.getStatus(), b.getClient() != null,
+                            b.getStatus(), b.isRateableByProvider(),
                             () -> providerReview.alreadyReviewed().contains(b.getId()));
                     return BookingDetailResponse.from(
                             b, canReview, providerCanReviewClient,
@@ -1945,7 +1956,7 @@ public class BookingService {
         // pre-filter, so the conjunct is load-bearing there) and for the mutation that proved a
         // listing test can never detect its removal.
         List<Booking> candidates = page.stream()
-                .filter(b -> b.getClient() != null
+                .filter(b -> b.isRateableByProvider()
                         && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
                 .toList();
         if (candidates.isEmpty()) {
@@ -4067,7 +4078,7 @@ public class BookingService {
         // by account id only. Before both locks, so a refused create never contends for them. An idempotent
         // replay of a still-active booking returns from createBooking before reaching here; a pre-block future
         // booking was DECLINED by the block (phase 398 user decision), so its retry is refused like a fresh create.
-        bookingBlockGuard.requireClientMayBook(master, clientId);
+        bookingBlockGuard.requireClientMayBook(master, client);
 
         // Client lock (salt 1) is always acquired BEFORE the master lock (salt 0) — the
         // deterministic global order that keeps the two lock classes deadlock-free (see

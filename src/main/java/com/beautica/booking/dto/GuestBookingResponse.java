@@ -21,6 +21,10 @@ import java.util.UUID;
  *
  * <p><b>Phase 407 D6 (additive).</b> {@code telegram} = {@code {available, linked}} for the booker's OTP-verified
  * phone, once per response (a salon multi-master checkout is one call per master). An older site ignores it.
+ *
+ * <p><b>B527 (additive).</b> {@code attachedToAccount} is {@code true} when the booking phone is a CLIENT account's
+ * verified phone and the booking was created attached to that account (GST-82); then {@code telegram} is forced
+ * unavailable. No account data (name, id) is ever in the response.
  */
 public record GuestBookingResponse(
         UUID bookingId,
@@ -30,14 +34,22 @@ public record GuestBookingResponse(
         String serviceName,
         int durationMinutes,
         String cancelUrl,
-        TelegramAvailability telegram
+        TelegramAvailability telegram,
+        boolean attachedToAccount
 ) {
+
+    /** Pre-527 8-arg shape ({@code attachedToAccount} {@code false}). */
+    public GuestBookingResponse(
+            UUID bookingId, UUID appointmentId, OffsetDateTime startsAt, String masterName,
+            String serviceName, int durationMinutes, String cancelUrl, TelegramAvailability telegram) {
+        this(bookingId, appointmentId, startsAt, masterName, serviceName, durationMinutes, cancelUrl, telegram, false);
+    }
 
     /** Pre-407 7-arg shape ({@code telegram} {@code null}) — kept for existing call-sites; see {@link #withTelegram}. */
     public GuestBookingResponse(
             UUID bookingId, UUID appointmentId, OffsetDateTime startsAt, String masterName,
             String serviceName, int durationMinutes, String cancelUrl) {
-        this(bookingId, appointmentId, startsAt, masterName, serviceName, durationMinutes, cancelUrl, null);
+        this(bookingId, appointmentId, startsAt, masterName, serviceName, durationMinutes, cancelUrl, null, false);
     }
 
     /**
@@ -47,12 +59,12 @@ public record GuestBookingResponse(
     public GuestBookingResponse(
             UUID bookingId, OffsetDateTime startsAt, String masterName,
             String serviceName, int durationMinutes, String cancelUrl) {
-        this(bookingId, null, startsAt, masterName, serviceName, durationMinutes, cancelUrl, null);
+        this(bookingId, null, startsAt, masterName, serviceName, durationMinutes, cancelUrl, null, false);
     }
 
     /** Phase 407 D6 — the same response with its {@code telegram} block set. */
     public GuestBookingResponse withTelegram(TelegramAvailability availability) {
         return new GuestBookingResponse(bookingId, appointmentId, startsAt, masterName, serviceName, durationMinutes,
-                cancelUrl, availability);
+                cancelUrl, availability, attachedToAccount);
     }
 }

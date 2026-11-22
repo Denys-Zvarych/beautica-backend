@@ -695,6 +695,16 @@ public class RateLimitConfig {
 
     private static final Duration STAFF_BOOKING_SMS_WINDOW = Duration.ofSeconds(60);
 
+    // B527 audit — per-ACTOR cap on staff walk-in creates. A create whose phone resolves to an existing CLIENT account
+    // answers "attached", so an unbounded loop of walk-ins is a phone-number -> "is a Beautica client" oracle. A bucket
+    // charged only on a match would leak the same bit through its own 429, so it is charged on EVERY create in
+    // StaffBookingService (after the per-phone cap). The route's flat bucket (10/60s) is sized for SMS spend and cannot
+    // see the match. 30 per hour per staff user: ample for a day's keying-in, too few to enumerate a number range.
+    @Value("${app.rate-limit.staff-walk-in-create-capacity:30}")
+    private long staffWalkInCreateCapacity;
+
+    private static final Duration STAFF_WALK_IN_CREATE_WINDOW = Duration.ofHours(1);
+
     /**
      * Per-user cap for {@code DELETE /api/v1/users/me} (Phase 300, perf/security finding 2, 2026-09
      * audit — MEDIUM, raised independently by both auditors). Before this the endpoint had NO rate
@@ -1390,6 +1400,16 @@ public class RateLimitConfig {
                 STAFF_BOOKING_SMS_WINDOW.plus(EVICTION_GRACE),
                 staffBookingSmsCapacity,
                 STAFF_BOOKING_SMS_WINDOW);
+    }
+
+    /** Per-staff-actor bucket (see {@link #staffWalkInCreateCapacity}); consumed by {@code WalkInCreateBudget}. */
+    @Bean
+    public LoadingCache<String, Bucket> staffWalkInCreateBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                STAFF_WALK_IN_CREATE_WINDOW.plus(EVICTION_GRACE),
+                staffWalkInCreateCapacity,
+                STAFF_WALK_IN_CREATE_WINDOW);
     }
 
     /**

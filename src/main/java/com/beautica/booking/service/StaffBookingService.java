@@ -13,6 +13,7 @@ import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.client.service.ClientPhoneAttachService;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
@@ -24,17 +25,20 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.service.InAppNotificationService;
+import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
+import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -134,6 +138,11 @@ import java.util.UUID;
  * user-decided 2026-09-28) — see {@link #registerInAppFeedNotification}. This is a SEPARATE seam
  * from the outbox untouched above (see {@code InAppNotificationService}'s class javadoc); it does not
  * revisit the "no outbox" decision this section otherwise still describes.
+ *
+ * <p><b>B527 exception — the attached client's receipt email.</b> A walk-in attached to a CLIENT account by its verified
+ * phone enqueues ONE {@code STATUS_CHANGED} row per visit, the same client-facing row an APP create enqueues, so the
+ * client gets the existing «Бронювання підтверджено» email + .ics — only when the account has a confirmed email
+ * (NTF-67, NTF-D15). No provider row is added (the provider is the actor).
  */
 @Slf4j
 @Service
@@ -165,6 +174,12 @@ public class StaffBookingService {
     private final GuestCancelUrlBuilder guestCancelUrlBuilder;
     /** Phase 435 — seals the walk-in's visit token (V230) so later guest SMS can link the guest's own page. */
     private final GuestCancelTokenCipher guestCancelTokenCipher;
+    /** B527 (CLI-62, GST-83) — a walk-in whose phone is a CLIENT account's verified phone is attached to it at create. */
+    private final ClientPhoneAttachService clientPhoneAttachService;
+
+    private final WalkInCreateBudget walkInCreateBudget;
+    /** B527 (NTF-67) — the attached client's receipt email rides the existing client-facing STATUS_CHANGED row. */
+    private final NotificationOutboxService outboxService;
 
     /**
      * Per-recipient ceiling on walk-in confirmation SMS, mirroring {@code PhoneOtpService}'s
@@ -301,7 +316,21 @@ public class StaffBookingService {
         // there is one global ordering and no acquisition cycle; swapping these two statements would
         // create one. That phone lock is this transaction's FIRST advisory lock and therefore fuses
         // the 3s lock_timeout the whole transaction then inherits.
-        assertWalkInSmsBudgetForPhone(guestPhone);
+        bookingRepository.acquireWalkInPhoneLock(guestPhone);
+        // B527 — the account owning this verified phone, resolved under the per-phone lock just taken
+        // (acquireWalkInPhoneLock, held to commit), so a phone verification racing this walk-in either sees the row or is
+        // seen by this lookup. Blocks are NOT consulted: a walk-in ignores blocks (MOD-28), attached or not.
+        // Resolved BEFORE the per-phone cap: an attached visit has guest_phone NULL, so the cap must also count the
+        // account's own STAFF visits or it would never trip for a registered client's phone.
+        User account = clientPhoneAttachService.findAccountUnderHeldLock(guestPhone).orElse(null);
+        assertWalkInSmsBudgetForPhone(guestPhone, account);
+        // B527 audit cycle 2 — per-actor walk-in create budget (30/h), charged for EVERY create, matched phone or not, so
+        // that its 429 carries no "this phone is a client" signal. After the per-phone cap and every validation above,
+        // so a request that fails them burns no token. Same 429 shape as the per-phone cap; nothing created.
+        if (!walkInCreateBudget.tryConsume(actorId)) {
+            throw new BusinessException(HttpStatus.TOO_MANY_REQUESTS,
+                    "Too many walk-in bookings for this phone — please try again later");
+        }
 
         // Read-only enrichment work HOISTED ABOVE the per-master lock (perf LOW, 2026-08-22): the
         // discovery labels are two SELECTs of lock-irrelevant work, so they run before the window every
@@ -331,6 +360,9 @@ public class StaffBookingService {
         GuestCancelToken cancelToken = GuestCancelToken.generate();
         Appointment appointment = Appointment.staffAppointment(
                 master.getSalon(), guest.name(), guest.surname(), guestPhone, cancelToken, actorId);
+        if (account != null) {
+            clientPhoneAttachService.attachNew(account, appointment);
+        }
 
         List<Booking> bookings = new ArrayList<>(items.size());
         for (VisitPlanner.PlannedItem item : items) {
@@ -344,6 +376,9 @@ public class StaffBookingService {
             // Booking#appointment's Javadoc. The window in which the entity is un-linked is purely
             // local and is never flushed in that state.
             booking.setAppointment(appointment);
+            if (account != null) {
+                clientPhoneAttachService.attachNew(account, booking);
+            }
             bookings.add(booking);
         }
 
@@ -366,10 +401,20 @@ public class StaffBookingService {
         // after the persistence context closes, so touching a lazy association from there would be a
         // LazyInitializationException. EXACTLY ONE SMS for the whole visit (Phase 22.13); since phase
         // 435 it names no service at all, only the visit start and the master.
-        registerWalkInConfirmationSms(
-                guestPhone,
-                buildWalkInConfirmationSms(saved.get(0), firstStart, lastEnd,
-                        guestCancelUrlBuilder.build(cancelToken)));
+        if (account == null) {
+            registerWalkInConfirmationSms(
+                    guestPhone,
+                    buildWalkInConfirmationSms(saved.get(0), firstStart, lastEnd,
+                            guestCancelUrlBuilder.build(cancelToken)));
+        }
+        // else (B527, NTF-67): an attached walk-in is told in the app (feed + push, via registerInAppFeedNotification
+        // above) and never by SMS — registered users get no SMS / Telegram — plus the receipt email + .ics below.
+        if (account != null && account.hasConfirmedEmail()) {
+            // REUSE-FIRST: the APP create's client-facing row (BookingService#doCreateBooking) — its drain sends
+            // «Бронювання підтверджено» + .ics to the client. Once per visit, keyed to the first item (NTF-D15:
+            // a confirmed email only).
+            outboxService.enqueueStatusChanged(saved.get(0).getId());
+        }
 
         // REUSE-FIRST (Phase 22.14): the visit-detail enrichment is AppointmentService#enrich's job,
         // not a second mapper here. `saved` already carries everything `enrich` dereferences —
@@ -409,18 +454,22 @@ public class StaffBookingService {
      * caller counts the row the first committed. It is taken before the count, never after — a lock
      * acquired after the read would protect nothing.
      */
-    private void assertWalkInSmsBudgetForPhone(String guestPhone) {
+    private void assertWalkInSmsBudgetForPhone(String guestPhone, @Nullable User account) {
         // Serialises same-phone creates. The phone is ALREADY E.164-normalised at every call site
         // (UkrainianPhoneNormalizer.toE164 runs first), so "050 123 45 67" and "+380501234567" key
         // the SAME lock — a lock on the raw string would be inert against exactly the alternation
         // the normalisation exists to defeat.
-        bookingRepository.acquireWalkInPhoneLock(guestPhone);
+        // The caller already took acquireWalkInPhoneLock (before resolving the account) — it must stay held here.
         // Phase 431: the walk-in verdict counts walk-in VISITS only — exactly the pre-431 budget and
         // query plan. Guest reschedule SMS (possibly another provider's) must never push a walk-in
         // create to 429 (user rule 2026-10-30); the reschedule side alone reads the combined count
         // (GuestRescheduleSmsBudget, BookingRepository#countPhoneSmsBudgetUsedSince).
-        long recent = bookingRepository.countStaffWalkInVisitsForPhoneSince(
-                guestPhone, clock.instant().minus(WALK_IN_PHONE_WINDOW));
+        Instant since = clock.instant().minus(WALK_IN_PHONE_WINDOW);
+        long recent = bookingRepository.countStaffWalkInVisitsForPhoneSince(guestPhone, since);
+        if (account != null) {
+            // B527 audit (HIGH): attached walk-ins carry client_id, not guest_phone — count them too, same cap.
+            recent += bookingRepository.countStaffVisitsForClientSince(account.getId(), since);
+        }
         if (recent >= MAX_WALK_INS_PER_PHONE_PER_WINDOW) {
             throw new BusinessException(HttpStatus.TOO_MANY_REQUESTS,
                     "Too many walk-in bookings for this phone — please try again later");

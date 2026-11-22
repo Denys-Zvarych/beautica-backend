@@ -85,6 +85,14 @@ public class ClientReviewService {
                     "Cannot review a guest booking — no client account exists");
         }
 
+        // 4b. REV-D04 / REV-E04 (B527 audit): a STAFF walk-in is never rateable by the provider, even once attached to
+        // the account that owns its phone — the phone was typed by staff, so a fake walk-in on a victim's number would
+        // otherwise plant a rating. Only LINK / APP bookings are rateable. Same 400 and wording as the guest case.
+        if (!booking.isRateableByProvider()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Cannot review a guest booking — no client account exists");
+        }
+
         // 5. 409 on a duplicate review for this booking.
         if (clientReviewRepository.existsByBookingId(booking.getId())) {
             throw new BusinessException(HttpStatus.CONFLICT,

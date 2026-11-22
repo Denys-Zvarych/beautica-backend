@@ -445,7 +445,7 @@ class BookingServiceTest {
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         org.mockito.Mockito.doThrow(com.beautica.common.exception.BookingUnavailableException.forMaster())
-                .when(bookingBlockGuard).requireClientMayBook(master, clientId);
+                .when(bookingBlockGuard).requireClientMayBook(master, client);
 
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
                 .isInstanceOf(com.beautica.common.exception.BookingUnavailableException.class);

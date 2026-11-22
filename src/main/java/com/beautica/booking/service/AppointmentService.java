@@ -313,7 +313,7 @@ public class AppointmentService {
         // re-check above, so a retry of a visit that is still active replays instead of being refused (a new block
         // DECLINES the client's future visits, so in practice only one that already started can still replay);
         // BEFORE the master lock, so a refused create never contends for it. Order pinned by AppointmentServiceTest.
-        bookingBlockGuard.requireClientMayBook(master, clientId);
+        bookingBlockGuard.requireClientMayBook(master, client);
 
         // Client-conflict check over the WHOLE visit span, BEFORE the master lock is taken — same
         // precedence and rationale as the single-service create path.

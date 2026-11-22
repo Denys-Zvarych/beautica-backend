@@ -164,6 +164,30 @@ class UserRatingIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("B526 shared summary: the serialized `data` object is byte-identical to the pre-B526 wire format "
+            + "(key order avgRating, reviewCount, ratingDistribution; buckets {rating,count} 5 down to 1)")
+    void should_serializeExactLegacyBody_when_clientHasRatings() throws Exception {
+        String clientEmail = "rating-bytes-client-" + System.nanoTime() + "@beautica.test";
+        UUID clientId = createUser(clientEmail, "CLIENT");
+        ProviderFixture provider = createProviderFixture();
+        insertCompletedBookingWithReview(clientId, provider, 5);
+        insertCompletedBookingWithReview(clientId, provider, 3);
+        insertCompletedBookingWithReview(clientId, provider, 5);
+        insertCompletedBookingWithReview(clientId, provider, 1);
+        jdbcTemplate.update("UPDATE users SET avg_rating = 3.50, review_count = 4 WHERE id = ?", clientId);
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                URL, HttpMethod.GET, new HttpEntity<>(bearerHeaders(tokenFor(clientEmail))), String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(resp.getBody())
+                .as("pre-B526 fixture of GET /users/me/rating raw body, actual=%s", resp.getBody())
+                .contains("\"data\":{\"avgRating\":3.50,\"reviewCount\":4,\"ratingDistribution\":["
+                        + "{\"rating\":5,\"count\":2},{\"rating\":4,\"count\":0},{\"rating\":3,\"count\":1},"
+                        + "{\"rating\":2,\"count\":0},{\"rating\":1,\"count\":1}]}");
+    }
+
+    @Test
     @DisplayName("401 when the caller has no bearer token")
     void should_return401_when_unauthenticated() {
         ResponseEntity<String> resp = restTemplate.exchange(URL, HttpMethod.GET, HttpEntity.EMPTY, String.class);

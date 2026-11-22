@@ -759,6 +759,32 @@ class BookingDetailResponseTest {
     }
 
     @Test
+    @DisplayName("B518: from() never sets clientPhone, even for a verified registered client (list/create/reschedule rows)")
+    void should_keepClientPhoneNull_when_builtByFactory() {
+        lenient().when(clientUser.getPhoneNumber()).thenReturn(ACCOUNT_PHONE);
+        lenient().when(clientUser.getPhoneVerifiedAt()).thenReturn(java.time.Instant.now());
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
+
+        assertThat(response.clientPhone()).isNull();
+    }
+
+    @Test
+    @DisplayName("B518: withProviderVisibleRegisteredPhone sets clientPhone only for a verified phone; guestPhone stays null")
+    void should_setClientPhoneOnlyWhenVerified_when_registeredWither() {
+        lenient().when(clientUser.getPhoneNumber()).thenReturn(ACCOUNT_PHONE);
+        var base = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
+
+        when(clientUser.getPhoneVerifiedAt()).thenReturn(null);
+        assertThat(base.withProviderVisibleRegisteredPhone(booking).clientPhone()).isNull();
+
+        when(clientUser.getPhoneVerifiedAt()).thenReturn(java.time.Instant.now());
+        var detail = base.withProviderVisibleRegisteredPhone(booking);
+        assertThat(detail.clientPhone()).isEqualTo(ACCOUNT_PHONE);
+        assertThat(detail.guestPhone()).isNull();
+    }
+
+    @Test
     @DisplayName("a guest booking without a phone (anonymised/erased, or never set) keeps guestPhone null")
     void should_keepGuestPhoneNull_when_guestPhoneAbsent() {
         when(booking.getClient()).thenReturn(null);
@@ -769,7 +795,7 @@ class BookingDetailResponseTest {
     }
 
     @Test
-    @DisplayName("the wither changes ONLY guestPhone - every other component is carried over unchanged")
+    @DisplayName("the wither changes ONLY guestPhone (+ B518 clientPhone) - every other component is carried over unchanged")
     void should_carryEveryOtherComponentOver_when_guestPhoneAttached() throws Exception {
         when(booking.getClient()).thenReturn(null);
         when(booking.getGuestName()).thenReturn("Оксана");
@@ -779,7 +805,8 @@ class BookingDetailResponseTest {
         var detail = base.withProviderVisibleGuestPhone(booking);
 
         for (var component : BookingDetailResponse.class.getRecordComponents()) {
-            Object expected = component.getName().equals("guestPhone") ? GUEST_PHONE
+            Object expected = component.getName().equals("guestPhone") || component.getName().equals("clientPhone")
+                    ? GUEST_PHONE
                     : component.getAccessor().invoke(base);
             assertThat(component.getAccessor().invoke(detail)).as(component.getName()).isEqualTo(expected);
         }

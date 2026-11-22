@@ -657,9 +657,11 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
                        AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.appointment_id = x.id
                                           AND b.guest_pii_anonymised_at IS NULL)
                      ORDER BY x.created_at LIMIT 500 FOR UPDATE SKIP LOCKED""");
+            // Erase targets ONE phone among many (the production shape). The seeded rows all carry PHONE, so
+            // probing PHONE matches every row and ties with idx_bookings_guest_pii_due (same predicate).
             String erasePhone = explain(tx, """
-                    SELECT id FROM bookings WHERE guest_phone = '+380501234567' AND client_id IS NULL
-                       AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL""");
+                    SELECT id FROM bookings WHERE guest_phone = '%s' AND client_id IS NULL
+                       AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL""".formatted(OTHER_PHONE));
 
             assertThat(bookingClaim).contains("idx_bookings_guest_pii_due");
             // Real batch shape (500 claimed ids): headers are reached BY ID from the claimed bookings
@@ -675,7 +677,8 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
             assertThat(leftoverSweep).contains("idx_appointments_guest_pii_due");
             assertThat(endedVisitSweep).contains("idx_bookings_guest_pii_anonymised_visit")
                     .doesNotContain("Seq Scan on appointments");
-            assertThat(erasePhone).contains("idx_bookings_guest_phone_open");
+            assertThat(erasePhone).contains("idx_bookings_guest_phone_open")
+                    .contains("Index Cond: ((guest_phone)::text = ");
         }
 
         private String uuidList(List<UUID> ids) {

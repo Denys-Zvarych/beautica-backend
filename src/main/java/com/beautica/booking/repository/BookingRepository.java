@@ -521,6 +521,21 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     long countStaffWalkInVisitsForPhoneSince(@Param("phone") String phone, @Param("since") Instant since);
 
     /**
+     * B527 audit (HIGH) — the attached half of the per-phone walk-in cap: STAFF visits created since {@code since} that
+     * were attached to this CLIENT account at create (their {@code guest_phone} is NULL, so
+     * {@link #countStaffWalkInVisitsForPhoneSince} cannot see them). Same distinct-visit denominator. Bounded by the
+     * client's own STAFF rows in the window.
+     */
+    @Query(value = """
+            SELECT count(DISTINCT coalesce(b.appointment_id, b.id))
+              FROM bookings b
+             WHERE b.client_id = :clientId
+               AND b.booking_source = 'STAFF'
+               AND b.created_at > :since
+            """, nativeQuery = true)
+    long countStaffVisitsForClientSince(@Param("clientId") UUID clientId, @Param("since") Instant since);
+
+    /**
      * Phase 431 — one phone's SMS activity since {@code since}, both halves in ONE statement: the walk-in
      * VISITS {@link #countStaffWalkInVisitsForPhoneSince} counts (same predicate, same V138 index) and the
      * guest reschedule SMS sent to that phone. Used ONLY by {@code GuestRescheduleSmsBudget#tryReserve},
@@ -2220,6 +2235,67 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     Integer acquireWalkInPhoneLock(@Param("phone") String phone);
 
     /**
+     * B527 (CLI-62) — retroactive attach: every guest (LINK) / walk-in (STAFF) booking carrying {@code phone} becomes
+     * the booking of the CLIENT account {@code clientId}: client set, link stamped with {@code reason}, {@code
+     * guest_phone} cleared (the account's verified phone is the one number — D3). Name, surname, consent columns,
+     * notes stay; the cancel token (hash + sealed) is NULLed so an old SMS link cannot cancel the account's booking. Every status; anonymised (GST-51) and detached (CLI-24) rows are excluded, so a
+     * detached row — whose phone is already NULL — can never re-attach. Same predicate as V261. Served by
+     * {@code idx_bookings_guest_phone_open} (V199; its predicate is this WHERE minus the phone and source).
+     *
+     * <p>Callers hold {@link #acquireWalkInPhoneLock} first (the per-phone lock every walk-in / link create takes), so
+     * a create racing the verification ends attached in every interleaving. {@code flushAutomatically} so pending
+     * entity writes (the verified phone itself) are visible; no clear — callers keep their managed entities.
+     *
+     * @return rows attached
+     */
+    @org.springframework.data.jpa.repository.Modifying(flushAutomatically = true)
+    @Query(value = """
+            UPDATE bookings
+               SET client_id = :clientId,
+                   client_linked_at = :at,
+                   client_link_reason = :reason,
+                   guest_phone = NULL,
+                   cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
+                   updated_at = :at
+             WHERE client_id IS NULL
+               AND guest_phone = :phone
+               AND guest_pii_anonymised_at IS NULL
+               AND client_detached_at IS NULL
+               AND booking_source IN ('LINK', 'STAFF')
+            """, nativeQuery = true)
+    int attachGuestRowsByPhone(@Param("phone") String phone, @Param("clientId") UUID clientId,
+                               @Param("reason") String reason, @Param("at") Instant at);
+
+    /**
+     * B527 audit cycle 3 — the retry sweep's work list: up to {@code limit} phones that are the verified phone of an active
+     * CLIENT account AND still carry attachable guest / walk-in rows (same predicates as {@link #attachGuestRowsByPhone}
+     * and V261). Drives from the verified CLIENT accounts ({@code ux_users_verified_phone}, V244) with an {@code EXISTS}
+     * probe into {@code idx_bookings_guest_phone_open} (V199, partial on the same open-guest predicate), so the normal
+     * no-match case costs one index probe per verified client rather than a scan of every unattached guest row.
+     * {@code ORDER BY random()} (applied to the already-filtered phones only) rotates the selection so phones that keep
+     * failing cannot fill every run and starve the rest; the 30-minute cadence makes random fair. Phones only — the
+     * caller never logs them.
+     */
+    @Query(value = """
+            SELECT u.phone_number
+              FROM users u
+             WHERE u.role = 'CLIENT'
+               AND u.is_active
+               AND u.phone_verified_at IS NOT NULL
+               AND EXISTS (SELECT 1
+                             FROM bookings b
+                            WHERE b.guest_phone = u.phone_number
+                              AND b.client_id IS NULL
+                              AND b.guest_pii_anonymised_at IS NULL
+                              AND b.client_detached_at IS NULL
+                              AND b.booking_source IN ('LINK', 'STAFF'))
+             ORDER BY random()
+             LIMIT :limit
+            """, nativeQuery = true)
+    java.util.List<String> findAttachableGuestPhones(@Param("limit") int limit);
+
+    /**
      * Fused, single-round-trip form of the per-master advisory lock for callers that take
      * ONLY the master lock (no client lock beforehand). Originally just
      * {@code GuestBookingService#persistBooking}; now also used by the no-client-lock (guest
@@ -2470,17 +2546,19 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     }
 
     /**
-     * Phase 494 (NTF-47) — registered clients' APP bookings due for the 24 h reminder: {@code CONFIRMED}, not yet
-     * reminded, with a client account, starting in {@code [from, to]} (the guest finder's inclusive window). The
-     * literal source / status / flag predicate matches the partial index {@code idx_bookings_reminder_app} (V240)
-     * exactly, so the planner can serve it from that index only. Bounded twice (Anti-Bug §E-3): the 2-hour window the
+     * Phase 494 (NTF-47) — registered clients' APP bookings (and, B527, guest / walk-in bookings attached to a client
+     * account) due for the 24 h reminder: {@code CONFIRMED}, not yet reminded, with a client account, starting in
+     * {@code [from, to]} (the guest finder's inclusive window). Served by an Index Scan on the partial index
+     * {@code idx_bookings_reminder_registered} (V262), whose predicate is this WHERE minus the window — the window is
+     * the Index Cond and no Filter remains (a BitmapOr of per-arm indexes was never chosen). Bounded twice (Anti-Bug §E-3): the 2-hour window the
      * job supplies and {@code limit} ({@link #REGISTERED_DAY_BEFORE_REMINDER_BATCH_CAP}); the overflow stays
      * unclaimed and is picked up by the next hourly tick. One row per booking — never grouped per visit (NTF-D11).
      */
     @Query("""
             SELECT b.id AS id, b.startsAt AS startsAt, b.createdAt AS createdAt
               FROM Booking b
-             WHERE b.bookingSource = com.beautica.booking.enums.BookingSource.APP
+             WHERE (b.bookingSource = com.beautica.booking.enums.BookingSource.APP
+                    OR b.clientLinkReason IS NOT NULL)
                AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
                AND b.reminderSent = false
                AND b.client IS NOT NULL
@@ -2591,14 +2669,17 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * Phase 494 (NTF-47) — registered clients' APP bookings due for the 2 h reminder, over the guest 2 h finder's
-     * half-open {@code [from, to)} window, on the partial index {@code idx_bookings_reminder_2h_app} (V240). Bounded
+     * half-open {@code [from, to)} window (B527: attached guest / walk-in bookings too), via an Index Scan on the
+     * partial index {@code idx_bookings_reminder_2h_registered} (V262), whose predicate is this WHERE minus the
+     * window. Bounded
      * twice like the guest finder: the 30-minute window and {@code limit}
      * ({@link #TWO_HOUR_REMINDER_BATCH_CAP}); the overflow is picked up by the next tick.
      */
     @Query("""
             SELECT b.id AS id, b.startsAt AS startsAt, b.createdAt AS createdAt
               FROM Booking b
-             WHERE b.bookingSource = com.beautica.booking.enums.BookingSource.APP
+             WHERE (b.bookingSource = com.beautica.booking.enums.BookingSource.APP
+                    OR b.clientLinkReason IS NOT NULL)
                AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
                AND b.reminder2hSent = false
                AND b.client IS NOT NULL

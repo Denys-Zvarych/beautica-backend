@@ -65,6 +65,7 @@ class GuestBookingServiceTest {
     private static final String FRONTEND = "https://app.beautica.test";
 
     @Mock private GuestTokenProvider guestTokenProvider;
+    @Mock private com.beautica.client.service.ClientPhoneAttachService clientPhoneAttachService;
     @Mock private com.beautica.master.repository.MasterRepository masterRepository;
     @Mock private com.beautica.service.repository.MasterServiceRepository masterServiceRepository;
     @Mock private BookingRepository bookingRepository;
@@ -96,7 +97,7 @@ class GuestBookingServiceTest {
                 GuestCancelTokenCipherFixtures.testCipher(),
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
                 inAppNotificationService, retiredBookingSlugGuard, salonGuestMasterResolver, guestTokenBookingCap,
-                bookingBlockGuard, guestTelegramLinkService, transactionManager);
+                bookingBlockGuard, guestTelegramLinkService, clientPhoneAttachService, transactionManager);
 
         // Phase 337 fix: BookingSlotLockGuard.lockMasterAndAssertFree now re-checks bookability
         // AFTER the advisory lock (PostLockSlotGuard, closing the self-delete-race CRITICAL), fused
@@ -254,7 +255,7 @@ class GuestBookingServiceTest {
                 GuestCancelTokenCipherFixtures.testCipher(),
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
                 inAppNotificationService, retiredBookingSlugGuard, salonGuestMasterResolver, guestTokenBookingCap,
-                bookingBlockGuard, realTelegram, transactionManager);
+                bookingBlockGuard, realTelegram, clientPhoneAttachService, transactionManager);
 
         GuestBookingResponse response = withRealTelegram.createGuestBooking("Bearer guest.jwt.token", SLUG,
                 new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
@@ -315,6 +316,109 @@ class GuestBookingServiceTest {
         // setBookingLockTimeout()+acquireAdvisoryLock() pair IS the regression guard that the
         // timeout ceiling is still applied before the lock wait.
         verify(bookingRepository).acquireAdvisoryLockWithTimeout(masterId);
+    }
+
+    // ── B527 — attach at create (CLI-62, GST-82) ─────────────────────────────
+
+    @Test
+    @DisplayName("B527: a phone that is a client account's verified phone creates an ATTACHED booking — no SMS, "
+            + "no Telegram, attachedToAccount true")
+    void should_createAttachedBooking_when_phoneBelongsToAClientAccount() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        stubHappyPath(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
+        com.beautica.user.User account = org.mockito.Mockito.mock(com.beautica.user.User.class);
+        when(clientPhoneAttachService.lockAndFindAccount(GUEST_PHONE)).thenReturn(Optional.of(account));
+
+        GuestBookingResponse response = service.createGuestBooking(
+                "Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        ArgumentCaptor<List<Booking>> savedCaptor = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).saveAll(savedCaptor.capture());
+        verify(clientPhoneAttachService).attachNew(account, savedCaptor.getValue().get(0));
+        verify(bookingBlockGuard).requireClientMayBook(any(), eq(account));
+        verify(bookingBlockGuard).requireGuestMayBook(any(), eq(GUEST_PHONE));
+        verifyNoInteractions(smsService);
+        assertThat(response.attachedToAccount()).isTrue();
+        assertThat(response.telegram())
+                .isEqualTo(com.beautica.notification.telegram.link.dto.TelegramAvailability.UNAVAILABLE);
+        assertThat(response.cancelUrl()).as("the cancel link keeps working").startsWith(FRONTEND + "/c/");
+        verify(outboxService).enqueueNewBooking(any());
+    }
+
+    @Test
+    @DisplayName("B527 (NTF-67): an attached booking whose account has a confirmed email enqueues ONE client receipt "
+            + "row (STATUS_CHANGED, keyed to the first item) next to the provider's NEW_BOOKING")
+    void should_enqueueOneClientReceipt_when_attachedAccountHasConfirmedEmail() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        stubHappyPath(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
+        com.beautica.user.User account = org.mockito.Mockito.mock(com.beautica.user.User.class);
+        when(account.hasConfirmedEmail()).thenReturn(true);
+        when(clientPhoneAttachService.lockAndFindAccount(GUEST_PHONE)).thenReturn(Optional.of(account));
+
+        service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        ArgumentCaptor<List<Booking>> savedCaptor = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).saveAll(savedCaptor.capture());
+        verify(outboxService).enqueueStatusChanged(savedCaptor.getValue().get(0).getId());
+        verify(outboxService).enqueueNewBooking(savedCaptor.getValue().get(0).getId());
+    }
+
+    @Test
+    @DisplayName("B527 (NTF-D15): an attached booking whose account has no confirmed email enqueues no client receipt")
+    void should_enqueueNoClientReceipt_when_attachedAccountHasNoConfirmedEmail() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        stubHappyPath(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
+        com.beautica.user.User account = org.mockito.Mockito.mock(com.beautica.user.User.class);
+        when(account.hasConfirmedEmail()).thenReturn(false);
+        when(clientPhoneAttachService.lockAndFindAccount(GUEST_PHONE)).thenReturn(Optional.of(account));
+
+        service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        verify(outboxService, org.mockito.Mockito.never()).enqueueStatusChanged(any());
+    }
+
+    @Test
+    @DisplayName("B527: no account owns the phone — a plain guest booking, attachedToAccount false, SMS as before")
+    void should_createGuestBooking_when_noAccountOwnsThePhone() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        stubHappyPath(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
+
+        GuestBookingResponse response = service.createGuestBooking(
+                "Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        verify(clientPhoneAttachService, org.mockito.Mockito.never()).attachNew(any(com.beautica.user.User.class),
+                any(Booking.class));
+        verify(bookingBlockGuard, org.mockito.Mockito.never()).requireClientMayBook(any(), any());
+        verify(smsService).send(eq(GUEST_PHONE), anyString());
+        assertThat(response.attachedToAccount()).isFalse();
+        verify(outboxService, org.mockito.Mockito.never()).enqueueStatusChanged(any());
+    }
+
+    @Test
+    @DisplayName("B527 (MOD-29): a blocked account refuses the booking made with its verified phone, before any save")
+    void should_refuseAndPersistNothing_when_theAttachedAccountIsBlocked() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
+        com.beautica.user.User account = org.mockito.Mockito.mock(com.beautica.user.User.class);
+        when(clientPhoneAttachService.lockAndFindAccount(GUEST_PHONE)).thenReturn(Optional.of(account));
+        org.mockito.Mockito.doThrow(com.beautica.common.exception.BookingUnavailableException.forMaster())
+                .when(bookingBlockGuard).requireClientMayBook(any(), eq(account));
+
+        assertThatThrownBy(() -> service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20")))
+                .isInstanceOf(com.beautica.common.exception.BookingUnavailableException.class);
+
+        verify(bookingRepository, org.mockito.Mockito.never()).saveAll(any());
+        verifyNoInteractions(smsService);
     }
 
     /**
