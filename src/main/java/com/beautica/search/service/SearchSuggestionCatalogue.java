@@ -1,5 +1,6 @@
 package com.beautica.search.service;
 
+import com.beautica.service.service.PlatformCategoryLabel;
 import com.beautica.service.service.PlatformCategoryLabelResolver;
 import com.beautica.service.service.ServiceTypeCatalogueEntry;
 import com.beautica.service.service.ServiceTypeSlugResolver;
@@ -7,9 +8,15 @@ import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
 /**
  * The catalogue half of {@code GET /api/v1/search/suggestions} (Phase 331) — every selectable
- * category and every active service type, with NO availability applied. Availability is joined in
+ * category and every active service type of a selectable category, with NO availability applied.
+ * B504 (track D21): a type under a HIDDEN category is left out (it stays active; unhide brings it back), so hiding a
+ * category drops its types from SERVICE suggestions too. Availability is joined in
  * memory by {@link SearchSuggestionService} from {@link SearchSuggestionAvailability}'s
  * per-place set.
  *
@@ -51,11 +58,15 @@ public class SearchSuggestionCatalogue {
     @Cacheable(value = CACHE_NAME, sync = true)
     @Transactional(readOnly = true)
     public SuggestionCatalogueSnapshot snapshot() {
+        // One read of the selectable categories feeds both halves, so they always agree (D21).
+        List<PlatformCategoryLabel> selectable = platformCategoryLabelResolver.selectableLabels();
+        Set<String> selectableKeys = selectable.stream().map(PlatformCategoryLabel::name).collect(Collectors.toSet());
         return new SuggestionCatalogueSnapshot(
-                platformCategoryLabelResolver.selectableLabels().stream()
+                selectable.stream()
                         .map(label -> new CatalogueCategoryEntry(label.name(), label.displayName()))
                         .toList(),
                 serviceTypeSlugResolver.allActiveTypes().stream()
+                        .filter(type -> selectableKeys.contains(type.categoryKey()))
                         .map(SearchSuggestionCatalogue::toCatalogueServiceEntry)
                         .toList());
     }

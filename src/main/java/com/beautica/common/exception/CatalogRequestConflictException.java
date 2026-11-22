@@ -4,7 +4,9 @@ import org.springframework.http.HttpStatus;
 
 /**
  * B502 (SVC-55) — a catalog-admin edit of a pending category request / service-type suggestion was refused; since B503
- * (SVC-06) also a portal approve / reject of a row that is no longer PENDING ({@link Code#REQUEST_NOT_PENDING}).
+ * (SVC-06) also a portal approve / reject of a row that is no longer PENDING ({@link Code#REQUEST_NOT_PENDING}); since
+ * B504 (SVC-56) also a refused rename / hide / unhide of a live category or service type
+ * ({@link Code#TYPE_EXISTS}, {@link Code#CATEGORY_NAME_EXISTS}, {@link Code#CATEGORY_NOT_APPROVED}).
  *
  * <p>Surfaces as {@code 409 Conflict} carrying the stable {@link Code} under {@code data.code} (the project's typed
  * error-code convention, same shape as {@link OwnerAccountDeletionBlockedException}):
@@ -21,8 +23,15 @@ public class CatalogRequestConflictException extends BusinessException {
         REQUEST_NOT_PENDING,
         /** Another PENDING suggestion in the same category has the same name (case-insensitive, V197 index). */
         DUPLICATE_PENDING,
-        /** An active service type with this name already exists in the category. */
-        TYPE_EXISTS
+        /**
+         * An active service type with this name already exists in the category. B504: also a type rename onto another
+         * type's name (active or hidden) in the same category, or an unhide onto an active type's name.
+         */
+        TYPE_EXISTS,
+        /** B504 — another approved or pending category already has this display name (case-insensitive). */
+        CATEGORY_NAME_EXISTS,
+        /** B504 — the category is a pending or rejected request, not a live category; edit it via the request queue. */
+        CATEGORY_NOT_APPROVED
     }
 
     private final Code code;

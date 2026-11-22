@@ -175,6 +175,9 @@ public class CategoryRequestService {
                     condition = APPROVED_ONLY),
             @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY,
                     condition = APPROVED_ONLY),
+            // B504 (D18): the label list now also backs the salon-catalogue group order + names.
+            @CacheEvict(value = PlatformCategoryOrderLookup.LABELS_CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY,
+                    condition = APPROVED_ONLY),
             @CacheEvict(value = SearchSuggestionCatalogue.CACHE_NAME, allEntries = true,
                     condition = APPROVED_ONLY)
     })

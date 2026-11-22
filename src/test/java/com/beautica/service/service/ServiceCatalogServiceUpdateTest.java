@@ -1095,4 +1095,78 @@ class ServiceCatalogServiceUpdateTest {
         assertThat(captor.getValue().getName()).isEqualTo("Манікюр \u2605 люкс");
         assertThat(captor.getValue().getBasePrice()).isEqualByComparingTo("400.00");
     }
+
+    // ── B504 (SVC-56, D4) — a hidden category / type keeps existing services editable ──
+
+    private ServiceDefinition definitionWithType(UUID id, UUID ownerId, ServiceType type) {
+        ServiceDefinition definition = buildDefinition(id, ownerId);
+        org.springframework.test.util.ReflectionTestUtils.setField(definition, "serviceType", type);
+        return definition;
+    }
+
+    @Test
+    @DisplayName("B504 — PATCH re-sending the service's own HIDDEN category and type is accepted (not new use)")
+    void should_acceptHiddenCurrentCategoryAndType_when_patchResendsThem() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        ServiceType hiddenType = mock(ServiceType.class);
+        when(hiddenType.getId()).thenReturn(typeId);
+        when(hiddenType.getPlatformCategoryName()).thenReturn("MANICURE");
+        ServiceDefinition existing = definitionWithType(serviceDefId, ownerId, hiddenType);
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(serviceTypeLookup.getById(typeId)).thenReturn(hiddenType);
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, ownerId, typeId, 60, "Original Name", serviceDefId)).thenReturn(Optional.empty());
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId)).thenReturn(List.of());
+        var request = new UpdateServiceDefinitionRequest(
+                null, null, "MANICURE", null, null, null, null, null, null, typeId);
+
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
+
+        verify(platformCategoryRepository, never()).existsByNameAndActiveTrueAndStatus(any(), any());
+        verify(serviceRepository).saveAndFlush(any(ServiceDefinition.class));
+    }
+
+    @Test
+    @DisplayName("B504 — PATCH switching to ANOTHER hidden type is still a 400 (new use is blocked)")
+    void should_rejectHiddenType_when_patchSwitchesToAnotherType() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID currentTypeId = UUID.randomUUID();
+        UUID otherTypeId = UUID.randomUUID();
+        ServiceType currentType = mock(ServiceType.class);
+        when(currentType.getId()).thenReturn(currentTypeId);
+        ServiceType hiddenOther = mock(ServiceType.class);
+        when(hiddenOther.isActive()).thenReturn(false);
+        ServiceDefinition existing = definitionWithType(serviceDefId, UUID.randomUUID(), currentType);
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(serviceTypeLookup.getById(otherTypeId)).thenReturn(hiddenOther);
+        var request = new UpdateServiceDefinitionRequest(
+                null, null, null, null, null, null, null, null, null, otherTypeId);
+
+        Throwable thrown = catchThrowable(
+                () -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request));
+
+        assertThat(thrown).isInstanceOf(BusinessException.class).hasMessage("Service type is not active");
+        verify(serviceRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("B504 — PATCH moving to a DIFFERENT hidden category is still a 400 (new use is blocked)")
+    void should_rejectHiddenCategory_when_patchMovesToAnotherCategory() {
+        UUID serviceDefId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, UUID.randomUUID()); // category = MANICURE
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "HIDDEN_CAT", com.beautica.service.entity.PlatformCategoryStatus.APPROVED)).thenReturn(false);
+        var request = new UpdateServiceDefinitionRequest(
+                null, null, "HIDDEN_CAT", null, null, null, null, null, null, null);
+
+        Throwable thrown = catchThrowable(
+                () -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request));
+
+        assertThat(thrown).isInstanceOf(BusinessException.class).hasMessageContaining("Unknown category");
+        verify(serviceRepository, never()).saveAndFlush(any());
+    }
 }

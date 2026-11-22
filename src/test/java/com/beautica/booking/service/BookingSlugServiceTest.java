@@ -88,6 +88,10 @@ class BookingSlugServiceTest {
     @Mock
     private RetiredBookingSlugGuard retiredBookingSlugGuard;
 
+    /** B504 (D18): an unstubbed mock returns an empty label map, so categoryDisplayName stays null. */
+    @Mock
+    private com.beautica.service.service.PlatformCategoryLabelResolver categoryLabelResolver;
+
     @InjectMocks
     private BookingSlugService service;
 

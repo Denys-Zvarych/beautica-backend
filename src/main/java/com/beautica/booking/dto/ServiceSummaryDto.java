@@ -6,6 +6,7 @@ import com.beautica.service.entity.ServiceDefinition;
 import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.math.BigDecimal;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -27,8 +28,24 @@ public record ServiceSummaryDto(
         @Schema(types = {"string", "null"}, nullable = true,
                 description = "The service's category key — the same value as ServiceDefinitionResponse.category "
                         + "and CategoryRef.key; the website groups services by it (phase 383).")
-        String category
+        String category,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Display name of that category, including a category the operator has since HIDDEN "
+                        + "(SVC-56). Null for an unknown / rejected category; fall back to category then.")
+        String categoryDisplayName
 ) {
+
+    /** B504 (track D18) — the pre-{@code categoryDisplayName} arity; existing construction sites compile unchanged. */
+    public ServiceSummaryDto(UUID id, String name, int durationMinutes, BigDecimal priceFrom, String category) {
+        this(id, name, durationMinutes, priceFrom, category, null);
+    }
+
+    /** B504 (track D18) — {@link #from(MasterServiceAssignment)} plus the label from a once-per-request map. */
+    public static ServiceSummaryDto from(MasterServiceAssignment assignment, Map<String, String> displayNamesByCategory) {
+        ServiceSummaryDto base = from(assignment);
+        return new ServiceSummaryDto(base.id(), base.name(), base.durationMinutes(), base.priceFrom(), base.category(),
+                base.category() == null ? null : displayNamesByCategory.get(base.category()));
+    }
 
     public static ServiceSummaryDto from(MasterServiceAssignment assignment) {
         ServiceDefinition def = assignment.getServiceDefinition();

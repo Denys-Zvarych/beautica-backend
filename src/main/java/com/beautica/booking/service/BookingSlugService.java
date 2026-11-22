@@ -27,6 +27,7 @@ import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.master.entity.MasterType;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.CatalogCategory;
+import com.beautica.service.service.PlatformCategoryLabelResolver;
 import com.beautica.user.User;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.annotation.Cacheable;
@@ -107,6 +108,7 @@ public class BookingSlugService {
             Map.entry('я', "ia"));
 
     private final MasterRepository masterRepository;
+    private final PlatformCategoryLabelResolver categoryLabelResolver;
     private final MasterServiceRepository masterServiceRepository;
     private final SalonRepository salonRepository;
     private final MediaService mediaService;
@@ -419,10 +421,12 @@ public class BookingSlugService {
                 .orElseThrow(() -> bookingPageNotFound(BookingLinkKind.MASTER, slug));
 
         User user = master.getUser();
+        // B504 (D18): labels resolved once for the whole list (one cached read), hidden categories included.
+        Map<String, String> categoryLabels = categoryLabelResolver.displayNamesIncludingHidden();
         List<ServiceSummaryDto> services = masterServiceRepository
                 .findByMasterIdAndIsActiveTrueWithGraph(master.getId(), PageRequest.of(0, MAX_SERVICES))
                 .stream()
-                .map(ServiceSummaryDto::from)
+                .map(assignment -> ServiceSummaryDto.from(assignment, categoryLabels))
                 .toList();
 
         boolean discloses = MasterType.disclosesOwnAddress(master.getMasterType());

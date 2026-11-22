@@ -74,8 +74,24 @@ public record ServiceDefinitionResponse(
                         + "non-CLIENT callers, every provider-side service-management response, "
                         + "and always null inside the salon-service-catalog cache) — decorated "
                         + "per-request, after the cache read.")
-        Boolean isFavorite
+        Boolean isFavorite,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Display name of the service's platform category, including a category the operator "
+                        + "has since HIDDEN (SVC-56), so an existing service keeps its label. Filled on the app's "
+                        + "read paths (salon catalogue, master services, own services); null on write responses or "
+                        + "for an unknown / rejected category — fall back to category then.")
+        String categoryDisplayName
 ) {
+
+    /** B504 (track D18) — the pre-{@code categoryDisplayName} arity; existing construction sites compile unchanged. */
+    public ServiceDefinitionResponse(UUID id, String name, String description, String category,
+            int baseDurationMinutes, int bufferMinutesAfter, boolean isActive, UUID serviceTypeId,
+            String serviceTypeNameUk, String serviceTypeSlug, String photoUrl, PriceType priceType,
+            BigDecimal priceMin, BigDecimal priceMax, String priceDisplay, Boolean isFavorite) {
+        this(id, name, description, category, baseDurationMinutes, bufferMinutesAfter, isActive, serviceTypeId,
+                serviceTypeNameUk, serviceTypeSlug, photoUrl, priceType, priceMin, priceMax, priceDisplay, isFavorite,
+                null);
+    }
     public static ServiceDefinitionResponse from(ServiceDefinition sd) {
         // Money is derived in exactly one place (Phase 31.4 D2) so that this DTO, the
         // master's service menu and the BEAUTY WISH LIST can never print different prices
@@ -139,6 +155,14 @@ public record ServiceDefinitionResponse(
         return new ServiceDefinitionResponse(
                 id, name, description, category, baseDurationMinutes, bufferMinutesAfter,
                 isActive, serviceTypeId, serviceTypeNameUk, serviceTypeSlug, photoUrl,
-                priceType, priceMin, priceMax, priceDisplay, favorite);
+                priceType, priceMin, priceMax, priceDisplay, favorite, categoryDisplayName);
+    }
+
+    /** B504 (track D18) — a copy with {@code categoryDisplayName} set from a once-per-request label map. */
+    public ServiceDefinitionResponse withCategoryDisplayName(String displayName) {
+        return new ServiceDefinitionResponse(
+                id, name, description, category, baseDurationMinutes, bufferMinutesAfter,
+                isActive, serviceTypeId, serviceTypeNameUk, serviceTypeSlug, photoUrl,
+                priceType, priceMin, priceMax, priceDisplay, isFavorite, displayName);
     }
 }

@@ -143,6 +143,9 @@ class BookingServiceTest {
 
     private Clock clock;
 
+    @Mock
+    private com.beautica.service.service.PlatformCategoryLabelResolver categoryLabelResolver;
+
     @InjectMocks
     private BookingService bookingService;
 
@@ -196,7 +199,9 @@ class BookingServiceTest {
                 eventPublisher,
                 inAppNotificationService,
                 clientBlockService,
-                bookingBlockGuard
+                bookingBlockGuard,
+                // B504 (D18): an unstubbed mock returns an empty label map, so categoryDisplayName stays null.
+                categoryLabelResolver
         );
         // Phase 397: provider-role detail reads ask for the block state; default to "not blockable".
         lenient().when(clientBlockService.blockStateFor(any(), any(), any()))

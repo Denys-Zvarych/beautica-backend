@@ -62,16 +62,29 @@ class CatalogCacheEvictorTest {
     }
 
     @Test
-    @DisplayName("the list equals the catalog subset of CacheConfig, so a new catalog cache fails here")
+    @DisplayName("the list equals the catalog subset of CacheConfig plus the label-holding per-master caches")
     void should_matchCatalogSubsetOfCacheConfig_when_comparingNames() {
         Set<String> catalogCaches = cacheManager.getCacheNames().stream()
                 .filter(name -> CATALOG_NAME.matcher(name).matches())
                 .filter(name -> !NOT_PLATFORM_CATALOG.contains(name))
-                .collect(Collectors.toSet());
+                .collect(Collectors.toCollection(java.util.HashSet::new));
+        catalogCaches.addAll(CatalogCacheEvictor.LABEL_HOLDING_CACHES);
 
         assertThat(CatalogCacheEvictor.CACHE_NAMES).doesNotHaveDuplicates()
                 .containsExactlyInAnyOrderElementsOf(catalogCaches);
         assertThat(cacheManager.getCacheNames()).containsAll(NOT_PLATFORM_CATALOG);
+    }
+
+    @Test
+    @DisplayName("B504 (D18) — platform-category-labels, masterServices and booking-slug-info are evicted, so a rename refreshes labels")
+    void should_listAndEvictLabelsCache_when_categoryLabelsCached() {
+        evictor.evictAll();
+
+        assertThat(CatalogCacheEvictor.CACHE_NAMES)
+                .contains("platform-category-labels", "masterServices", "booking-slug-info");
+        assertThat(cacheManager.getCache("platform-category-labels").get(KEY)).isNull();
+        assertThat(cacheManager.getCache("masterServices").get(KEY)).isNull();
+        assertThat(cacheManager.getCache("booking-slug-info").get(KEY)).isNull();
     }
 
     @Test

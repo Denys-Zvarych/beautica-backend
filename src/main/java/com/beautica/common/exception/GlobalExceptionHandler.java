@@ -355,7 +355,8 @@ public class GlobalExceptionHandler {
     /**
      * B502 (SVC-55) — distinct 409 for a refused catalog-admin request edit: the
      * {@link CatalogRequestConflictResponse} body carries {@code REQUEST_NOT_PENDING} / {@code DUPLICATE_PENDING} /
-     * {@code TYPE_EXISTS} under {@code data.code}, which {@link #handleBusiness}'s genericised CONFLICT branch would
+     * {@code TYPE_EXISTS} (B504 adds {@code CATEGORY_NAME_EXISTS} / {@code CATEGORY_NOT_APPROVED}) under
+     * {@code data.code}, which {@link #handleBusiness}'s genericised CONFLICT branch would
      * otherwise drop. The message is fixed here, never {@code ex.getMessage()}. A new code; no existing body changes.
      */
     @ExceptionHandler(CatalogRequestConflictException.class)
@@ -370,6 +371,8 @@ public class GlobalExceptionHandler {
                             case REQUEST_NOT_PENDING -> "Request is no longer pending";
                             case DUPLICATE_PENDING -> "A matching request is already pending";
                             case TYPE_EXISTS -> "A service type with this name already exists";
+                            case CATEGORY_NAME_EXISTS -> "A category with this name already exists";
+                            case CATEGORY_NOT_APPROVED -> "Category is not approved";
                         }));
     }
 

@@ -5,6 +5,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Public seam exposing the selectable {@link PlatformCategory} rows as
@@ -71,5 +73,28 @@ public class PlatformCategoryLabelResolver {
         return platformCategoryOrderLookup.getApprovedActive().stream()
                 .map(category -> new PlatformCategoryLabel(category.getName(), category.getDisplayName()))
                 .toList();
+    }
+
+    /**
+     * B504 (track D18) — every APPROVED category's label, hidden ones included, by {@code displayName}: the DISPLAY
+     * vocabulary for services that already use a category the operator has since hidden (D4). Not a search or picker
+     * vocabulary — {@link #selectableLabels()} stays that. Backed by the cached
+     * {@code PlatformCategoryOrderLookup#getApprovedIncludingHidden()} ({@code platform-category-labels}).
+     *
+     * @return {@code (name, displayName)} pairs; never {@code null}
+     */
+    @Transactional(readOnly = true)
+    public List<PlatformCategoryLabel> labelsIncludingHidden() {
+        return platformCategoryOrderLookup.getApprovedIncludingHidden().stream()
+                .map(category -> new PlatformCategoryLabel(category.getName(), category.getDisplayName()))
+                .toList();
+    }
+
+    /** {@link #labelsIncludingHidden()} as a {@code name -> displayName} map, for once-per-request label resolution. */
+    @Transactional(readOnly = true)
+    public Map<String, String> displayNamesIncludingHidden() {
+        return labelsIncludingHidden().stream()
+                .collect(Collectors.toMap(PlatformCategoryLabel::name, PlatformCategoryLabel::displayName,
+                        (first, second) -> first));
     }
 }

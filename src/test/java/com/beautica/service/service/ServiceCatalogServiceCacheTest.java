@@ -140,6 +140,7 @@ class ServiceCatalogServiceCacheTest {
         cacheManager.getCache("service-categories").clear();
         cacheManager.getCache("available-slots").clear();
         cacheManager.getCache("platform-category-order").clear();
+        cacheManager.getCache("platform-category-labels").clear();
         cacheManager.getCache("salon-service-catalog").clear();
     }
 
@@ -674,7 +675,7 @@ class ServiceCatalogServiceCacheTest {
     // ── platform-category-order cache (perf follow-up, Phase 13.6) ─────────────
 
     @Test
-    @DisplayName("second getSalonServiceCatalog call for a different salon does not re-query findApprovedActive — platform-category-order cache is effective")
+    @DisplayName("second getSalonServiceCatalog call for a different salon does not re-query findApprovedIncludingHidden — platform-category-labels cache is effective (B504 D18)")
     void should_hitCache_when_getSalonServiceCatalogCalledForTwoSalons() {
         UUID salonId1 = UUID.randomUUID();
         UUID salonId2 = UUID.randomUUID();
@@ -708,15 +709,15 @@ class ServiceCatalogServiceCacheTest {
         // with (one entry per master, byMaster's own grouping) rather than the old per-master list.
         when(slotCalculationService.filterBookableAssignmentsBatch(any()))
                 .thenAnswer(inv -> inv.getArgument(0));
-        when(platformCategoryRepository.findApprovedActive())
+        when(platformCategoryRepository.findApprovedIncludingHidden())
                 .thenReturn(List.of(com.beautica.service.entity.PlatformCategory.ofApproved("MANICURE", "Манікюр")));
 
         serviceCatalogService.getSalonServiceCatalog(salonId1);
         serviceCatalogService.getSalonServiceCatalog(salonId2);
 
-        // Two distinct salons still share the SAME platform-category-order cache entry
+        // Two distinct salons still share the SAME platform-category-labels cache entry
         // ('all' key, no salonId in the key) — the repository must be hit only once.
-        verify(platformCategoryRepository, times(1)).findApprovedActive();
+        verify(platformCategoryRepository, times(1)).findApprovedIncludingHidden();
     }
 
     // ── salon-service-catalog cache (perf/security #2) ─────────────────────────

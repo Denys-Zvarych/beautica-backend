@@ -16,8 +16,8 @@ import java.util.UUID;
                 @jakarta.persistence.Index(name = "idx_service_types_name_en_trgm", columnList = "name_en"),
                 // Composite partial index from V14 covering category+active filter.
                 @jakarta.persistence.Index(name = "idx_service_types_category_active", columnList = "category_id, name_uk"),
-                // Partial B-tree index from V73 for platform-category filtering (Phase 16.2+).
-                // Mirrors the DB partial index: WHERE is_active = TRUE.
+                // B-tree index for platform-category filtering (Phase 16.2+). V73 created it partial
+                // (WHERE is_active = TRUE); V265 (B504) made it FULL so hidden-inclusive admin reads use it too.
                 @jakarta.persistence.Index(name = "idx_service_types_platform_category", columnList = "platform_category_name")
         }
 )
@@ -54,8 +54,8 @@ public class ServiceType extends AuditableEntity {
 
     // Added in V73 (Phase 16.1). Stores the platform_categories.name slug that
     // this service type belongs to (e.g. 'MANICURE', 'HAIR'). The column has a
-    // FK → platform_categories(name) for closed-set enforcement and a partial
-    // B-tree index (idx_service_types_platform_category WHERE is_active = TRUE)
+    // FK → platform_categories(name) for closed-set enforcement and a B-tree
+    // index (idx_service_types_platform_category; partial in V73, full since V265)
     // for Phase 16.2+ category-filtered queries.
     // Field mapping is intentionally minimal here (16.2 service layer will use it);
     // adding the @Column now stops ddl-auto=validate from drifting.
@@ -63,4 +63,18 @@ public class ServiceType extends AuditableEntity {
     @Size(max = 100)
     @Column(name = "platform_category_name", nullable = false, length = 100)
     private String platformCategoryName;
+
+    /**
+     * B504 (SVC-56) — the platform operator renames the type. The {@code slug} never changes: deep links and search
+     * keys use it. Caller has validated and canonicalised both values; {@code nameEn} may be {@code null}.
+     */
+    public void rename(String nameUk, String nameEn) {
+        this.nameUk = nameUk;
+        this.nameEn = nameEn;
+    }
+
+    /** B504 (SVC-56) — hides ({@code false}) or unhides ({@code true}) the type for new services. */
+    public void changeActive(boolean active) {
+        this.active = active;
+    }
 }

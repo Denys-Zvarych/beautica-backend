@@ -514,8 +514,76 @@ public record BookingDetailResponse(
         @Schema(types = {"string", "null"}, nullable = true, format = "phone",
                 description = "Retired (GST-80, CLI-D08): ALWAYS null. Booking detail carries no phone for any "
                         + "role; the client's phone is on the provider client card only. Kept for old app builds.")
-        String clientPhone
+        String clientPhone,
+        // B504 (track D18) — appended last; set only through withCategoryDisplayName (the old-arity constructor
+        // below leaves it null), so no construction site passes it positionally.
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Display name of the service's platform category (platform_categories.display_name), "
+                        + "including a category the operator has since HIDDEN (SVC-56): an existing booking keeps "
+                        + "showing its label. Null when the category is unknown / rejected or the service has none; "
+                        + "fall back to categoryKey then. Resolved once per request, never per row.")
+        String categoryDisplayName
 ) {
+
+    /**
+     * B504 (track D18) — the pre-{@code categoryDisplayName} arity, so every existing construction site compiles
+     * unchanged; {@code categoryDisplayName} starts {@code null} and is set by {@link #withCategoryDisplayName}.
+     */
+    public BookingDetailResponse(
+            UUID id,
+            UUID clientId,
+            UUID masterId,
+            UUID masterServiceId,
+            String serviceName,
+            BookingStatus status,
+            ZonedDateTime startsAt,
+            ZonedDateTime endsAt,
+            BigDecimal priceAtBooking,
+            BigDecimal priceMaxAtBooking,
+            int durationMinutesAtBooking,
+            OffsetDateTime createdAt,
+            String clientFirstName,
+            String clientLastName,
+            String masterFirstName,
+            String masterLastName,
+            String masterProfessionalTitle,
+            String clientComment,
+            String providerComment,
+            String clientCancellationNote,
+            String masterAvatarUrl,
+            Role masterType,
+            String salonName,
+            String cityLabel,
+            String districtLabel,
+            String street,
+            String buildingNo,
+            String locationNote,
+            String categoryName,
+            boolean canReview,
+            boolean providerCanReviewClient,
+            UUID appointmentId,
+            String clientAvatarUrl,
+            boolean awaitingClosure,
+            BigDecimal masterAvgRating,
+            Integer masterReviewCount,
+            UUID salonId,
+            String categoryKey,
+            ClientAuthoredReviewResponse reviewByClient,
+            BigDecimal clientAvgRating,
+            Integer clientReviewCount,
+            String guestPhone,
+            boolean clientBlocked,
+            UUID clientBlockId,
+            boolean clientBlockable,
+            String clientPhone
+    ) {
+        this(id, clientId, masterId, masterServiceId, serviceName, status, startsAt, endsAt, priceAtBooking, priceMaxAtBooking, durationMinutesAtBooking, createdAt, clientFirstName, clientLastName, masterFirstName, masterLastName, masterProfessionalTitle, clientComment, providerComment, clientCancellationNote, masterAvatarUrl, masterType, salonName, cityLabel, districtLabel, street, buildingNo, locationNote, categoryName, canReview, providerCanReviewClient, appointmentId, clientAvatarUrl, awaitingClosure, masterAvgRating, masterReviewCount, salonId, categoryKey, reviewByClient, clientAvgRating, clientReviewCount, guestPhone, clientBlocked, clientBlockId, clientBlockable, clientPhone, null);
+    }
+
+    /** B504 (track D18) — a copy with {@code categoryDisplayName} set (the read path resolves the label map once). */
+    public BookingDetailResponse withCategoryDisplayName(String displayName) {
+        return new BookingDetailResponse(id, clientId, masterId, masterServiceId, serviceName, status, startsAt, endsAt, priceAtBooking, priceMaxAtBooking, durationMinutesAtBooking, createdAt, clientFirstName, clientLastName, masterFirstName, masterLastName, masterProfessionalTitle, clientComment, providerComment, clientCancellationNote, masterAvatarUrl, masterType, salonName, cityLabel, districtLabel, street, buildingNo, locationNote, categoryName, canReview, providerCanReviewClient, appointmentId, clientAvatarUrl, awaitingClosure, masterAvgRating, masterReviewCount, salonId, categoryKey, reviewByClient, clientAvgRating, clientReviewCount, guestPhone, clientBlocked, clientBlockId, clientBlockable, clientPhone, displayName);
+    }
 
     /**
      * Phase 397 — the ONLY place the three block components are populated (detail read, blocker-role viewer).
@@ -532,7 +600,7 @@ public record BookingDetailResponse(
                 districtLabel, street, buildingNo, locationNote, categoryName, canReview, providerCanReviewClient,
                 appointmentId, clientAvatarUrl, awaitingClosure, masterAvgRating, masterReviewCount, salonId,
                 categoryKey, reviewByClient, clientAvgRating, clientReviewCount, guestPhone,
-                blockId != null, blockId, blockable, clientPhone);
+                blockId != null, blockId, blockable, clientPhone, categoryDisplayName);
     }
 
     /**

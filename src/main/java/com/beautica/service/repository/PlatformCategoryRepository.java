@@ -92,6 +92,34 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
         return findByIdForUpdateNoLockTimeout(id);
     }
 
+    /**
+     * B504 — the live category a catalog-admin rename / hide / unhide mutates, keyed by its immutable wire name and
+     * locked ({@code FOR UPDATE}) so the write serialises with a concurrent request decision on the same row.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select c from PlatformCategory c where c.name = :name")
+    Optional<PlatformCategory> findByNameForUpdateNoLockTimeout(@Param("name") String name);
+
+    /** {@link #findByNameForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default Optional<PlatformCategory> findByNameForUpdate(String name) {
+        applyTransactionLockTimeout();
+        return findByNameForUpdateNoLockTimeout(name);
+    }
+
+    /**
+     * B504 — true when ANOTHER approved or pending category (hidden ones included) already shows this display name,
+     * case-insensitive; a rejected request's name never blocks. Guards a rename against two identical picker labels.
+     */
+    @Query("""
+            SELECT COUNT(pc) > 0 FROM PlatformCategory pc
+             WHERE LOWER(pc.displayName) = LOWER(:displayName)
+               AND pc.id <> :excludeId
+               AND pc.status IN (com.beautica.service.entity.PlatformCategoryStatus.APPROVED,
+                                 com.beautica.service.entity.PlatformCategoryStatus.PENDING)
+            """)
+    boolean existsOtherLiveByDisplayNameIgnoreCase(@Param("displayName") String displayName,
+                                                   @Param("excludeId") Long excludeId);
+
     /** Phase 372 — batch display-name lookup for suggestion feed items (one statement per page). */
     List<PlatformCategory> findByNameIn(Collection<String> names);
 
@@ -107,6 +135,18 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
              ORDER BY pc.displayName
             """)
     List<PlatformCategory> findApprovedActive();
+
+    /**
+     * B504 (track D18) — every APPROVED category in ANY {@code active} state, by display name: the LABEL source for
+     * services that already use a category the operator has since hidden (D4: they keep showing, under the display
+     * name, not the slug). Never a picker source — {@link #findApprovedActive()} stays that.
+     */
+    @Query("""
+            SELECT pc FROM PlatformCategory pc
+             WHERE pc.status = com.beautica.service.entity.PlatformCategoryStatus.APPROVED
+             ORDER BY pc.displayName
+            """)
+    List<PlatformCategory> findApprovedIncludingHidden();
 
     /**
      * Returns all platform categories with their usage counts from

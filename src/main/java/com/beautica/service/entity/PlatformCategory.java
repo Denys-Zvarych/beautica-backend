@@ -217,6 +217,38 @@ public class PlatformCategory {
         this.initialServiceName = initialServiceName;
     }
 
+    public boolean isApproved() {
+        return this.status == PlatformCategoryStatus.APPROVED;
+    }
+
+    /**
+     * B504 (SVC-56) — the platform operator renames a live category. Only the display name changes; the wire
+     * {@code name} is immutable (track D4). Caller has validated and canonicalised the value.
+     *
+     * @throws IllegalStateException when the category is not APPROVED (the service checks first)
+     */
+    public void renameDisplayName(String displayName) {
+        requireApproved();
+        this.displayName = displayName;
+    }
+
+    /**
+     * B504 (SVC-56) — hides ({@code false}) or unhides ({@code true}) a live category: a hidden one is not offered for
+     * new services; services already using it keep working (track D4).
+     *
+     * @throws IllegalStateException when the category is not APPROVED (the service checks first)
+     */
+    public void changeActive(boolean active) {
+        requireApproved();
+        this.active = active;
+    }
+
+    private void requireApproved() {
+        if (!isApproved()) {
+            throw new IllegalStateException("Only an APPROVED category can be renamed, hidden or unhidden");
+        }
+    }
+
     private void clearToken() {
         this.tokenHash = null;
         this.tokenExpiresAt = null;

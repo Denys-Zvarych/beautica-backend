@@ -5,7 +5,11 @@ import com.beautica.service.entity.ServiceType;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
 import java.util.UUID;
@@ -34,6 +38,9 @@ class ServiceTypePlatformCategoryRepositoryTest extends AbstractIntegrationTest 
 
     @Autowired
     private ServiceTypeRepository serviceTypeRepository;
+
+    @Autowired
+    private PlatformTransactionManager transactionManager;
 
     private UUID insertedInactiveId;
 
@@ -121,5 +128,39 @@ class ServiceTypePlatformCategoryRepositoryTest extends AbstractIntegrationTest 
                 serviceTypeRepository.findActiveByPlatformCategoryName("NO_SUCH_BUCKET");
 
         assertThat(result).isEmpty();
+    }
+
+    // ── V265 (B504): the platform-category index is FULL, so hidden-inclusive reads use it too ──
+
+    @Test
+    @DisplayName("V265 — idx_service_types_platform_category is a full (non-partial) index on platform_category_name")
+    void should_beFullIndex_when_v265Applied() {
+        String indexdef = jdbcTemplate.queryForObject(
+                "SELECT indexdef FROM pg_indexes WHERE tablename = 'service_types' "
+                        + "AND indexname = 'idx_service_types_platform_category'", String.class);
+
+        assertThat(indexdef).contains("(platform_category_name)").doesNotContain("WHERE");
+    }
+
+    /**
+     * The three predicate shapes on platform_category_name: the active-only picker (V73's original reader) and the
+     * two hidden-inclusive B504 admin reads (type list, type_count). {@code enable_seqscan = off} (transaction-local)
+     * because the seeded table is small enough that the planner would otherwise prefer a scan regardless; under
+     * V73's partial index the two hidden-inclusive shapes could not use it at all.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "SELECT id FROM service_types WHERE platform_category_name = 'BROWS' AND is_active = TRUE",
+            "SELECT id, name_uk FROM service_types WHERE platform_category_name = 'BROWS' ORDER BY name_uk",
+            "SELECT COUNT(*) FROM service_types st WHERE st.platform_category_name = 'BROWS'"
+    })
+    @DisplayName("V265 — every platform_category_name lookup (active-only and hidden-inclusive) can use the index")
+    void should_useIndex_when_filteringByPlatformCategoryName(String sql) {
+        List<String> plan = new TransactionTemplate(transactionManager).execute(status -> {
+            jdbcTemplate.execute("SET LOCAL enable_seqscan = off");
+            return jdbcTemplate.queryForList("EXPLAIN " + sql, String.class);
+        });
+
+        assertThat(String.join("\n", plan)).contains("idx_service_types_platform_category");
     }
 }
