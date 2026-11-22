@@ -145,6 +145,10 @@ public abstract class AbstractIntegrationTest {
         jdbcTemplate.execute("DELETE FROM users");
         // Phase 368 (V195): singleton environment stamp; no FK. Only staging/prod boots write it.
         jdbcTemplate.execute("DELETE FROM deployment_environment");
+        // B501 (V264): catalog_admin_audit has no FK either way (polymorphic target). Its append-only row trigger
+        // rejects DELETE, and row triggers do not fire on TRUNCATE, so it is TRUNCATEd here so audit rows never leak
+        // between tests (§O-7).
+        jdbcTemplate.execute("TRUNCATE catalog_admin_audit");
 
         cacheManager.getCacheNames().forEach(name -> {
             var cache = cacheManager.getCache(name);

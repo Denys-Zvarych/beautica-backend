@@ -775,6 +775,10 @@ app:
     # Phase 435 audit-fix — DECRYPT-ONLY previous key during a rotation (values are sealed v2:<kid>:…, so open picks
     # the key by kid). Empty outside a rotation. Rotation steps: docs/backend-phases/phase-435-guest-sms-copy.md.
     key-previous: ${GUEST_CANCEL_TOKEN_KEY_PREVIOUS:}
+  # B501 — optional catalog-only internal key (opens /api/v1/internal/catalog/** only; SVC-54). Blank = disabled, so
+  # this base default is safe on every profile; prod and staging (profiles prod,staging) both read INTERNAL_CATALOG_KEY,
+  # and EnvironmentFingerprintGuard requires >= 32 chars and != INTERNAL_API_KEY whenever it is set there.
+  internal-catalog-key: ${INTERNAL_CATALOG_KEY:}
   # app.internal-api-key is deliberately NOT defined in the base profile: a base default would
   # reach prod. It is mapped from INTERNAL_API_KEY in application-prod.yml (staging inherits it;
   # EnvironmentFingerprintGuard enforces non-blank, non-default, >= 32 chars) and given a dev-only

@@ -145,6 +145,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             checkR2Bucket(env, environment, violations);
             checkLinkBaseUrls(env, environment, violations);
             checkInternalApiKey(env, violations);
+            checkInternalCatalogKey(env, violations);
             checkRetentionJobs(env, environment, violations);
             if (environment == DeployEnvironment.PROD) {
                 checkProd(env, violations);
@@ -489,6 +490,29 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         } else if (key.strip().length() < MIN_INTERNAL_API_KEY_LENGTH) {
             violations.add("rule internal-api-key-length: app.internal-api-key must be at least "
                     + MIN_INTERNAL_API_KEY_LENGTH + " characters");
+        }
+    }
+
+    /**
+     * B501 — the catalog-only key ({@code INTERNAL_CATALOG_KEY}) is optional on prod and staging (blank = disabled),
+     * but when set it must be a real secret of at least {@value #MIN_INTERNAL_API_KEY_LENGTH} chars and must differ
+     * from {@code INTERNAL_API_KEY}: an equal value would make the Worker's scoped key the master key. Messages name
+     * the rule and property only, never a value.
+     */
+    private static void checkInternalCatalogKey(Environment env, List<String> violations) {
+        String catalogKey = readOrNull(env, "app.internal-catalog-key");
+        if (isBlank(catalogKey)) {
+            return;
+        }
+        String key = catalogKey.strip();
+        if (key.length() < MIN_INTERNAL_API_KEY_LENGTH) {
+            violations.add("rule internal-catalog-key-length: app.internal-catalog-key (INTERNAL_CATALOG_KEY) must be"
+                    + " at least " + MIN_INTERNAL_API_KEY_LENGTH + " characters when set");
+        }
+        String masterKey = readOrNull(env, "app.internal-api-key");
+        if (masterKey != null && key.equals(masterKey.strip())) {
+            violations.add("rule internal-catalog-key-reused: app.internal-catalog-key (INTERNAL_CATALOG_KEY) must"
+                    + " differ from app.internal-api-key (INTERNAL_API_KEY)");
         }
     }
 
