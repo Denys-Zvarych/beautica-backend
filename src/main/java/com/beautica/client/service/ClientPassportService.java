@@ -232,14 +232,15 @@ public class ClientPassportService {
      *
      * <p>The label lookup is decorative — the timeline payload (bookings, dates, service
      * names, ids) does not depend on it. A cache or DB failure inside
-     * {@link PlatformCategoryLabelResolver#selectableLabels()} therefore degrades to an empty
+     * {@link PlatformCategoryLabelResolver#labelsIncludingHidden()} therefore degrades to an empty
      * map rather than propagating: {@code categoryName} already falls back to the raw slug via
      * {@code getOrDefault(category, category)} on a map miss, so an empty map here reproduces
      * exactly that pre-existing, documented fallback for every row.
      */
     private Map<String, String> resolveCategoryLabelsBySlug() {
         try {
-            return platformCategoryLabelResolver.selectableLabels().stream()
+            // B504 (D18): hidden categories included, so a past visit under a since-hidden category keeps its label.
+            return platformCategoryLabelResolver.labelsIncludingHidden().stream()
                     .collect(Collectors.toMap(PlatformCategoryLabel::name, PlatformCategoryLabel::displayName));
         } catch (Exception ex) {
             log.warn("Category label resolution failed for timeline read — falling back to raw "

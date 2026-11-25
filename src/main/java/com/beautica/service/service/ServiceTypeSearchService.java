@@ -43,6 +43,11 @@ class ServiceTypeSearchService {
      * {@code @CacheEvict(value = "service-type-search", allEntries = true)} to prevent
      * stale search results for up to the 5-minute TTL.
      *
+     * <p>Deliberately NOT {@code sync = true} (reviewed B503): the key is the typed query, so the cache has many distinct
+     * keys and misses on every new prefix; a sync load holds Caffeine's {@code synchronized} bin lock for the whole
+     * miss and pins a virtual thread's carrier (same rule as {@code SettlementSearchService#runIndexedSearch} and
+     * {@code SearchSuggestionAvailability}). A rare duplicate load of one cold query is cheaper.
+     *
      * @param q          search term (caller must ensure length >= 3, stripped, lowercased)
      * @param categoryId optional category filter; {@code null} searches across all categories
      */

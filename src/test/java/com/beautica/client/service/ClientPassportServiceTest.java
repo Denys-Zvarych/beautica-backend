@@ -354,7 +354,7 @@ class ClientPassportServiceTest {
                 .thenReturn(page);
         // Empty selectable-label set: the fallback is getOrDefault(category, category), so this
         // keeps the previous slug-passthrough assertion below intact.
-        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of());
+        when(platformCategoryLabelResolver.labelsIncludingHidden()).thenReturn(List.of());
 
         PageResponse<TimelineItemResponse> result = service().getTimeline(clientId, PageRequest.of(0, 20));
 
@@ -381,7 +381,7 @@ class ClientPassportServiceTest {
     void should_resolveNowFromClock_when_findingTimeline() {
         when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(), PageRequest.of(0, 20), 0));
-        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of());
+        when(platformCategoryLabelResolver.labelsIncludingHidden()).thenReturn(List.of());
 
         service().getTimeline(clientId, PageRequest.of(0, 20));
 
@@ -412,7 +412,7 @@ class ClientPassportServiceTest {
         // A POPULATED, multi-entry resolved label map — this is the label-hit branch
         // (getOrDefault actually returning the mapped value). Every other getTimeline test in this
         // class stubs an empty list and therefore never reaches it; this is the one that does.
-        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of(
+        when(platformCategoryLabelResolver.labelsIncludingHidden()).thenReturn(List.of(
                 new PlatformCategoryLabel("HAIRCUT", "Стрижка"),
                 new PlatformCategoryLabel("MANICURE", "Манікюр")));
 
@@ -443,7 +443,7 @@ class ClientPassportServiceTest {
         // Non-empty map that deliberately does NOT contain "MANICURE" — proves the fallback holds
         // against a populated catalog, not merely an empty one (an empty-catalog stub would pass
         // this same assertion even if getOrDefault were broken, since the map has nothing to hit).
-        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of(
+        when(platformCategoryLabelResolver.labelsIncludingHidden()).thenReturn(List.of(
                 new PlatformCategoryLabel("HAIRCUT", "Стрижка")));
 
         PageResponse<TimelineItemResponse> result = service().getTimeline(clientId, PageRequest.of(0, 20));
@@ -457,7 +457,7 @@ class ClientPassportServiceTest {
     }
 
     @Test
-    @DisplayName("getTimeline — selectableLabels() is called exactly ONCE per page, never once per "
+    @DisplayName("getTimeline — labelsIncludingHidden() is called exactly ONCE per page, never once per "
             + "row, even with multiple timeline items on the page: pins the once-per-request "
             + "contract so a future refactor that moves the resolver call inside the row loop fails "
             + "here even though every per-row mapping assertion elsewhere stays green")
@@ -473,24 +473,24 @@ class ClientPassportServiceTest {
                 new PageImpl<>(List.of(first, second, third), PageRequest.of(0, 20), 3);
         when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
                 .thenReturn(page);
-        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of(
+        when(platformCategoryLabelResolver.labelsIncludingHidden()).thenReturn(List.of(
                 new PlatformCategoryLabel("MANICURE", "Манікюр"),
                 new PlatformCategoryLabel("HAIRCUT", "Стрижка")));
 
         PageResponse<TimelineItemResponse> result = service().getTimeline(clientId, PageRequest.of(0, 20));
 
         assertThat(result.data()).hasSize(3);
-        verify(platformCategoryLabelResolver, times(1)).selectableLabels();
+        verify(platformCategoryLabelResolver, times(1)).labelsIncludingHidden();
     }
 
     @Test
-    @DisplayName("getTimeline — selectableLabels() throwing (cache/DB failure) degrades the WHOLE "
+    @DisplayName("getTimeline — labelsIncludingHidden() throwing (cache/DB failure) degrades the WHOLE "
             + "page to the raw-slug fallback rather than failing the timeline read: the failure "
             + "happens once, before the row loop, so a single-row test would pass even if the "
             + "empty fallback map were only wired up for the first element — this pins it across "
             + "every row on a multi-row page, and pins categoryKey as unaffected since the mobile "
             + "client picks the tile icon from it")
-    void should_fallBackToRawSlugForAllRows_when_selectableLabelsThrows() {
+    void should_fallBackToRawSlugForAllRows_when_labelsIncludingHiddenThrows() {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 10, 9, 0, 0, 0, ZoneOffset.UTC);
         TimelineItemProjection first = new TimelineItemProjection(
                 UUID.randomUUID(), "NAIL_SERVICE", startsAt, UUID.randomUUID(), "Gel Manicure");
@@ -502,7 +502,7 @@ class ClientPassportServiceTest {
                 new PageImpl<>(List.of(first, second, third), PageRequest.of(0, 20), 3);
         when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
                 .thenReturn(page);
-        when(platformCategoryLabelResolver.selectableLabels())
+        when(platformCategoryLabelResolver.labelsIncludingHidden())
                 .thenThrow(new RuntimeException("cache backend unavailable"));
 
         PageResponse<TimelineItemResponse> result = service().getTimeline(clientId, PageRequest.of(0, 20));
@@ -535,7 +535,7 @@ class ClientPassportServiceTest {
                 new PageImpl<>(List.of(projection), PageRequest.of(0, 20), 1);
         when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
                 .thenReturn(page);
-        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of());
+        when(platformCategoryLabelResolver.labelsIncludingHidden()).thenReturn(List.of());
 
         PageResponse<TimelineItemResponse> result = service().getTimeline(clientId, PageRequest.of(0, 20));
 
@@ -553,7 +553,7 @@ class ClientPassportServiceTest {
                 UUID.randomUUID(), null, startsAt, UUID.randomUUID(), "Mystery Service");
         when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(projection), PageRequest.of(0, 20), 1));
-        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of());
+        when(platformCategoryLabelResolver.labelsIncludingHidden()).thenReturn(List.of());
 
         PageResponse<TimelineItemResponse> result = service().getTimeline(clientId, PageRequest.of(0, 20));
 
@@ -568,7 +568,7 @@ class ClientPassportServiceTest {
                 .thenReturn(new PageImpl<>(List.of(), PageRequest.of(0, 20), 0));
         // getTimeline builds the category-label map unconditionally, before mapping content —
         // it runs even on an empty page.
-        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of());
+        when(platformCategoryLabelResolver.labelsIncludingHidden()).thenReturn(List.of());
 
         PageResponse<TimelineItemResponse> result = service().getTimeline(clientId, PageRequest.of(0, 20));
 

@@ -129,3 +129,8 @@ c886fda4ca7a69f4899ac0fdb1ece57de282ff2e:src/test/java/com/beautica/booking/cryp
 # that the scrubber test proves gets redacted. Never issued by the app, not a
 # credential (reviewed 2026-11-06).
 1756002fee1766a1b79779fad250c57783cd7d61:src/test/java/com/beautica/common/observability/SentryPiiScrubberTest.java:generic-api-key:434
+# GlobalExceptionHandlerLoggingTest: RAW_TOKEN is a hand-typed path-variable
+# canary ("s3cr3t-T0ken-..." style) that the B500 logging test proves never
+# reaches the log line (only the route template is logged). Never issued by
+# the app, not a credential (reviewed 2026-11-25).
+9ed3b233c64b06515a7127df4d6c3815d322c2f4:src/test/java/com/beautica/common/exception/GlobalExceptionHandlerLoggingTest.java:generic-api-key:48

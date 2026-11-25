@@ -135,6 +135,22 @@ public record MasterServiceResponse(
      * never by {@code ServiceCatalogService} (Phase 32.1 D2.1): the cached method must never call
      * this, or the cache would start holding client-specific data.
      */
+    /**
+     * B504 (track D18) — a copy whose nested {@link ServiceDefinitionResponse} carries the category display name
+     * looked up in {@code displayNamesByCategory} (resolved once per request); {@code null} when not found.
+     */
+    public MasterServiceResponse withCategoryDisplayName(java.util.Map<String, String> displayNamesByCategory) {
+        if (serviceDefinition == null || serviceDefinition.category() == null) {
+            return this;
+        }
+        return new MasterServiceResponse(
+                id, masterId,
+                serviceDefinition.withCategoryDisplayName(displayNamesByCategory.get(serviceDefinition.category())),
+                priceOverride, durationOverrideMinutes, effectivePrice, effectiveDurationMinutes, isActive,
+                priceType, priceMin, priceMax, priceDisplay, serviceTypeId, serviceTypeNameUk, serviceTypeSlug,
+                isFavorite);
+    }
+
     public MasterServiceResponse withIsFavorite(boolean favorite) {
         return new MasterServiceResponse(
                 id, masterId, serviceDefinition, priceOverride, durationOverrideMinutes,

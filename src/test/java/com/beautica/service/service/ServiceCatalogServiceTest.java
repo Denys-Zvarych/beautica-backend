@@ -2355,7 +2355,7 @@ class ServiceCatalogServiceTest {
         when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
                 .thenReturn(List.of(assignmentFor(manicure1), assignmentFor(manicure2), assignmentFor(haircut)));
         stubAllAssignmentsBookable();
-        when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());
+        when(platformCategoryOrderLookup.getApprovedIncludingHidden()).thenReturn(List.of());
 
         var result = serviceCatalogService.getSalonServiceCatalog(salonId);
 
@@ -2379,7 +2379,7 @@ class ServiceCatalogServiceTest {
         when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
                 .thenReturn(List.of(assignmentFor(haircut), assignmentFor(manicure)));
         stubAllAssignmentsBookable();
-        when(platformCategoryOrderLookup.getApprovedActive())
+        when(platformCategoryOrderLookup.getApprovedIncludingHidden())
                 .thenReturn(List.of(approvedCategory("MANICURE"), approvedCategory("HAIRCUT")));
 
         var result = serviceCatalogService.getSalonServiceCatalog(salonId);
@@ -2402,7 +2402,7 @@ class ServiceCatalogServiceTest {
                 .thenReturn(List.of(assignmentFor(legacy), assignmentFor(manicure)));
         stubAllAssignmentsBookable();
         // ZZZ_LEGACY is intentionally absent from the approved+active list.
-        when(platformCategoryOrderLookup.getApprovedActive())
+        when(platformCategoryOrderLookup.getApprovedIncludingHidden())
                 .thenReturn(List.of(approvedCategory("MANICURE")));
 
         var result = serviceCatalogService.getSalonServiceCatalog(salonId);
@@ -2425,7 +2425,7 @@ class ServiceCatalogServiceTest {
         stubAllAssignmentsBookable();
         // displayName deliberately differs from the category slug, so an accidental
         // "displayName == category" implementation (e.g. reusing the map key) would fail this.
-        when(platformCategoryOrderLookup.getApprovedActive())
+        when(platformCategoryOrderLookup.getApprovedIncludingHidden())
                 .thenReturn(List.of(approvedCategory("HAIRDRESSING", "Перукарські послуги")));
 
         var result = serviceCatalogService.getSalonServiceCatalog(salonId);
@@ -2447,7 +2447,7 @@ class ServiceCatalogServiceTest {
                 .thenReturn(List.of(assignmentFor(legacy)));
         stubAllAssignmentsBookable();
         // ZZZ_LEGACY is intentionally absent from the approved+active list.
-        when(platformCategoryOrderLookup.getApprovedActive())
+        when(platformCategoryOrderLookup.getApprovedIncludingHidden())
                 .thenReturn(List.of(approvedCategory("MANICURE", "Манікюр")));
 
         var result = serviceCatalogService.getSalonServiceCatalog(salonId);
@@ -2469,7 +2469,7 @@ class ServiceCatalogServiceTest {
         var result = serviceCatalogService.getSalonServiceCatalog(salonId);
 
         assertThat(result.categories()).isEmpty();
-        verify(platformCategoryOrderLookup, never()).getApprovedActive();
+        verify(platformCategoryOrderLookup, never()).getApprovedIncludingHidden();
     }
 
     @Test
@@ -2481,7 +2481,7 @@ class ServiceCatalogServiceTest {
         when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
                 .thenReturn(List.of(assignmentFor(manicure)));
         stubAllAssignmentsBookable();
-        when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());
+        when(platformCategoryOrderLookup.getApprovedIncludingHidden()).thenReturn(List.of());
 
         var result = serviceCatalogService.getSalonServiceCatalog(salonId);
 
@@ -2511,7 +2511,7 @@ class ServiceCatalogServiceTest {
         assertThat(result.categories())
                 .as("a service with zero bookable performing masters must be excluded from the catalogue")
                 .isEmpty();
-        verify(platformCategoryOrderLookup, never()).getApprovedActive();
+        verify(platformCategoryOrderLookup, never()).getApprovedIncludingHidden();
     }
 
     // ── phase 464 name ALLOW-LIST (create) ────────────────────────────────────────

@@ -351,10 +351,10 @@ class ClientPassportContractIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET timeline — a category deactivated after the booking was made falls back to the "
-            + "raw slug over HTTP, never null or blank, so the historical procedure is not silently "
-            + "dropped from the client's timeline")
-    void should_fallBackToRawSlugOverHttp_when_categoryDeactivatedSinceBooking() throws Exception {
+    @DisplayName("GET timeline — a category HIDDEN after the booking was made (APPROVED, active = false) keeps "
+            + "its Ukrainian display_name over HTTP (B504, track D18 / SVC-56), never the raw slug, null or "
+            + "blank, so the historical procedure keeps its label on the client's timeline")
+    void should_keepDisplayNameOverHttp_when_categoryHiddenSinceBooking() throws Exception {
         SeededCategory category = anySeededApprovedActiveCategory();
         UUID clientId = createClient("timeline-deactivated-client@beautica.test");
         UUID master = createIndependentMasterAt("timeline-deactivated-master@beautica.test", null);
@@ -363,7 +363,7 @@ class ClientPassportContractIT extends AbstractIntegrationTest {
         insertCompletedBooking(clientId, master, masterServiceId, new BigDecimal("500.00"));
 
         // platform_categories is reference data shared by every IT in this JVM (cleanDb() never
-        // restores it) — flip it back in a finally so no later test inherits a deactivated category.
+        // restores it) — flip it back in a finally so no later test inherits a hidden category.
         jdbcTemplate.update("UPDATE platform_categories SET active = false WHERE name = ?", category.name());
         try {
             List<TimelineItemResponse> items = getTimeline(clientId);
@@ -371,8 +371,9 @@ class ClientPassportContractIT extends AbstractIntegrationTest {
             assertThat(items).hasSize(1);
             assertThat(items.get(0).categoryKey()).isEqualTo(category.name());
             assertThat(items.get(0).categoryName())
-                    .as("fallback to the raw slug over HTTP — never null, never blank")
-                    .isEqualTo(category.name())
+                    .as("D18 — a hidden category keeps its display_name over HTTP, never the raw slug")
+                    .isEqualTo(category.displayName())
+                    .isNotEqualTo(category.name())
                     .isNotBlank();
         } finally {
             jdbcTemplate.update("UPDATE platform_categories SET active = true WHERE name = ?", category.name());

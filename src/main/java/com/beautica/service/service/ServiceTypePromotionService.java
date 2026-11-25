@@ -75,6 +75,17 @@ public class ServiceTypePromotionService {
     }
 
     /**
+     * B502 — whether an active service type with this name (case-insensitive) already exists in the platform category:
+     * the same lookup {@link #promote} reuses an existing type with. A portal rename to such a name is refused (409
+     * {@code TYPE_EXISTS}) rather than silently approved onto the existing type.
+     */
+    public boolean activeTypeExists(String categoryName, String name) {
+        return serviceTypeRepository
+                .findFirstActiveByPlatformCategoryNameAndNameUkIgnoreCase(categoryName, name)
+                .isPresent();
+    }
+
+    /**
      * Returns an existing active type with the same category + name, or creates a new one.
      * Always returns a non-null {@link ServiceType}: the parent bucket is the platform
      * category's mapped System-A bucket when present, otherwise the permanent "Other"

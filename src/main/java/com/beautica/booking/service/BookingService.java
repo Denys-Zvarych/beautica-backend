@@ -138,6 +138,8 @@ public class BookingService {
     private final ClientBlockService clientBlockService;
     // Phase 398 — refuses a create when the provider blocked this client account (BOOKING_UNAVAILABLE).
     private final BookingBlockGuard bookingBlockGuard;
+    /** B504 (track D18) — category display names (hidden included) for {@code categoryDisplayName}. */
+    private final com.beautica.service.service.PlatformCategoryLabelResolver categoryLabelResolver;
 
     /**
      * Creates a booking (or replays an idempotent one) and returns the <b>enriched</b> detail view.
@@ -467,9 +469,22 @@ public class BookingService {
 
         // Phase 29.2: single-row path, so "once per request" trivially holds — there is only one
         // row to disagree with itself.
-        return BookingDetailResponse.from(
-                booking, canReview, providerCanReviewClient,
-                labels.cityLabel(cityId), labels.districtLabel(districtId), now, reviewByClient);
+        return withCategoryLabel(categoryLabelResolver.displayNamesIncludingHidden()).apply(
+                BookingDetailResponse.from(
+                        booking, canReview, providerCanReviewClient,
+                        labels.cityLabel(cityId), labels.districtLabel(districtId), now, reviewByClient));
+    }
+
+    /**
+     * B504 (track D18) — sets {@code categoryDisplayName} from the raw {@code categoryName} slug both mapper paths
+     * carry. The map is built ONCE per request by the caller (one cached list read), never per row; hidden
+     * categories are included so an existing booking keeps its label (SVC-56).
+     */
+    private static java.util.function.UnaryOperator<BookingDetailResponse> withCategoryLabel(
+            Map<String, String> displayNamesByCategory) {
+        return detail -> detail.categoryName() == null
+                ? detail
+                : detail.withCategoryDisplayName(displayNamesByCategory.get(detail.categoryName()));
     }
 
     /**
@@ -1312,6 +1327,7 @@ public class BookingService {
                             // review exists".
                             null);
                 })
+                .map(withCategoryLabel(categoryLabelResolver.displayNamesIncludingHidden()))
                 .toList();
 
         return PageResponse.of(ordered, idPage.getNumber(), idPage.getSize(),
@@ -1610,11 +1626,11 @@ public class BookingService {
         Set<String> seenProperties = new HashSet<>();
         for (Sort.Order order : effectiveSort) {
             if (!SORTABLE_BOOKING_PROPERTIES.contains(order.getProperty())) {
-                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                throw BusinessException.withUserInput(HttpStatus.BAD_REQUEST,
                         "Unsupported sort property: " + order.getProperty());
             }
             if (!seenProperties.add(order.getProperty())) {
-                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                throw BusinessException.withUserInput(HttpStatus.BAD_REQUEST,
                         "Duplicate sort property: " + order.getProperty());
             }
         }
@@ -1674,6 +1690,7 @@ public class BookingService {
                 .map(byId::get)
                 .filter(Objects::nonNull)
                 .map(p -> toDetailResponse(p, labels, now))
+                .map(withCategoryLabel(categoryLabelResolver.displayNamesIncludingHidden()))
                 .toList();
         return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }
@@ -1875,6 +1892,7 @@ public class BookingService {
                             // review exists".
                             null);
                 })
+                .map(withCategoryLabel(categoryLabelResolver.displayNamesIncludingHidden()))
                 .toList();
         return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }

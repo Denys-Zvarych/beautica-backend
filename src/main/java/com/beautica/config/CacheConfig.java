@@ -829,6 +829,14 @@ public class CacheConfig {
                         .maximumSize(200)
                         .expireAfterWrite(60, TimeUnit.MINUTES)
                         .build());
+        // B504 (track D18) — APPROVED categories incl. hidden ones (PlatformCategoryOrderLookup
+        // #getApprovedIncludingHidden): labels + group order for services under a hidden category. Same
+        // reference-data shape and bounds as platform-category-order; emptied by CatalogCacheEvictor.
+        manager.registerCustomCache("platform-category-labels",
+                Caffeine.newBuilder()
+                        .maximumSize(200)
+                        .expireAfterWrite(60, TimeUnit.MINUTES)
+                        .build());
         assertCustomRegistration(manager, ClientPassportService.CLIENT_PASSPORT_CACHE);
         // Same treatment for user-profile: it is written by four services across three feature
         // packages via UserProfileCacheEvictor, which resolves the cache through

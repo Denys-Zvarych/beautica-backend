@@ -856,7 +856,7 @@ class ServiceCatalogServiceCatalogTest {
 
     private void stubBookable(UUID salonId, List<MasterServiceAssignment> candidates,
             Map<UUID, List<MasterServiceAssignment>> byMaster) {
-        when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());
+        when(platformCategoryOrderLookup.getApprovedIncludingHidden()).thenReturn(List.of());
         when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(candidates);
         when(slotCalculationService.filterBookableAssignmentsBatch(any())).thenReturn(byMaster);
     }

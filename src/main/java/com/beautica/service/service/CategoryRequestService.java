@@ -2,6 +2,8 @@ package com.beautica.service.service;
 
 import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.CatalogRequestConflictException;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
@@ -173,6 +175,9 @@ public class CategoryRequestService {
                     condition = APPROVED_ONLY),
             @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY,
                     condition = APPROVED_ONLY),
+            // B504 (D18): the label list now also backs the salon-catalogue group order + names.
+            @CacheEvict(value = PlatformCategoryOrderLookup.LABELS_CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY,
+                    condition = APPROVED_ONLY),
             @CacheEvict(value = SearchSuggestionCatalogue.CACHE_NAME, allEntries = true,
                     condition = APPROVED_ONLY)
     })
@@ -200,6 +205,63 @@ public class CategoryRequestService {
         return decide(rawToken, false, reason);
     }
 
+    /** B502 — the editable fields before and after a portal edit (for the caller's audit row). */
+    public record NameChange(String displayNameBefore, String displayNameAfter,
+                             String initialServiceNameBefore, String initialServiceNameAfter) {}
+
+    /**
+     * B502 (SVC-55) — the platform operator corrects the requested display name (and optionally the carried initial
+     * service name) while the request is PENDING. The wire {@code name} never changes (track D4); the outstanding
+     * email token stays valid (track D2). The display name follows the service-name rules (SVC-07 allow-list, SVC-08
+     * 100 chars, {@code ServiceCatalogService.canonicalName}); the initial service name goes through the suggestion
+     * validator it eventually feeds ({@code canonicalSuggestedName}). {@code initialServiceName}: {@code null} keeps
+     * the current value, a blank string clears it. Pending rows are not cached, so nothing is evicted.
+     *
+     * @throws NotFoundException               no category row with this id
+     * @throws CatalogRequestConflictException {@code REQUEST_NOT_PENDING} when the row is not a PENDING request
+     */
+    @Transactional
+    public NameChange editPendingName(Long categoryId, String rawDisplayName, String rawInitialServiceName) {
+        PlatformCategory category = platformCategoryRepository.findByIdForUpdate(categoryId)
+                .orElseThrow(() -> new NotFoundException("Request not found"));
+        if (!category.isPending()) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING);
+        }
+        String displayName = ServiceCatalogService.canonicalName(rawDisplayName);
+        if (displayName == null || displayName.isEmpty()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Name is required");
+        }
+        String initialBefore = category.getInitialServiceName();
+        String initialAfter = resolveInitialServiceName(rawInitialServiceName, initialBefore);
+        String displayBefore = category.getDisplayName();
+        category.editPendingRequest(displayName, initialAfter);
+        flushEdit(category);
+        return new NameChange(displayBefore, displayName, initialBefore, initialAfter);
+    }
+
+    /**
+     * Flushes now (same as the suggestion edit) so a constraint violation surfaces inside the service: a
+     * {@value #NAME_UNIQUE_CONSTRAINT} hit maps to the request 409 instead of a 500 at commit. The wire name is never
+     * changed here, so that branch is defensive.
+     */
+    private void flushEdit(PlatformCategory category) {
+        try {
+            platformCategoryRepository.saveAndFlush(category);
+        } catch (DataIntegrityViolationException ex) {
+            if (isNameUniqueViolation(ex)) {
+                throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.DUPLICATE_PENDING);
+            }
+            throw ex;
+        }
+    }
+
+    private static String resolveInitialServiceName(String raw, String current) {
+        if (raw == null) {
+            return current;
+        }
+        return raw.isBlank() ? null : ServiceCatalogService.canonicalSuggestedName(raw);
+    }
+
     /**
      * Approved + active categories for the authenticated mobile picker.
      *
@@ -218,9 +280,12 @@ public class CategoryRequestService {
      * ServiceCatalogService#buildCategoryOrderAndNames} with the same {@code findApprovedActive()}
      * query result, kept as a separate cache/bean because it returns entities for internal
      * ordering rather than the {@link ApprovedCategoryResponse} DTO this method exposes.
+     *
+     * <p>{@code sync = true} (B503): one hot platform-wide key, so a TTL expiry or an approve's eviction loads it once
+     * instead of once per concurrent picker.
      */
     @Transactional(readOnly = true)
-    @Cacheable(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY)
+    @Cacheable(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY, sync = true)
     public List<ApprovedCategoryResponse> listApproved() {
         return platformCategoryRepository.findApprovedActive().stream()
                 .map(ApprovedCategoryResponse::from)
@@ -242,7 +307,52 @@ public class CategoryRequestService {
         if (isExpired(category)) {
             return DecisionOutcome.INVALID_OR_EXPIRED;
         }
+        return decide(category, approve, reason);
+    }
 
+    /**
+     * B503 (SVC-06) — the platform operator approves the category request from the catalog portal. Same outcome as
+     * the email link: it runs the SAME {@link #decide(PlatformCategory, boolean, String)} (APPROVED + active, the
+     * carried initial-service suggestion, in-app item, decision e-mail) and clears the email token, so a later link
+     * click shows «already decided». The row is locked ({@code FOR UPDATE}, the lock B502's edit and the token path
+     * take), so the first decision wins. Token expiry does not apply: it bounds the e-mailed link, not the request.
+     *
+     * <p>No cache annotation here: the caller ({@code CatalogRequestAdminService}) runs this inside its own
+     * transaction and calls {@code CatalogCacheEvictor.evictAll()} after commit, a superset of {@link #approve}'s
+     * evict set; a nested {@code @CacheEvict} would fire before that outer commit (Anti-Bug §F-2).
+     *
+     * @throws NotFoundException               no category row with this id
+     * @throws CatalogRequestConflictException {@code REQUEST_NOT_PENDING} when the row is not a PENDING request
+     */
+    @Transactional
+    public DecisionOutcome approveById(Long categoryId) {
+        return decide(lockPendingById(categoryId), true, null);
+    }
+
+    /**
+     * B503 — portal reject; see {@link #approveById}. {@code reason} is already cleaned and length-checked by the
+     * caller ({@code DecisionReason}, the email path's rules); {@code null} when none.
+     */
+    @Transactional
+    public DecisionOutcome rejectById(Long categoryId, String reason) {
+        return decide(lockPendingById(categoryId), false, reason);
+    }
+
+    private PlatformCategory lockPendingById(Long categoryId) {
+        PlatformCategory category = platformCategoryRepository.findByIdForUpdate(categoryId)
+                .orElseThrow(() -> new NotFoundException("Request not found"));
+        if (!category.isPending()) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING);
+        }
+        return category;
+    }
+
+    /**
+     * The ONE decision for a locked PENDING request, shared by the email-link path ({@link #approve} /
+     * {@link #reject}) and the portal path ({@link #approveById} / {@link #rejectById}) — B503 D1. B541 adds its
+     * approve-branch check here.
+     */
+    private DecisionOutcome decide(PlatformCategory category, boolean approve, String reason) {
         OffsetDateTime now = OffsetDateTime.now(clock);
         if (approve) {
             category.approve(now);
@@ -330,7 +440,7 @@ public class CategoryRequestService {
     }
 
     private static BusinessException duplicateCategory(String name) {
-        return new BusinessException(HttpStatus.CONFLICT, DUPLICATE_CATEGORY_MESSAGE_PREFIX + name);
+        return BusinessException.withUserInput(HttpStatus.CONFLICT, DUPLICATE_CATEGORY_MESSAGE_PREFIX + name);
     }
 
     /** Blank or null becomes {@code null}; otherwise the trimmed value. */

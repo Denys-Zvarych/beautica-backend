@@ -172,6 +172,19 @@ public class ServiceTypeSuggestion {
         return this.status == ServiceTypeSuggestionStatus.PENDING;
     }
 
+    /**
+     * B502 (SVC-55) — corrects the suggested name of a PENDING suggestion. The token stays valid (track D2): the
+     * emailed link then approves the corrected name. Caller has already validated and canonicalised the name.
+     *
+     * @throws IllegalStateException when the suggestion is no longer PENDING (the service checks first)
+     */
+    public void renamePending(String canonicalName) {
+        if (!isPending()) {
+            throw new IllegalStateException("Only a PENDING suggestion can be renamed");
+        }
+        this.suggestedName = canonicalName;
+    }
+
     private void clearToken() {
         this.tokenHash = null;
         this.tokenExpiresAt = null;

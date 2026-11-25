@@ -197,7 +197,8 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
 
         assertThat(keys(body)).isEqualTo(ROOT_KEYS);
         assertThat(keys(body.path("services").get(0)))
-                .isEqualTo(Set.of("id", "name", "durationMinutes", "priceFrom", "category"));
+                // B504 (track D18) added categoryDisplayName (the category label, hidden categories included).
+                .isEqualTo(Set.of("id", "name", "durationMinutes", "priceFrom", "category", "categoryDisplayName"));
         assertThat(keys(body.path("categories").get(0))).isEqualTo(Set.of("id", "name", "key"));
         assertThat(keys(body.path("ratingDistribution").get(0))).isEqualTo(Set.of("rating", "count"));
         assertThat(keys(body.path("portfolio").get(0)))

@@ -403,7 +403,7 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
     }
 
     // =========================================================================
-    // 7. Partial B-tree index for category filtering
+    // 7. B-tree index for category filtering (V73 partial; a FULL index of the same name since V265, B504)
     // =========================================================================
 
     @Nested
@@ -422,6 +422,21 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
             assertThat(indexes)
                     .as("idx_service_types_platform_category must exist for fast category filtering")
                     .containsExactly("idx_service_types_platform_category");
+        }
+
+        @Test
+        @DisplayName("V265 — idx_service_types_platform_category is a FULL btree on platform_category_name (no WHERE)")
+        void should_beFullIndexOnPlatformCategoryName_when_v265Applied() {
+            String indexDef = jdbcTemplate.queryForObject(
+                    "SELECT indexdef FROM pg_indexes "
+                    + "WHERE tablename = 'service_types' "
+                    + "  AND indexname = 'idx_service_types_platform_category'",
+                    String.class);
+
+            assertThat(indexDef)
+                    .as("the hidden-inclusive admin reads (B504) need the index without V73's is_active predicate")
+                    .endsWith("USING btree (platform_category_name)")
+                    .doesNotContainIgnoringCase(" WHERE ");
         }
     }
 

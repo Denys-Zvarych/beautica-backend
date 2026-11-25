@@ -1,8 +1,11 @@
 package com.beautica.service.repository;
 
+import com.beautica.common.repository.TransactionLockTimeout;
 import com.beautica.service.entity.ServiceType;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -11,7 +14,8 @@ import java.util.Optional;
 import java.util.UUID;
 
 /**
- * Read-only repository for service type catalog data.
+ * Repository for service type catalog data: read-only for the apps; the B504 catalog-admin rename / hide / unhide
+ * writes through {@link #findByIdForUpdate}.
  *
  * <p>Auth policy: {@code GET /api/v1/service-types} (list and search) is declared
  * {@code permitAll()} in {@code SecurityConfig} — repository query methods here must not
@@ -19,7 +23,7 @@ import java.util.UUID;
  * endpoint requires {@code SALON_OWNER}, {@code INDEPENDENT_MASTER}, or {@code SALON_ADMIN}
  * roles, enforced at the controller layer via {@code @PreAuthorize}.
  */
-public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID> {
+public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID>, TransactionLockTimeout {
 
     /**
      * @deprecated No JOIN FETCH — accessing {@code category} fields on returned entities
@@ -126,8 +130,8 @@ public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID> 
      * <p>The match is case-sensitive against the canonical uppercase slugs stored
      * in {@code platform_categories.name} (e.g. {@code EYELASH}, {@code HAIR}).
      *
-     * <p>Backed by the partial B-tree index
-     * {@code idx_service_types_platform_category WHERE is_active = TRUE} from V73.
+     * <p>Backed by the B-tree index {@code idx_service_types_platform_category} (V73 partial on
+     * {@code is_active = TRUE}; FULL since V265, B504, so hidden-inclusive admin reads use it too).
      *
      * <p>Phase doc specified "display order" but no {@code display_order} column
      * exists on {@code service_types} — ordering falls back to {@code nameUk ASC},
@@ -169,4 +173,58 @@ public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID> 
             """)
     Optional<ServiceType> findFirstActiveByPlatformCategoryNameAndNameUkIgnoreCase(
             @Param("categoryName") String categoryName, @Param("nameUk") String nameUk);
+
+    /**
+     * B504 — the type a catalog-admin rename / hide / unhide mutates, row-locked so two concurrent portal writes on one
+     * type serialise. Hibernate 6 renders {@code PESSIMISTIC_WRITE} on PostgreSQL as {@code FOR NO KEY UPDATE} (not
+     * {@code FOR UPDATE}); that conflicts with itself, which is all edit-vs-edit needs (the key {@code id} never
+     * changes). It does NOT block the {@code FOR KEY SHARE} of an FK check, so it cannot fence a concurrent service
+     * insert — the B505 delete uses {@link #findByIdForDelete}. No graph: the write reads only plain columns.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select t from ServiceType t where t.id = :id")
+    Optional<ServiceType> findByIdForUpdateNoLockTimeout(@Param("id") UUID id);
+
+    /** {@link #findByIdForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default Optional<ServiceType> findByIdForUpdate(UUID id) {
+        applyTransactionLockTimeout();
+        return findByIdForUpdateNoLockTimeout(id);
+    }
+
+    /**
+     * B504 — true when ANOTHER type in the category already has this {@code nameUk} (case-insensitive). {@code
+     * activeOnly = false} counts hidden types too (the rename rule); {@code true} only active ones (the unhide rule).
+     */
+    @Query("""
+            SELECT COUNT(t) > 0 FROM ServiceType t
+             WHERE t.platformCategoryName = :categoryName
+               AND LOWER(t.nameUk) = LOWER(:nameUk)
+               AND t.id <> :excludeId
+               AND (:activeOnly = false OR t.active = true)
+            """)
+    boolean existsOtherInCategoryByNameUkIgnoreCase(@Param("categoryName") String categoryName,
+                                                    @Param("nameUk") String nameUk,
+                                                    @Param("excludeId") UUID excludeId,
+                                                    @Param("activeOnly") boolean activeOnly);
+
+    /**
+     * B505 (SVC-57) — every type under the category, hidden ones included; the catalog-admin delete refuses a category
+     * with any (V73 FK RESTRICT is the backstop). Backed by the full {@code idx_service_types_platform_category} (V265).
+     */
+    @Query("SELECT COUNT(t) FROM ServiceType t WHERE t.platformCategoryName = :categoryName")
+    long countAllByPlatformCategoryName(@Param("categoryName") String categoryName);
+
+    /**
+     * B505 — the type a catalog-admin DELETE removes, locked with a real {@code FOR UPDATE} (native on purpose; see
+     * {@code PlatformCategoryRepository#findByNameForDeleteNoLockTimeout}): a concurrent service-definition insert on
+     * this type (V111 FK, {@code FOR KEY SHARE}) either commits before the usage count or waits and then fails its FK.
+     */
+    @Query(value = "SELECT st.* FROM service_types st WHERE st.id = :id FOR UPDATE", nativeQuery = true)
+    Optional<ServiceType> findByIdForDeleteNoLockTimeout(@Param("id") UUID id);
+
+    /** {@link #findByIdForDeleteNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default Optional<ServiceType> findByIdForDelete(UUID id) {
+        applyTransactionLockTimeout();
+        return findByIdForDeleteNoLockTimeout(id);
+    }
 }

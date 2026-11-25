@@ -4,6 +4,7 @@ import com.beautica.config.TestAsyncConfig;
 import com.beautica.config.TestPoolSessionResetConfig;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.service.EmailNotificationService;
+import com.beautica.service.service.PlatformCategoryLabelResolver;
 import com.beautica.support.LocalityTestLookup;
 import com.beautica.support.SlowTestExtension;
 import com.beautica.support.TestHttpClients;
@@ -56,6 +57,20 @@ public abstract class AbstractIntegrationTest {
 
     @Autowired
     private TestRestTemplate baseRestTemplate;
+
+    @Autowired
+    private PlatformCategoryLabelResolver categoryLabelResolver;
+
+    /**
+     * B504 (track D18) — fills the {@code platform-category-labels} cache that {@link #cleanDb()} cleared, the way it is
+     * warm in production (60-min TTL, evicted only by catalog-admin writes). Booking reads resolve
+     * {@code categoryDisplayName} through it once per request; a statement-count test that measures a cold first read
+     * would charge that one-per-hour lookup to the request under test. Call from a subclass {@code @BeforeEach}, never
+     * between the two reads being compared.
+     */
+    protected final void warmCategoryLabelCache() {
+        categoryLabelResolver.displayNamesIncludingHidden();
+    }
 
     @AfterEach
     protected void cleanDb() {
@@ -145,6 +160,10 @@ public abstract class AbstractIntegrationTest {
         jdbcTemplate.execute("DELETE FROM users");
         // Phase 368 (V195): singleton environment stamp; no FK. Only staging/prod boots write it.
         jdbcTemplate.execute("DELETE FROM deployment_environment");
+        // B501 (V264): catalog_admin_audit has no FK either way (polymorphic target). Its append-only row trigger
+        // rejects DELETE, and row triggers do not fire on TRUNCATE, so it is TRUNCATEd here so audit rows never leak
+        // between tests (§O-7).
+        jdbcTemplate.execute("TRUNCATE catalog_admin_audit");
 
         cacheManager.getCacheNames().forEach(name -> {
             var cache = cacheManager.getCache(name);

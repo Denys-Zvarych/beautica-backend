@@ -1024,7 +1024,7 @@ public class ServiceCatalogService {
         Set<String> selectable = Set.copyOf(platformCategoryRepository.findSelectableNamesIn(requested));
         for (String category : requested) {
             if (!selectable.contains(category)) {
-                throw new BusinessException(HttpStatus.BAD_REQUEST, "Unknown category: " + category);
+                throw BusinessException.withUserInput(HttpStatus.BAD_REQUEST, "Unknown category: " + category);
             }
         }
     }
@@ -1242,7 +1242,9 @@ public class ServiceCatalogService {
      * {@code ""} so callers can default it to the type name.
      */
     @Nullable
-    private static String canonicalName(@Nullable String name) {
+    // Package-private (B502): CategoryRequestService.editPendingName reuses it for a request's display name.
+    // B504: PlatformCatalogEditService reuses it for a live category display name and a type nameUk / nameEn.
+    static String canonicalName(@Nullable String name) {
         String canonical = normaliseNameForm(name);
         if (canonical == null) {
             return null;
@@ -1296,6 +1298,7 @@ public class ServiceCatalogService {
                 .findByMasterIdAndIsActiveTrueWithGraph(masterId, PageRequest.of(0, 200))
                 .stream()
                 .map(MasterServiceResponse::from)
+                .map(withCategoryLabels(categoryDisplayNames()))
                 .toList();
     }
 
@@ -1322,6 +1325,7 @@ public class ServiceCatalogService {
                 .findByMasterIdAndIsActiveTrueWithGraph(master.getId(), PageRequest.of(0, 200))
                 .stream()
                 .map(MasterServiceResponse::from)
+                .map(withCategoryLabels(categoryDisplayNames()))
                 .toList();
     }
 
@@ -1424,6 +1428,7 @@ public class ServiceCatalogService {
                 .findByMasterIdAndIsActiveTrueWithGraph(masterId, pageable)
                 .stream()
                 .map(MasterServiceResponse::from)
+                .map(withCategoryLabels(categoryDisplayNames()))
                 .toList();
 
         if (pageable.getPageNumber() == 0 && services.size() == pageable.getPageSize()) {
@@ -1660,7 +1665,9 @@ public class ServiceCatalogService {
     private ServiceType resolvePatchServiceType(ServiceDefinition definition,
             UpdateServiceDefinitionRequest request) {
 
-        if (request.category() != null) {
+        // B504 (SVC-56, track D4): re-sending the service's CURRENT category is not new use, so a category the
+        // operator has since hidden does not block editing an existing service (the mobile edit form re-sends it).
+        if (request.category() != null && !request.category().equals(definition.getCategory())) {
             validateCategoryActive(request.category());
         }
         String effectiveCategory =
@@ -1680,7 +1687,10 @@ public class ServiceCatalogService {
                         "service type does not belong to the selected category");
             }
         } else {
-            serviceType = resolveServiceType(request.serviceTypeId(), effectiveCategory);
+            // B504 (D4): the service's CURRENT type may be re-sent even when hidden; any other type must be active.
+            ServiceType existing = definition.getServiceType();
+            boolean keepsCurrentType = existing != null && request.serviceTypeId().equals(existing.getId());
+            serviceType = resolveServiceType(request.serviceTypeId(), effectiveCategory, !keepsCurrentType);
         }
 
         assertPatchKeepsCopyUnique(definition, request, serviceType);
@@ -1895,7 +1905,8 @@ public class ServiceCatalogService {
                         categoryDisplayNames.getOrDefault(e.getKey(), e.getKey()),
                         e.getValue().size(),
                         e.getValue().stream()
-                                .map(sd -> priceForSalonCatalogue(sd, bookableByDefinition.get(sd.getId())))
+                                .map(sd -> priceForSalonCatalogue(sd, bookableByDefinition.get(sd.getId()))
+                                        .withCategoryDisplayName(categoryDisplayNames.get(e.getKey())))
                                 .toList()))
                 .toList();
 
@@ -2059,7 +2070,7 @@ public class ServiceCatalogService {
      * {@code buildCategoryOrderAndNames()}'s return shape — the ordinal-position map used to
      * sort {@link #getSalonServiceCatalog} groups, and the sibling {@code name -> displayName}
      * map used to resolve the human-readable category header. Both are derived from a single
-     * pass over the same {@link PlatformCategoryOrderLookup#getApprovedActive()} list so the
+     * pass over the same {@link PlatformCategoryOrderLookup#getApprovedIncludingHidden()} list so the
      * cached lookup is not queried twice per request.
      */
     private record CategoryOrderAndNames(Map<String, Integer> order, Map<String, String> displayNames) {
@@ -2091,8 +2102,23 @@ public class ServiceCatalogService {
      * {@code @Cacheable} method would not intercept via the AOP proxy on this self-invocation
      * (same caveat documented on {@link #searchServiceTypes}), hence the separate bean.
      */
+    /**
+     * B504 (track D18) — {@code category -> displayName} for every APPROVED category, hidden ones included; one cached
+     * list read per call, so a read path calls it ONCE and applies the map to every row.
+     */
+    private Map<String, String> categoryDisplayNames() {
+        return buildCategoryOrderAndNames().displayNames();
+    }
+
+    private static java.util.function.UnaryOperator<MasterServiceResponse> withCategoryLabels(
+            Map<String, String> displayNames) {
+        return response -> response.withCategoryDisplayName(displayNames);
+    }
+
     private CategoryOrderAndNames buildCategoryOrderAndNames() {
-        List<PlatformCategory> approved = platformCategoryOrderLookup.getApprovedActive();
+        // B504 (D18): hidden categories included, so existing services under one keep their display name and
+        // sort by it (D4); every active category keeps its relative order. Rejected / unknown codes still fall back.
+        List<PlatformCategory> approved = platformCategoryOrderLookup.getApprovedIncludingHidden();
         Map<String, Integer> order = new LinkedHashMap<>();
         Map<String, String> displayNames = new LinkedHashMap<>();
         for (int i = 0; i < approved.size(); i++) {
@@ -2181,7 +2207,9 @@ public class ServiceCatalogService {
      * and the strip empties it, so the blank check re-runs here (400, never a blank row). Re-checks
      * the 255-char column cap (NFKC can lengthen) and the post-normalisation allow-list.
      */
-    private static String canonicalSuggestedName(@Nullable String name) {
+    // Package-private (B502): the SAME validator for the portal's suggested-name edit
+    // (ServiceTypeSuggestionService.editPendingName) and a category request's initial service name.
+    static String canonicalSuggestedName(@Nullable String name) {
         String canonical = normaliseNameForm(name);
         if (canonical == null || canonical.isEmpty()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Name is required");
@@ -3129,7 +3157,7 @@ public class ServiceCatalogService {
         // self-service requests and REJECTED rows must never pass this gate.
         if (!platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
                 category, com.beautica.service.entity.PlatformCategoryStatus.APPROVED)) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST, "Unknown category: " + category);
+            throw BusinessException.withUserInput(HttpStatus.BAD_REQUEST, "Unknown category: " + category);
         }
     }
 
@@ -3152,11 +3180,21 @@ public class ServiceCatalogService {
      */
     @Nullable
     private ServiceType resolveServiceType(@Nullable UUID serviceTypeId, String targetCategory) {
+        return resolveServiceType(serviceTypeId, targetCategory, true);
+    }
+
+    /**
+     * {@link #resolveServiceType(UUID, String)} with the active check optional: {@code requireActive = false} only for
+     * a PATCH that re-sends the service's own current type (B504, D4 — a hidden type keeps existing services editable).
+     * The cross-category guard always runs.
+     */
+    @Nullable
+    private ServiceType resolveServiceType(@Nullable UUID serviceTypeId, String targetCategory, boolean requireActive) {
         if (serviceTypeId == null) {
             return null;
         }
         ServiceType type = serviceTypeLookup.getById(serviceTypeId);
-        if (!type.isActive()) {
+        if (requireActive && !type.isActive()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Service type is not active");
         }
         // Phase 16.3 cross-field guard: a present serviceTypeId must belong to the same

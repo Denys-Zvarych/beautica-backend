@@ -603,8 +603,8 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("handleBusiness — internal message is emitted at DEBUG level for server-side triage")
-    void should_emitDebugLog_when_businessExceptionThrown() {
+    @DisplayName("handleBusiness — a 409's internal message is emitted at WARN for server-side triage (phase 500)")
+    void should_emitWarnLog_when_conflictBusinessExceptionThrown() {
         // Arrange
         String internalMessage = "Owner master profile already exists in a different salon";
         var ex = new ConflictException(internalMessage);
@@ -613,15 +613,15 @@ class GlobalExceptionHandlerTest {
         // Act
         handler.handleBusiness(ex);
 
-        // Assert — exactly one DEBUG event containing the internal message
-        List<ILoggingEvent> debugEvents = listAppender.list.stream()
-                .filter(e -> e.getLevel() == Level.DEBUG)
+        // Assert — exactly one WARN event containing the internal message
+        List<ILoggingEvent> warnEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
                 .toList();
-        assertThat(debugEvents)
-                .as("handleBusiness must emit exactly one DEBUG log for server-side triage")
+        assertThat(warnEvents)
+                .as("handleBusiness must emit exactly one WARN log for a 409")
                 .hasSize(1);
-        assertThat(debugEvents.get(0).getFormattedMessage())
-                .as("DEBUG log must contain the original internal message")
+        assertThat(warnEvents.get(0).getFormattedMessage())
+                .as("WARN log must contain the original internal message")
                 .contains(internalMessage);
     }
 
@@ -1304,6 +1304,41 @@ class GlobalExceptionHandlerTest {
         assertThat(response.getBody().message())
                 .as("the cap's own copy, not handleBusiness's genericised CONFLICT message")
                 .isEqualTo("Portfolio photo limit reached");
+    }
+
+    // ── catalog-admin request edit (B502) ──────────────────────────────────────
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(CatalogRequestConflictException.Code.class)
+    @DisplayName("handleCatalogRequestConflict — 409 with the code under data.code and a fixed message")
+    void should_return409WithCatalogRequestCode_when_catalogRequestEditRefused(
+            CatalogRequestConflictException.Code code) {
+        var ex = new CatalogRequestConflictException(code);
+
+        ResponseEntity<ApiResponse<CatalogRequestConflictResponse>> response = handler.handleCatalogRequestConflict(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().data().code()).isEqualTo(code.name());
+        assertThat(response.getBody().errors()).as("the code lives in data, errors stays absent").isNull();
+        assertThat(response.getBody().message())
+                .as("fixed copy, never ex.getMessage()")
+                .isNotEqualTo(ex.getMessage())
+                .isNotBlank();
+    }
+
+    @Test
+    @DisplayName("handleCatalogRequestConflict — a fixed wireMessage override replaces the per-code text; data.code kept")
+    void should_useWireMessage_when_catalogConflictCarriesOverride() {
+        var ex = CatalogRequestConflictException.withFixedMessages(
+                CatalogRequestConflictException.Code.DUPLICATE_PENDING,
+                GlobalExceptionHandler.GENERIC_CONFLICT_MESSAGE, "internal text");
+
+        ResponseEntity<ApiResponse<CatalogRequestConflictResponse>> response = handler.handleCatalogRequestConflict(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().data().code()).isEqualTo("DUPLICATE_PENDING");
+        assertThat(response.getBody().message()).isEqualTo("Request could not be completed due to a conflict");
     }
 
     // ── guest reschedule cap (Phase 431, D4b) ──────────────────────────────────

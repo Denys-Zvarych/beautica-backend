@@ -3,6 +3,8 @@ package com.beautica.service.service;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.CatalogRequestConflictException;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
@@ -624,5 +626,78 @@ class CategoryRequestServiceTest {
         assertThat(service.approve(RAW_TOKEN)).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
 
         verifyNoInteractions(notificationOutboxService);
+    }
+
+    // ── editPendingName (B502) ─────────────────────────────────────────────────
+
+    private PlatformCategory lockedPending(long id, String initialServiceName) {
+        PlatformCategory category = pendingCategory(
+                OffsetDateTime.now(Clock.fixed(NOW, ZoneOffset.UTC)).plusDays(3), UUID.randomUUID(), initialServiceName);
+        when(platformCategoryRepository.findByIdForUpdate(id)).thenReturn(Optional.of(category));
+        return category;
+    }
+
+    @Test
+    @DisplayName("should_editDisplayNameAndKeepWireNameAndInitial_when_pendingAndInitialAbsent")
+    void should_editDisplayNameAndKeepWireNameAndInitial_when_pendingAndInitialAbsent() {
+        PlatformCategory category = lockedPending(7L, "Френч");
+
+        CategoryRequestService.NameChange change = service.editPendingName(7L, " Нейл  арт ", null);
+
+        assertThat(change).isEqualTo(new CategoryRequestService.NameChange("Нейл-арт", "Нейл арт", "Френч", "Френч"));
+        assertThat(category.getDisplayName()).isEqualTo("Нейл арт");
+        assertThat(category.getName()).as("wire name immutable (D4)").isEqualTo("NAIL_ART");
+        assertThat(category.getInitialServiceName()).isEqualTo("Френч");
+        assertThat(category.getTokenHash()).as("email link stays valid (D2)").isEqualTo(TOKEN_HASH);
+        verify(platformCategoryRepository).saveAndFlush(category);
+        verifyNoInteractions(emailService, inAppNotificationService, notificationOutboxService);
+    }
+
+    @Test
+    @DisplayName("should_replaceOrClearInitialServiceName_when_given")
+    void should_replaceOrClearInitialServiceName_when_given() {
+        PlatformCategory replaced = lockedPending(8L, "Френч");
+        PlatformCategory cleared = lockedPending(9L, "Френч");
+
+        service.editPendingName(8L, "Нейл-арт", "Френч  манікюр");
+        service.editPendingName(9L, "Нейл-арт", "   ");
+
+        assertThat(replaced.getInitialServiceName()).isEqualTo("Френч манікюр");
+        assertThat(cleared.getInitialServiceName()).as("blank clears").isNull();
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_categoryMissing")
+    void should_throwNotFound_when_categoryMissing() {
+        when(platformCategoryRepository.findByIdForUpdate(5L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.editPendingName(5L, "Нейл-арт", null))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    @Test
+    @DisplayName("should_throwRequestNotPending_when_categoryAlreadyApproved")
+    void should_throwRequestNotPending_when_categoryAlreadyApproved() {
+        PlatformCategory category = lockedPending(7L, null);
+        category.approve(OffsetDateTime.now(Clock.fixed(NOW, ZoneOffset.UTC)));
+
+        assertThatThrownBy(() -> service.editPendingName(7L, "Нейл арт", null))
+                .isInstanceOfSatisfying(CatalogRequestConflictException.class, ex -> assertThat(ex.getCode())
+                        .isEqualTo(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING));
+        assertThat(category.getDisplayName()).isEqualTo("Нейл-арт");
+    }
+
+    @Test
+    @DisplayName("should_throw400_when_displayNameBreaksAllowListOrIsBlank")
+    void should_throw400_when_displayNameBreaksAllowListOrIsBlank() {
+        PlatformCategory category = lockedPending(7L, null);
+
+        assertThatThrownBy(() -> service.editPendingName(7L, "Нейл \u2764", null))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
+        assertThatThrownBy(() -> service.editPendingName(7L, "\u00A0 ", null))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
+        assertThat(category.getDisplayName()).isEqualTo("Нейл-арт");
     }
 }

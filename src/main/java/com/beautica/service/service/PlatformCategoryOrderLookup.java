@@ -39,6 +39,8 @@ class PlatformCategoryOrderLookup {
     static final String CACHE_NAME = "platform-category-order";
     /** Constant key — the approved+active list is platform-wide, not per-caller. */
     static final String CACHE_KEY = "'all'";
+    /** B504 (track D18) — cache of {@link #getApprovedIncludingHidden()}; same constant key. */
+    static final String LABELS_CACHE_NAME = "platform-category-labels";
 
     private final PlatformCategoryRepository platformCategoryRepository;
 
@@ -54,5 +56,16 @@ class PlatformCategoryOrderLookup {
     @Transactional(readOnly = true)
     List<PlatformCategory> getApprovedActive() {
         return platformCategoryRepository.findApprovedActive();
+    }
+
+    /**
+     * B504 (track D18) — APPROVED categories, hidden ones included, by display name: labels and group order for
+     * services that already use a hidden category. One hot platform-wide key, hence {@code sync = true} (D17).
+     * Emptied by {@code CatalogCacheEvictor} (portal writes) and by the approve / ops-create evict sets.
+     */
+    @Cacheable(value = LABELS_CACHE_NAME, key = CACHE_KEY, sync = true)
+    @Transactional(readOnly = true)
+    List<PlatformCategory> getApprovedIncludingHidden() {
+        return platformCategoryRepository.findApprovedIncludingHidden();
     }
 }

@@ -2,6 +2,9 @@ package com.beautica.service.service;
 
 import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.CatalogRequestConflictException;
+import com.beautica.common.exception.GlobalExceptionHandler;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
@@ -9,12 +12,14 @@ import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.service.RequestKind;
 import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.entity.ServiceTypeSuggestion;
+import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceTypeSuggestionRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Caching;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -60,8 +65,11 @@ public class ServiceTypeSuggestionService {
     static final String PENDING_DEDUP_INDEX = "ux_service_type_suggestion_pending_dedup";
     private static final String DUPLICATE_PENDING_MESSAGE = "A matching suggestion is already pending review";
     private static final String REVIEW_PATH = "/api/v1/service-types/suggestions/review?token=";
+    /** SVC-08 cap on a portal-edited suggested name (B502), re-checked after canonicalisation. */
+    private static final int MAX_EDITED_NAME_LENGTH = 100;
 
     private final ServiceTypeSuggestionRepository suggestionRepository;
+    private final PlatformCategoryRepository platformCategoryRepository;
     private final TokenGenerator tokenGenerator;
     private final EmailService emailService;
     private final PublicBaseUrlProperties publicBaseUrlProperties;
@@ -109,7 +117,39 @@ public class ServiceTypeSuggestionService {
     @Transactional
     public void submitSuggestion(
             String categoryName, String suggestedName, String description, UUID requestedByUserId) {
+        lockSelectableCategory(categoryName);
         persistPendingAndNotify(categoryName, suggestedName, description, requestedByUserId);
+    }
+
+    /**
+     * B505 — takes {@code FOR SHARE} on the named category for the rest of this transaction and re-checks it is still
+     * APPROVED + active under the lock. The suggestion names its category by string only (no FK), so without this a
+     * catalog-admin delete ({@code FOR UPDATE}) running at the same moment could count zero pending suggestions and
+     * remove the category under an uncommitted one. With it the two serialise: a committed suggestion makes the delete
+     * a 409; a committed delete makes this the caller's existing 400 for an unknown category.
+     *
+     * <p>Not on {@link #submitSuggestionInternal}: that runs in REQUIRES_NEW under the category approval, whose own row
+     * lock on the same category would make this wait on its own outer transaction; the approval's lock already fences
+     * a delete.
+     *
+     * <p>Accepted cost: the share lock waits behind a portal rename / hide / decision on the same category (its
+     * {@code FOR NO KEY UPDATE} conflicts with {@code FOR SHARE}) — normally milliseconds; past the 3 s
+     * {@code lock_timeout} it is 409 {@code CATEGORY_BUSY}.
+     */
+    private void lockSelectableCategory(String categoryName) {
+        boolean selectable;
+        try {
+            selectable = platformCategoryRepository.findByNameForShare(categoryName)
+                    .filter(category -> category.isApproved() && category.isActive())
+                    .isPresent();
+        } catch (PessimisticLockingFailureException ex) {
+            // 3 s lock_timeout behind a portal write on the same category: a typed, retry-able 409 instead of the
+            // generic lock-conflict body. Nothing was written (the transaction rolls back).
+            throw categoryBusy();
+        }
+        if (!selectable) {
+            throw BusinessException.withUserInput(HttpStatus.BAD_REQUEST, "Unknown category: " + categoryName);
+        }
     }
 
     /**
@@ -177,6 +217,11 @@ public class ServiceTypeSuggestionService {
                 throw duplicatePending();
             }
             throw ex;
+        } catch (PessimisticLockingFailureException ex) {
+            // B505: the V197 unique-index wait behind an identical, still-uncommitted submit outlasted the 3 s
+            // lock_timeout the share lock set for this transaction — the same retry-able CATEGORY_BUSY as the share
+            // lock itself. Nothing was written. (Only the user path sets lock_timeout; the internal path waits.)
+            throw categoryBusy();
         }
     }
 
@@ -195,8 +240,73 @@ public class ServiceTypeSuggestionService {
         return false;
     }
 
+    /**
+     * B505 — typed {@code DUPLICATE_PENDING} (B502 convention, {@code data.code}). The exception message and the
+     * response {@code message} (the generic 409 text the provider path always returned) stay byte-identical. Still a
+     * {@code BusinessException} with status 409, so {@code CategoryRequestService}'s 409 swallow is unchanged.
+     */
     private static BusinessException duplicatePending() {
-        return new BusinessException(HttpStatus.CONFLICT, DUPLICATE_PENDING_MESSAGE);
+        return CatalogRequestConflictException.withFixedMessages(
+                CatalogRequestConflictException.Code.DUPLICATE_PENDING,
+                GlobalExceptionHandler.GENERIC_CONFLICT_MESSAGE, DUPLICATE_PENDING_MESSAGE);
+    }
+
+    private static CatalogRequestConflictException categoryBusy() {
+        return new CatalogRequestConflictException(CatalogRequestConflictException.Code.CATEGORY_BUSY);
+    }
+
+    /** B502 — the suggested name before and after a portal edit (for the caller's audit row). */
+    public record NameChange(String categoryName, String before, String after) {}
+
+    /**
+     * B502 (SVC-55) — the platform operator corrects the suggested name while the suggestion is PENDING. The name goes
+     * through the SAME validator as {@link #submitSuggestion} ({@code ServiceCatalogService.canonicalSuggestedName}:
+     * NFKC, space-collapse, SVC-07 allow-list → 400). The outstanding email token stays valid (track D2), so the link
+     * then approves the corrected name. The row is locked, so a concurrent approve/reject serialises with the edit.
+     *
+     * @throws NotFoundException               no suggestion with this id
+     * @throws CatalogRequestConflictException {@code REQUEST_NOT_PENDING} when already decided;
+     *                                         {@code DUPLICATE_PENDING} when another PENDING suggestion in the category
+     *                                         has the name (pre-check or the V197 index); {@code TYPE_EXISTS} when an
+     *                                         active service type in the category already has it
+     */
+    @Transactional
+    public NameChange editPendingName(UUID suggestionId, String rawName) {
+        ServiceTypeSuggestion suggestion = suggestionRepository.findByIdForUpdate(suggestionId)
+                .orElseThrow(() -> new NotFoundException("Request not found"));
+        if (!suggestion.isPending()) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING);
+        }
+        String name = ServiceCatalogService.canonicalSuggestedName(rawName);
+        // SVC-08 on the CANONICAL form: the DTO's @Size(max = 100) runs before NFKC, which can lengthen (ﬁ → fi),
+        // and canonicalSuggestedName only re-checks the 255 column cap.
+        if (name.length() > MAX_EDITED_NAME_LENGTH) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Name must be at most 100 characters");
+        }
+        String category = suggestion.getCategoryName();
+        if (suggestionRepository.existsOtherPendingByCategoryNameAndSuggestedNameIgnoreCase(
+                category, name, suggestionId)) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.DUPLICATE_PENDING);
+        }
+        if (promotionService.activeTypeExists(category, name)) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.TYPE_EXISTS);
+        }
+        String before = suggestion.getSuggestedName();
+        suggestion.renamePending(name);
+        flushRename(suggestion);
+        return new NameChange(category, before, name);
+    }
+
+    /** Flushes now so a lost race on {@value #PENDING_DEDUP_INDEX} is the same 409 as the pre-check, not a 500. */
+    private void flushRename(ServiceTypeSuggestion suggestion) {
+        try {
+            suggestionRepository.saveAndFlush(suggestion);
+        } catch (DataIntegrityViolationException ex) {
+            if (isPendingDedupViolation(ex)) {
+                throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.DUPLICATE_PENDING);
+            }
+            throw ex;
+        }
     }
 
     /**
@@ -273,7 +383,52 @@ public class ServiceTypeSuggestionService {
         if (isExpired(suggestion)) {
             return DecisionOutcome.INVALID_OR_EXPIRED;
         }
+        return decide(suggestion, approve, reason);
+    }
 
+    /**
+     * B503 (SVC-06) — the platform operator approves the suggestion from the catalog portal. Same outcome as the
+     * email link: it runs the SAME {@link #decide(ServiceTypeSuggestion, boolean, String)} (promotion, in-app item,
+     * decision e-mail) and clears the email token, so a later link click shows «already decided». The row is
+     * locked ({@code FOR UPDATE}, the lock B502's edit and the token path take), so the first decision wins.
+     * Token expiry does not apply: it bounds the e-mailed link, not the request.
+     *
+     * <p>No cache annotation here: the caller ({@code CatalogRequestAdminService}) runs this inside its own
+     * transaction and calls {@code CatalogCacheEvictor.evictAll()} after commit, a superset of {@link #approve}'s
+     * evict set; a nested {@code @CacheEvict} would fire before that outer commit (Anti-Bug §F-2).
+     *
+     * @throws NotFoundException               no suggestion with this id
+     * @throws CatalogRequestConflictException {@code REQUEST_NOT_PENDING} when already decided
+     */
+    @Transactional
+    public DecisionOutcome approveById(UUID suggestionId) {
+        return decide(lockPendingById(suggestionId), true, null);
+    }
+
+    /**
+     * B503 — portal reject; see {@link #approveById}. {@code reason} is already cleaned and length-checked by the
+     * caller ({@code DecisionReason}, the email path's rules); {@code null} when none.
+     */
+    @Transactional
+    public DecisionOutcome rejectById(UUID suggestionId, String reason) {
+        return decide(lockPendingById(suggestionId), false, reason);
+    }
+
+    private ServiceTypeSuggestion lockPendingById(UUID suggestionId) {
+        ServiceTypeSuggestion suggestion = suggestionRepository.findByIdForUpdate(suggestionId)
+                .orElseThrow(() -> new NotFoundException("Request not found"));
+        if (!suggestion.isPending()) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING);
+        }
+        return suggestion;
+    }
+
+    /**
+     * The ONE decision for a locked PENDING suggestion, shared by the email-link path ({@link #approve} /
+     * {@link #reject}) and the portal path ({@link #approveById} / {@link #rejectById}) — B503 D1. B541 adds its
+     * approve-branch check here.
+     */
+    private DecisionOutcome decide(ServiceTypeSuggestion suggestion, boolean approve, String reason) {
         OffsetDateTime now = OffsetDateTime.now(clock);
         if (approve) {
             suggestion.approve(now);          // flips APPROVED + clears the single-use token

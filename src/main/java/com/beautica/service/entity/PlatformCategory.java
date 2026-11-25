@@ -201,6 +201,54 @@ public class PlatformCategory {
         return this.status == PlatformCategoryStatus.PENDING;
     }
 
+    /**
+     * B502 (SVC-55) — corrects the requested display name (and, optionally, the carried initial service name) of a
+     * PENDING request. The wire {@code name} never changes (track D4). The token stays valid (track D2). Caller has
+     * already validated and canonicalised both values.
+     *
+     * @param initialServiceName the new value, {@code null} to clear it
+     * @throws IllegalStateException when the request is no longer PENDING (the service checks first)
+     */
+    public void editPendingRequest(String displayName, String initialServiceName) {
+        if (!isPending()) {
+            throw new IllegalStateException("Only a PENDING category request can be edited");
+        }
+        this.displayName = displayName;
+        this.initialServiceName = initialServiceName;
+    }
+
+    public boolean isApproved() {
+        return this.status == PlatformCategoryStatus.APPROVED;
+    }
+
+    /**
+     * B504 (SVC-56) — the platform operator renames a live category. Only the display name changes; the wire
+     * {@code name} is immutable (track D4). Caller has validated and canonicalised the value.
+     *
+     * @throws IllegalStateException when the category is not APPROVED (the service checks first)
+     */
+    public void renameDisplayName(String displayName) {
+        requireApproved();
+        this.displayName = displayName;
+    }
+
+    /**
+     * B504 (SVC-56) — hides ({@code false}) or unhides ({@code true}) a live category: a hidden one is not offered for
+     * new services; services already using it keep working (track D4).
+     *
+     * @throws IllegalStateException when the category is not APPROVED (the service checks first)
+     */
+    public void changeActive(boolean active) {
+        requireApproved();
+        this.active = active;
+    }
+
+    private void requireApproved() {
+        if (!isApproved()) {
+            throw new IllegalStateException("Only an APPROVED category can be renamed, hidden or unhidden");
+        }
+    }
+
     private void clearToken() {
         this.tokenHash = null;
         this.tokenExpiresAt = null;

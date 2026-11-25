@@ -30,6 +30,12 @@ import java.security.MessageDigest;
  * {@code /api/v1/internal} so it adds zero overhead to normal JWT-protected
  * endpoints.
  *
+ * <h2>Catalog-scoped key (B501, SVC-54)</h2>
+ * {@link InternalApiKeyProperties#getInternalCatalogKey()} is accepted in the same header, with the same
+ * constant-time compare and the same 401 body, but ONLY on paths starting {@value #CATALOG_PATH_PREFIX}. A blank
+ * catalog key disables it. A path carrying a {@code ..} segment never counts as a catalog path, so the scoped key
+ * cannot be walked out of its prefix even if a container ever handed the filter an un-normalised servlet path.
+ *
  * <h2>Security config</h2>
  * {@code /api/v1/internal/**} is declared {@code permitAll()} in
  * {@link SecurityConfig} — the JWT filter skips these paths. This filter is
@@ -41,6 +47,7 @@ public class InternalApiKeyFilter extends OncePerRequestFilter {
 
     private static final String HEADER_NAME = "X-Internal-Key";
     private static final String INTERNAL_PATH_PREFIX = "/api/v1/internal";
+    static final String CATALOG_PATH_PREFIX = "/api/v1/internal/catalog/";
 
     private final InternalApiKeyProperties internalApiKeyProperties;
     private final ObjectMapper objectMapper;
@@ -58,11 +65,11 @@ public class InternalApiKeyFilter extends OncePerRequestFilter {
 
         String suppliedKey = request.getHeader(HEADER_NAME);
 
-        String configuredKey = internalApiKeyProperties.getInternalApiKey();
+        boolean masterKeyMatches = keyMatches(suppliedKey, internalApiKeyProperties.getInternalApiKey());
+        boolean catalogKeyMatches = isCatalogPath(request.getServletPath())
+                && keyMatches(suppliedKey, internalApiKeyProperties.getInternalCatalogKey());
 
-        // Fail closed: an unset/blank configured key must never match an empty or missing header.
-        if (suppliedKey == null || configuredKey == null || configuredKey.isBlank()
-                || !ConstantTimeSecrets.matches(suppliedKey, configuredKey)) {
+        if (!masterKeyMatches && !catalogKeyMatches) {
             response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
             response.setContentType(MediaType.APPLICATION_JSON_VALUE);
             objectMapper.writeValue(response.getWriter(), ApiResponse.error("Unauthorized"));
@@ -70,5 +77,16 @@ public class InternalApiKeyFilter extends OncePerRequestFilter {
         }
 
         filterChain.doFilter(request, response);
+    }
+
+    /** Fail closed: an unset/blank configured key never matches, not even an empty or missing header. */
+    private static boolean keyMatches(String suppliedKey, String configuredKey) {
+        return suppliedKey != null && configuredKey != null && !configuredKey.isBlank()
+                && ConstantTimeSecrets.matches(suppliedKey, configuredKey);
+    }
+
+    private static boolean isCatalogPath(String servletPath) {
+        return servletPath.startsWith(CATALOG_PATH_PREFIX) && !servletPath.contains("/..")
+                && !servletPath.contains("\\");
     }
 }

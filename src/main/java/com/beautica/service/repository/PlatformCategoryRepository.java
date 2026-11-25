@@ -78,6 +78,53 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
      */
     Optional<PlatformCategory> findByName(String name);
 
+    /**
+     * B502 — the row a catalog-admin request edit mutates, locked ({@code FOR UPDATE}) so the edit serialises with a
+     * concurrent email-link approve/reject ({@link #findByTokenHashForUpdate}).
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select c from PlatformCategory c where c.id = :id")
+    Optional<PlatformCategory> findByIdForUpdateNoLockTimeout(@Param("id") Long id);
+
+    /** {@link #findByIdForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default Optional<PlatformCategory> findByIdForUpdate(Long id) {
+        applyTransactionLockTimeout();
+        return findByIdForUpdateNoLockTimeout(id);
+    }
+
+    /**
+     * B504 — the live category a catalog-admin rename / hide / unhide mutates, keyed by its immutable wire name and
+     * row-locked. Hibernate 6 renders {@code PESSIMISTIC_WRITE} on PostgreSQL as {@code FOR NO KEY UPDATE} (not
+     * {@code FOR UPDATE}). That is enough here: {@code FOR NO KEY UPDATE} conflicts with itself, so a second portal edit
+     * and a request decision (the id / token finders above, also {@code PESSIMISTIC_WRITE}) on the same row serialise,
+     * and none of them changes the key ({@code name} is immutable). It does NOT conflict with the {@code FOR KEY SHARE}
+     * an FK check takes, so it cannot fence a concurrent insert of a referencing row — the B505 delete uses
+     * {@link #findByNameForDelete} for that.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select c from PlatformCategory c where c.name = :name")
+    Optional<PlatformCategory> findByNameForUpdateNoLockTimeout(@Param("name") String name);
+
+    /** {@link #findByNameForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default Optional<PlatformCategory> findByNameForUpdate(String name) {
+        applyTransactionLockTimeout();
+        return findByNameForUpdateNoLockTimeout(name);
+    }
+
+    /**
+     * B504 — true when ANOTHER approved or pending category (hidden ones included) already shows this display name,
+     * case-insensitive; a rejected request's name never blocks. Guards a rename against two identical picker labels.
+     */
+    @Query("""
+            SELECT COUNT(pc) > 0 FROM PlatformCategory pc
+             WHERE LOWER(pc.displayName) = LOWER(:displayName)
+               AND pc.id <> :excludeId
+               AND pc.status IN (com.beautica.service.entity.PlatformCategoryStatus.APPROVED,
+                                 com.beautica.service.entity.PlatformCategoryStatus.PENDING)
+            """)
+    boolean existsOtherLiveByDisplayNameIgnoreCase(@Param("displayName") String displayName,
+                                                   @Param("excludeId") Long excludeId);
+
     /** Phase 372 — batch display-name lookup for suggestion feed items (one statement per page). */
     List<PlatformCategory> findByNameIn(Collection<String> names);
 
@@ -93,6 +140,18 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
              ORDER BY pc.displayName
             """)
     List<PlatformCategory> findApprovedActive();
+
+    /**
+     * B504 (track D18) — every APPROVED category in ANY {@code active} state, by display name: the LABEL source for
+     * services that already use a category the operator has since hidden (D4: they keep showing, under the display
+     * name, not the slug). Never a picker source — {@link #findApprovedActive()} stays that.
+     */
+    @Query("""
+            SELECT pc FROM PlatformCategory pc
+             WHERE pc.status = com.beautica.service.entity.PlatformCategoryStatus.APPROVED
+             ORDER BY pc.displayName
+            """)
+    List<PlatformCategory> findApprovedIncludingHidden();
 
     /**
      * Returns all platform categories with their usage counts from
@@ -127,5 +186,35 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
         boolean isActive();
         java.time.OffsetDateTime getCreatedAt();
         long getUsageCount();
+    }
+
+    /**
+     * B505 — the category a catalog-admin DELETE removes, locked with a real {@code FOR UPDATE} (native on purpose).
+     * Hibernate 6 renders {@code PESSIMISTIC_WRITE} on PostgreSQL as {@code FOR NO KEY UPDATE}, which does NOT conflict
+     * with the {@code FOR KEY SHARE} an FK check takes; {@code FOR UPDATE} does, so a concurrent insert of a type under
+     * this category (V73 FK) either commits before the usage count and is counted, or waits and then fails its FK.
+     */
+    @Query(value = "SELECT pc.* FROM platform_categories pc WHERE pc.name = :name FOR UPDATE", nativeQuery = true)
+    Optional<PlatformCategory> findByNameForDeleteNoLockTimeout(@Param("name") String name);
+
+    /** {@link #findByNameForDeleteNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default Optional<PlatformCategory> findByNameForDelete(String name) {
+        applyTransactionLockTimeout();
+        return findByNameForDeleteNoLockTimeout(name);
+    }
+
+    /**
+     * B505 — a shared lock ({@code FOR SHARE}, native on purpose: JPA has no portable mapping) on the category a new
+     * PENDING service-type suggestion names. It conflicts with the delete's {@code FOR UPDATE}
+     * ({@link #findByNameForDelete}), so a suggestion create and a category delete serialise: the delete counts a
+     * committed suggestion (409), or the create sees the category gone. Concurrent creates share it.
+     */
+    @Query(value = "SELECT pc.* FROM platform_categories pc WHERE pc.name = :name FOR SHARE", nativeQuery = true)
+    Optional<PlatformCategory> findByNameForShareNoLockTimeout(@Param("name") String name);
+
+    /** {@link #findByNameForShareNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default Optional<PlatformCategory> findByNameForShare(String name) {
+        applyTransactionLockTimeout();
+        return findByNameForShareNoLockTimeout(name);
     }
 }

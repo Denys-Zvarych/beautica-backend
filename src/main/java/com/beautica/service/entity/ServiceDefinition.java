@@ -68,14 +68,16 @@ import java.util.UUID;
 // @Table(indexes = ...) against the live schema, so an @Index naming a nonexistent index is silently
 // cosmetic and will never fail a boot. Only a reader can catch it — hence this note.
 //
-// Not every real index appears here: idx_service_def_category, the GIN trigram
+// Not every real index appears here: the GIN trigram
 // idx_service_definitions_name_trgm (V98) and the PARTIAL unique ux_service_def_owner_type_duration_name_active
 // (V233) are absent because JPA's @Index cannot express GIN or partial indices at all — see the class
 // javadoc above for the unique one. Absent-but-real is harmless; declared-but-absent is the drift.
 @Table(name = "service_definitions",
         indexes = {
                 @Index(name = "idx_service_def_owner_type_active", columnList = "owner_type, owner_id, is_active"),
-                @Index(name = "idx_service_def_service_type",      columnList = "service_type_id")
+                @Index(name = "idx_service_def_service_type",      columnList = "service_type_id"),
+                // V6; serves the category lookups incl. the B505 catalog-admin delete usage count.
+                @Index(name = "idx_service_def_category",          columnList = "category")
         })
 @Getter
 @Setter

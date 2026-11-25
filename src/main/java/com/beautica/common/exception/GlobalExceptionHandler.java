@@ -18,6 +18,8 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
@@ -38,12 +40,16 @@ import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
+import org.springframework.web.servlet.HandlerMapping;
 import org.springframework.web.servlet.NoHandlerFoundException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -98,6 +104,32 @@ import java.util.stream.Collectors;
 public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    /** The generic 409 text ({@link #handleBusiness}, {@link #handlePessimisticLockingFailure}); byte-stable. */
+    public static final String GENERIC_CONFLICT_MESSAGE = "Request could not be completed due to a conflict";
+
+    /** Phase 500 business 4xx line: status value, status name, HTTP method, path template, message. */
+    private static final String BUSINESS_LOG_FORMAT = "Business {} {} on {} {}: {}";
+    private static final String UNKNOWN_REQUEST_PART = "[unknown]";
+    /** Phase 500 audit — one line per throttled window: suppressed count, HTTP method, path template. */
+    private static final String BUSINESS_SUPPRESSED_FORMAT = "Business 4xx suppressed {} lines on {} {}";
+
+    private final BusinessLogThrottle businessLogThrottle;
+
+    /** Direct instantiation (standalone MockMvc / unit tests); Spring uses the {@link Clock}-bean constructor. */
+    public GlobalExceptionHandler() {
+        this(new BusinessLogThrottle(Clock.systemUTC()));
+    }
+
+    /** Spring entry point — the shared {@link Clock} bean when present (absent in some {@code @WebMvcTest} slices). */
+    @Autowired
+    public GlobalExceptionHandler(ObjectProvider<Clock> clock) {
+        this(new BusinessLogThrottle(clock.getIfAvailable(Clock::systemUTC)));
+    }
+
+    GlobalExceptionHandler(BusinessLogThrottle businessLogThrottle) {
+        this.businessLogThrottle = businessLogThrottle;
+    }
 
     /**
      * Phase 379 audit (perf LOW F1) — a retired booking link is never re-issued, so its 410 is immutable:
@@ -353,6 +385,37 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * B502 (SVC-55) — distinct 409 for a refused catalog-admin request edit: the
+     * {@link CatalogRequestConflictResponse} body carries {@code REQUEST_NOT_PENDING} / {@code DUPLICATE_PENDING} /
+     * {@code TYPE_EXISTS} (B504 adds {@code CATEGORY_NAME_EXISTS} / {@code CATEGORY_NOT_APPROVED}; B505 adds
+     * {@code CATALOG_IN_USE} with its usage counts next to the code, and {@code CATEGORY_BUSY}) under
+     * {@code data.code}, which {@link #handleBusiness}'s genericised CONFLICT branch would
+     * otherwise drop. The message is fixed here, never {@code ex.getMessage()}: the per-code text below, or the
+     * exception's fixed {@code wireMessage} constant (B505: the provider-path {@code DUPLICATE_PENDING} keeps its
+     * pre-existing generic text byte-identical). A new code; no existing body changes.
+     */
+    @ExceptionHandler(CatalogRequestConflictException.class)
+    public ResponseEntity<ApiResponse<CatalogRequestConflictResponse>> handleCatalogRequestConflict(
+            CatalogRequestConflictException ex) {
+        // Phase 500: a typed catalog 409 keeps the WARN «Business 409» line handleBusiness would have written (the
+        // provider-path DUPLICATE_PENDING was a plain BusinessException before B505). Messages are fixed constants.
+        logBusiness(ex);
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false,
+                        CatalogRequestConflictResponse.of(ex.getCode().name(), ex.getUsage()),
+                        ex.getWireMessage() != null ? ex.getWireMessage() : switch (ex.getCode()) {
+                            case REQUEST_NOT_PENDING -> "Request is no longer pending";
+                            case DUPLICATE_PENDING -> "A matching request is already pending";
+                            case TYPE_EXISTS -> "A service type with this name already exists";
+                            case CATEGORY_NAME_EXISTS -> "A category with this name already exists";
+                            case CATEGORY_NOT_APPROVED -> "Category is not approved";
+                            case CATALOG_IN_USE -> "Catalog entry is in use; hide it instead";
+                            case CATEGORY_BUSY -> "Category is being updated; please try again";
+                        }));
+    }
+
+    /**
      * Phase 431 — distinct 409 for the guest-booking reschedule cap (5 provider reschedules per guest
      * booking/visit per rolling 24 h): the {@link RescheduleLimitReachedResponse} body carries
      * {@code RESCHEDULE_LIMIT_REACHED} under {@code data.code}, which {@link #handleBusiness}'s
@@ -412,9 +475,9 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<ApiResponse<Void>> handleBusiness(BusinessException ex) {
-        log.debug("Business exception: {}", ex.getMessage());
+        logBusiness(ex);
         String clientMessage = switch (ex.getStatus()) {
-            case CONFLICT -> "Request could not be completed due to a conflict";
+            case CONFLICT -> GENERIC_CONFLICT_MESSAGE;
             case BAD_REQUEST -> "Invalid request";
             // 422 carries deliberate, user-facing domain copy (e.g. the Ukrainian
             // cancel-window-closed message in Phase 13.4) that the client must display
@@ -430,6 +493,61 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(ex.getStatus())
                 .body(ApiResponse.error(clientMessage));
+    }
+
+    /**
+     * Phase 500 — a 4xx business rejection leaves a line on prod/staging (both log {@code com.beautica} at INFO),
+     * so a user report can be traced: 409 at WARN, every other 4xx at INFO, as
+     * {@code Business {status} {code} on {METHOD} {path-template}: {message}}. Only the handler's path TEMPLATE
+     * ({@link HandlerMapping#BEST_MATCHING_PATTERN_ATTRIBUTE}) is logged, never the raw URI or query string, so
+     * tokens and ids in the path stay out of the line. WARN is below Sentry's {@code minimum-event-level: error},
+     * so no Sentry event is raised (D2).
+     *
+     * <p>5xx keeps the previous DEBUG line, and so does any message built with
+     * {@link BusinessException#withUserInput} (it interpolates caller input).
+     *
+     * <p>Audit (perf LOW): capped per {@code METHOD template} by {@link BusinessLogThrottle} — at most
+     * {@value BusinessLogThrottle#LINES_PER_WINDOW} lines a minute, then one
+     * {@code Business 4xx suppressed {n} lines on {METHOD} {template}} WARN line at the next window's first hit.
+     * The response body is unaffected.
+     */
+    private void logBusiness(BusinessException ex) {
+        HttpStatus status = ex.getStatus();
+        if (!status.is4xxClientError() || ex.messageCarriesUserInput()) {
+            log.debug("Business exception: {}", ex.getMessage());
+            return;
+        }
+        HttpServletRequest request = currentRequest();
+        String method = request != null ? request.getMethod() : UNKNOWN_REQUEST_PART;
+        String template = pathTemplateOf(request);
+        BusinessLogThrottle.Decision decision = businessLogThrottle.acquire(method, template);
+        if (decision.suppressedInPreviousWindow() > 0) {
+            log.warn(BUSINESS_SUPPRESSED_FORMAT, decision.suppressedInPreviousWindow(), method, template);
+        }
+        if (!decision.logLine()) {
+            return;
+        }
+        if (status == HttpStatus.CONFLICT) {
+            log.warn(BUSINESS_LOG_FORMAT, status.value(), status.name(), method, template, ex.getMessage());
+        } else {
+            log.info(BUSINESS_LOG_FORMAT, status.value(), status.name(), method, template, ex.getMessage());
+        }
+    }
+
+    private static HttpServletRequest currentRequest() {
+        return RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attributes
+                ? attributes.getRequest()
+                : null;
+    }
+
+    /** The matched handler's path template, or {@code [unknown]} — never the raw request URI. */
+    private static String pathTemplateOf(HttpServletRequest request) {
+        if (request == null) {
+            return UNKNOWN_REQUEST_PART;
+        }
+        return request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE) instanceof String template
+                ? template
+                : UNKNOWN_REQUEST_PART;
     }
 
     @ExceptionHandler(ResendThrottledException.class)
@@ -728,7 +846,7 @@ public class GlobalExceptionHandler {
         log.debug("Pessimistic locking failure (lock_timeout wait or deadlock): {}", ex.getClass().getSimpleName());
         return ResponseEntity
                 .status(HttpStatus.CONFLICT)
-                .body(ApiResponse.error("Request could not be completed due to a conflict"));
+                .body(ApiResponse.error(GENERIC_CONFLICT_MESSAGE));
     }
 
     /**

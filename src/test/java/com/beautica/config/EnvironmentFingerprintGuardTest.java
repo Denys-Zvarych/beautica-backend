@@ -690,6 +690,59 @@ class EnvironmentFingerprintGuardTest {
         assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
     }
 
+    // ---- B501: internal-catalog-key rule (optional; prod and staging) ----
+
+    @Test
+    @DisplayName("prod and staging with no catalog key — pass (the key is optional)")
+    void should_pass_when_catalogKeyUnset() {
+        assertThatCode(() -> run(prodEnv().withProperty("app.internal-catalog-key", ""),
+                DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+        assertThatCode(() -> run(stagingEnv().withProperty("app.internal-catalog-key", "${INTERNAL_CATALOG_KEY_UNSET}"),
+                DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod with a catalog key under 32 chars — fails, message carries no value")
+    void should_fail_when_prodCatalogKeyTooShort() {
+        String shortKey = "c".repeat(31);
+        MockEnvironment env = prodEnv().withProperty("app.internal-catalog-key", shortKey);
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("internal-catalog-key-length").message().doesNotContain(shortKey);
+    }
+
+    @Test
+    @DisplayName("prod with the catalog key equal to the master key — fails, message carries no value")
+    void should_fail_when_prodCatalogKeyEqualsMasterKey() {
+        MockEnvironment env = prodEnv().withProperty("app.internal-catalog-key", " " + VALID_KEY + " ");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("internal-catalog-key-reused").message().doesNotContain(VALID_KEY);
+    }
+
+    @Test
+    @DisplayName("staging with a short catalog key or one equal to the master key — fails (staging = prod,staging)")
+    void should_fail_when_stagingCatalogKeyShortOrReused() {
+        MockEnvironment shortKey = stagingEnv().withProperty("app.internal-catalog-key", "c".repeat(31));
+        MockEnvironment reused = stagingEnv().withProperty("app.internal-catalog-key", VALID_KEY);
+
+        assertThatThrownBy(() -> run(shortKey, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .hasMessageContaining("internal-catalog-key-length");
+        assertThatThrownBy(() -> run(reused, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .hasMessageContaining("internal-catalog-key-reused");
+    }
+
+    @Test
+    @DisplayName("prod and staging with a distinct 32-char catalog key — pass")
+    void should_pass_when_catalogKeyDistinctAndLongEnough() {
+        String catalogKey = "c".repeat(32);
+
+        assertThatCode(() -> run(prodEnv().withProperty("app.internal-catalog-key", catalogKey),
+                DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+        assertThatCode(() -> run(stagingEnv().withProperty("app.internal-catalog-key", catalogKey),
+                DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
+    }
+
     // ---- Phase 371, D6: Sentry rules ----------------------------------------------------------------
 
     private static final String EU_DSN = "https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001";

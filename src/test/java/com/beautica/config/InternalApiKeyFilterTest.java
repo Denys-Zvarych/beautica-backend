@@ -31,6 +31,11 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.ResultActions;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.util.List;
@@ -54,14 +59,16 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @TestPropertySource(properties = {
         "app.frontend.base-url=http://localhost:3000",
         "app.internal-api-key=test-internal-api-key",
+        "app.internal-catalog-key=test-internal-catalog-key-0123456789",
         "spring.main.allow-bean-definition-overriding=true"
 })
-@Import(InternalApiKeyFilterTest.TestConfig.class)
+@Import({InternalApiKeyFilterTest.TestConfig.class, InternalApiKeyFilterTest.InternalPathStubController.class})
 @DisplayName("InternalApiKeyFilter — @WebMvcTest slice")
 class InternalApiKeyFilterTest {
 
     private static final String VALID_KEY = "test-internal-api-key";
     private static final String WRONG_KEY  = "wrong-key";
+    private static final String CATALOG_KEY = "test-internal-catalog-key-0123456789";
 
     // ── Infrastructure ─────────────────────────────────────────────────────────
 
@@ -134,6 +141,7 @@ class InternalApiKeyFilterTest {
         InternalApiKeyProperties internalApiKeyProperties() {
             InternalApiKeyProperties props = new InternalApiKeyProperties();
             props.setInternalApiKey(VALID_KEY);
+            props.setInternalCatalogKey(CATALOG_KEY);
             return props;
         }
 
@@ -141,6 +149,16 @@ class InternalApiKeyFilterTest {
         InternalApiKeyFilter internalApiKeyFilter(InternalApiKeyProperties props,
                                                   ObjectMapper objectMapper) {
             return new InternalApiKeyFilter(props, objectMapper);
+        }
+    }
+
+    /** B501 — stand-in endpoints for the catalog prefix and two non-catalog internal paths. */
+    @RestController
+    static class InternalPathStubController {
+
+        @GetMapping({"/api/v1/internal/catalog/x", "/api/v1/internal/moderation/reports", "/api/v1/internal/guest-pii"})
+        String ok() {
+            return "ok";
         }
     }
 
@@ -199,5 +217,38 @@ class InternalApiKeyFilterTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data[0].name").value("MANICURE"));
+    }
+
+    // ── B501: catalog-scoped key (SVC-54) ─────────────────────────────────────
+
+    private ResultActions getWithKey(String path, String key) throws Exception {
+        return mockMvc.perform(get(path).servletPath(path).header("X-Internal-Key", key));
+    }
+
+    @Test
+    @DisplayName("catalog key opens /api/v1/internal/catalog/**")
+    void should_return200_when_catalogKeyOnCatalogPath() throws Exception {
+        getWithKey("/api/v1/internal/catalog/x", CATALOG_KEY)
+                .andExpect(status().isOk());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/api/v1/internal/moderation/reports", "/api/v1/internal/guest-pii",
+            "/api/v1/internal/service-categories"})
+    @DisplayName("catalog key gets the same 401 body on every non-catalog internal path")
+    void should_return401_when_catalogKeyOnNonCatalogPath(String path) throws Exception {
+        getWithKey(path, CATALOG_KEY)
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("Unauthorized"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/api/v1/internal/catalog/x", "/api/v1/internal/moderation/reports",
+            "/api/v1/internal/guest-pii"})
+    @DisplayName("master key still opens every internal path, the catalog prefix included")
+    void should_return200_when_masterKeyOnAnyInternalPath(String path) throws Exception {
+        getWithKey(path, VALID_KEY)
+                .andExpect(status().isOk());
     }
 }

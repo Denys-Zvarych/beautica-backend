@@ -256,6 +256,12 @@ class BookingSalonBookingsPartitionIT extends AbstractIntegrationTest {
         fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 
+    /** Statement counts are per-request; see {@link AbstractIntegrationTest#warmCategoryLabelCache()}. */
+    @BeforeEach
+    void warmCategoryLabels() {
+        warmCategoryLabelCache();
+    }
+
     /**
      * The clock bean is context-scoped and therefore shared by every test in this class, so it is
      * returned to its default FROZEN state after each one — the one test that arms it must not be able
