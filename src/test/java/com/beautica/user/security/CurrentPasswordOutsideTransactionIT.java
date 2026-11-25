@@ -18,8 +18,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 
 /**
@@ -35,6 +35,8 @@ class CurrentPasswordOutsideTransactionIT extends AbstractPhoneIdentityIT {
     private static final String PHONE_VERIFY_URL = "/api/v1/users/me/phone/otp/verify";
     private static final String EMAIL_REQUEST_URL = "/api/v1/users/me/email/request-code";
     private static final String EMAIL_VERIFY_URL = "/api/v1/users/me/email/verify";
+    /** The code mail is handed to {@code emailExecutor} after commit, so it lands after the response returns. */
+    private static final long MAIL_WAIT_MS = 5_000;
 
     @MockitoSpyBean
     private PasswordEncoder passwordEncoder;
@@ -76,7 +78,8 @@ class CurrentPasswordOutsideTransactionIT extends AbstractPhoneIdentityIT {
         String email = newEmail();
         postAs(token, EMAIL_REQUEST_URL, Map.of("email", email));
         ArgumentCaptor<String> code = ArgumentCaptor.forClass(String.class);
-        verify(emailNotificationService, atLeastOnce()).sendVerificationEmail(eq(email), code.capture());
+        verify(emailNotificationService, timeout(MAIL_WAIT_MS).atLeastOnce())
+                .sendVerificationEmail(eq(email), code.capture());
         List<Boolean> states = recordTransactionStateOnBcrypt();
 
         ResponseEntity<String> verified = postAs(token, EMAIL_VERIFY_URL,
