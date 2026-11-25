@@ -39,7 +39,6 @@ import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -900,10 +899,18 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
         assertThat(visitRows(masterGuestOk)).hasSize(1);
     }
 
-    @Test
-    @DisplayName("auth: every salon-family card/visit path (users, guests, +visits) - 401 anonymous; 403 SALON_MASTER, "
-            + "CLIENT, INDEPENDENT_MASTER, another salon's owner and admin; 200 owner and own admin")
-    void should_enforceRoleMatrixOnAllSalonPaths_when_called() throws Exception {
+    // Split per outcome (was two 32- and 25-request tests that crossed the 10 s SlowTestExtension budget under load):
+    // each test seeds the same full matrix fixture, so no 403/404 can pass merely because a row is missing.
+
+    /** Seeded state of the salon-family matrix: own salon {@code s}, foreign salon {@code t}, the four paths. */
+    private record SalonMatrix(Salon s, Salon t, String clientEmail, Independent indep, String ownAdmin,
+                               String foreignAdmin, List<String> paths) {}
+
+    /** Seeded state of the master-family matrix: user paths (both masters served), guest paths (anchor of {@code s}). */
+    private record MasterMatrix(Salon s, Independent indep, UUID indepAnchor, String clientEmail,
+                                List<String> userPaths, List<String> guestPaths) {}
+
+    private SalonMatrix salonMatrix() {
         Salon s = fx.salon();
         Salon t = fx.salon();
         UUID c = fx.client("Клієнтка", "Матриця Салону");
@@ -912,32 +919,12 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
         String clientEmail = fx.email("viewer");
         fx.user(clientEmail, "CLIENT", null, "Хтось", "Клієнт");
         Independent indep = fx.independent();
-        String ownAdmin = fx.admin(s.salonId());
-        String foreignAdmin = fx.admin(t.salonId());
-        Map<String, String> denied = new java.util.LinkedHashMap<>();
-        denied.put("SALON_MASTER", fx.token(s.masterEmail()));
-        denied.put("CLIENT", fx.token(clientEmail));
-        denied.put("INDEPENDENT_MASTER", fx.token(indep.email()));
-        denied.put("foreign SALON_OWNER", fx.token(t.ownerEmail()));
-        denied.put("foreign SALON_ADMIN", fx.token(foreignAdmin));
-        String ownerToken = fx.token(s.ownerEmail());
-        String adminToken = fx.token(ownAdmin);
         List<String> paths = List.of(userCard(s.salonId(), c), userCard(s.salonId(), c) + "/visits",
                 guestCard(s.salonId(), anchor), guestCard(s.salonId(), anchor) + "/visits");
-
-        for (String path : paths) {
-            assertThat(fx.get(null, path).getStatusCode()).as("anonymous %s", path).isEqualTo(HttpStatus.UNAUTHORIZED);
-            denied.forEach((role, tok) -> assertThat(fx.get(tok, path).getStatusCode())
-                    .as("%s on %s", role, path).isEqualTo(HttpStatus.FORBIDDEN));
-            assertThat(fx.get(ownerToken, path).getStatusCode()).as("owner %s", path).isEqualTo(HttpStatus.OK);
-            assertThat(fx.get(adminToken, path).getStatusCode()).as("own admin %s", path).isEqualTo(HttpStatus.OK);
-        }
+        return new SalonMatrix(s, t, clientEmail, indep, fx.admin(s.salonId()), fx.admin(t.salonId()), paths);
     }
 
-    @Test
-    @DisplayName("auth: every master-family card/visit path - 401 anonymous; 403 owner, admin, CLIENT; 200 SALON_MASTER "
-            + "and INDEPENDENT_MASTER")
-    void should_enforceRoleMatrixOnAllMasterPaths_when_called() throws Exception {
+    private MasterMatrix masterMatrix() {
         Salon s = fx.salon();
         UUID c = fx.client("Клієнтка", "Матриця Майстра");
         fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-5));
@@ -947,30 +934,98 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
         UUID indepAnchor = fx.guestBooking(indep.masterId(), null, GUEST_PHONE, "Гість", "Соло", "COMPLETED", fx.at(-2));
         String clientEmail = fx.email("viewer");
         fx.user(clientEmail, "CLIENT", null, "Хтось", "Клієнт");
-        Map<String, String> denied = new java.util.LinkedHashMap<>();
-        denied.put("SALON_OWNER", fx.token(s.ownerEmail()));
-        denied.put("SALON_ADMIN", fx.token(fx.admin(s.salonId())));
-        denied.put("CLIENT", fx.token(clientEmail));
-        String masterToken = fx.token(s.masterEmail());
-        String indepToken = fx.token(indep.email());
+        return new MasterMatrix(s, indep, indepAnchor, clientEmail,
+                List.of(ME_URL + "/users/" + c, ME_URL + "/users/" + c + "/visits"),
+                List.of(ME_URL + "/guests/" + anchor, ME_URL + "/guests/" + anchor + "/visits"));
+    }
 
-        for (String suffix : List.of("/users/" + c, "/users/" + c + "/visits")) {
-            String path = ME_URL + suffix;
-            assertThat(fx.get(null, path).getStatusCode()).as("anonymous %s", path).isEqualTo(HttpStatus.UNAUTHORIZED);
-            denied.forEach((role, tok) -> assertThat(fx.get(tok, path).getStatusCode())
-                    .as("%s on %s", role, path).isEqualTo(HttpStatus.FORBIDDEN));
-            assertThat(fx.get(masterToken, path).getStatusCode()).as("salon master %s", path).isEqualTo(HttpStatus.OK);
-            assertThat(fx.get(indepToken, path).getStatusCode()).as("independent %s", path).isEqualTo(HttpStatus.OK);
+    /** Every path answers {@code expected} for the caller holding {@code token} ({@code null} = anonymous). */
+    private void assertEveryPath(String caller, String token, List<String> paths, HttpStatus expected) {
+        for (String path : paths) {
+            assertThat(fx.get(token, path).getStatusCode()).as("%s on %s", caller, path).isEqualTo(expected);
         }
-        for (String path : List.of(ME_URL + "/guests/" + anchor, ME_URL + "/guests/" + anchor + "/visits")) {
-            assertThat(fx.get(null, path).getStatusCode()).as("anonymous %s", path).isEqualTo(HttpStatus.UNAUTHORIZED);
-            denied.forEach((role, tok) -> assertThat(fx.get(tok, path).getStatusCode())
-                    .as("%s on %s", role, path).isEqualTo(HttpStatus.FORBIDDEN));
-            assertThat(fx.get(masterToken, path).getStatusCode()).as("salon master %s", path).isEqualTo(HttpStatus.OK);
-            assertThat(fx.get(indepToken, path).getStatusCode()).as("independent on foreign anchor %s", path)
-                    .isEqualTo(HttpStatus.NOT_FOUND);
-        }
-        assertThat(fx.get(indepToken, ME_URL + "/guests/" + indepAnchor).getStatusCode()).isEqualTo(HttpStatus.OK);
+    }
+
+    private static List<String> concat(List<String> a, List<String> b) {
+        List<String> all = new ArrayList<>(a);
+        all.addAll(b);
+        return all;
+    }
+
+    @Test
+    @DisplayName("auth: every salon-family card/visit path (users, guests, +visits) - 401 anonymous")
+    void should_return401OnAllSalonPaths_when_anonymous() {
+        SalonMatrix m = salonMatrix();
+
+        assertEveryPath("anonymous", null, m.paths(), HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    @DisplayName("auth: every salon-family card/visit path - 403 SALON_MASTER, CLIENT, INDEPENDENT_MASTER (role gate)")
+    void should_return403OnAllSalonPaths_when_roleIsNotSalonStaff() throws Exception {
+        SalonMatrix m = salonMatrix();
+
+        assertEveryPath("SALON_MASTER", fx.token(m.s().masterEmail()), m.paths(), HttpStatus.FORBIDDEN);
+        assertEveryPath("CLIENT", fx.token(m.clientEmail()), m.paths(), HttpStatus.FORBIDDEN);
+        assertEveryPath("INDEPENDENT_MASTER", fx.token(m.indep().email()), m.paths(), HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("auth: every salon-family card/visit path - 403 another salon's owner and admin (ownership gate)")
+    void should_return403OnAllSalonPaths_when_callerBelongsToAnotherSalon() throws Exception {
+        SalonMatrix m = salonMatrix();
+
+        assertEveryPath("foreign SALON_OWNER", fx.token(m.t().ownerEmail()), m.paths(), HttpStatus.FORBIDDEN);
+        assertEveryPath("foreign SALON_ADMIN", fx.token(m.foreignAdmin()), m.paths(), HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("auth: every salon-family card/visit path - 200 owner and own admin")
+    void should_return200OnAllSalonPaths_when_ownerOrOwnAdmin() throws Exception {
+        SalonMatrix m = salonMatrix();
+
+        assertEveryPath("owner", fx.token(m.s().ownerEmail()), m.paths(), HttpStatus.OK);
+        assertEveryPath("own admin", fx.token(m.ownAdmin()), m.paths(), HttpStatus.OK);
+    }
+
+    @Test
+    @DisplayName("auth: every master-family card/visit path (users, guests, +visits) - 401 anonymous")
+    void should_return401OnAllMasterPaths_when_anonymous() {
+        MasterMatrix m = masterMatrix();
+
+        assertEveryPath("anonymous", null, concat(m.userPaths(), m.guestPaths()), HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    @DisplayName("auth: every master-family card/visit path - 403 owner, admin, CLIENT")
+    void should_return403OnAllMasterPaths_when_roleIsNotMaster() throws Exception {
+        MasterMatrix m = masterMatrix();
+        List<String> all = concat(m.userPaths(), m.guestPaths());
+
+        assertEveryPath("SALON_OWNER", fx.token(m.s().ownerEmail()), all, HttpStatus.FORBIDDEN);
+        assertEveryPath("SALON_ADMIN", fx.token(fx.admin(m.s().salonId())), all, HttpStatus.FORBIDDEN);
+        assertEveryPath("CLIENT", fx.token(m.clientEmail()), all, HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("auth: every master-family card/visit path - 200 SALON_MASTER on own user and guest paths")
+    void should_return200OnAllMasterPaths_when_salonMaster() throws Exception {
+        MasterMatrix m = masterMatrix();
+
+        assertEveryPath("salon master", fx.token(m.s().masterEmail()), concat(m.userPaths(), m.guestPaths()),
+                HttpStatus.OK);
+    }
+
+    @Test
+    @DisplayName("auth: master-family paths - INDEPENDENT_MASTER 200 on a shared client and own guest anchor, "
+            + "404 on another master's guest anchor")
+    void should_scopeIndependentMaster_when_masterPathsCalled() throws Exception {
+        MasterMatrix m = masterMatrix();
+        String indepToken = fx.token(m.indep().email());
+
+        assertEveryPath("independent", indepToken, m.userPaths(), HttpStatus.OK);
+        assertEveryPath("independent on foreign anchor", indepToken, m.guestPaths(), HttpStatus.NOT_FOUND);
+        assertThat(fx.get(indepToken, ME_URL + "/guests/" + m.indepAnchor()).getStatusCode()).isEqualTo(HttpStatus.OK);
     }
 
     @Test
@@ -1088,5 +1143,64 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
         assertThat(ok(fx.get(token, ME_URL + "/users/" + freeClient)).path("blocked").asBoolean(true)).isFalse();
         assertThat(ok(fx.get(token, ME_URL + "/guests/" + otherBlockedGuest)).path("blocked").asBoolean(true))
                 .as("another master's block").isFalse();
+    }
+
+    // ── B550: name parts (CLI-79) + owner rule on the id-taking call (CLI-D14) ─
+
+    @Test
+    @DisplayName("B550: a registered card returns firstName and lastName from the account")
+    void should_returnFirstAndLastName_for_registered() throws Exception {
+        Salon s = fx.salon();
+        UUID c = fx.client("Анна Марія", "Коваль");
+        fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-5));
+
+        JsonNode data = ok(fx.get(fx.token(s.ownerEmail()), userCard(s.salonId(), c)));
+
+        assertThat(data.path("firstName").asText()).isEqualTo("Анна Марія");
+        assertThat(data.path("lastName").asText()).isEqualTo("Коваль");
+        assertThat(data.path("displayName").asText()).isEqualTo("Анна Марія Коваль");
+    }
+
+    @Test
+    @DisplayName("B550: a guest card returns the name pair of ONE booking (never a mixed pair)")
+    void should_returnFirstAndLastName_for_guest() throws Exception {
+        Salon s = fx.salon();
+        fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Марія", "Петренко", "COMPLETED", fx.at(-10));
+        UUID newest = fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Оля", null, "COMPLETED", fx.at(-2));
+
+        JsonNode data = ok(fx.get(fx.token(s.ownerEmail()), guestCard(s.salonId(), newest)));
+
+        assertThat(data.path("firstName").asText()).isEqualTo("Оля");
+        assertThat(data.path("lastName").isNull()).as("not «Петренко» from the older booking").isTrue();
+        assertThat(data.path("displayName").asText()).isEqualTo("Оля");
+    }
+
+    @Test
+    @DisplayName("B550 owner rule: an IM opening another IM's client card (registered or guest) gets 404")
+    void should_return404_when_IMRequestsOtherMastersClientCard() throws Exception {
+        Independent a = fx.independent();
+        Independent b = fx.independent();
+        UUID c = fx.client("Чужа", "Клієнтка");
+        fx.booking(b.masterId(), null, c, "COMPLETED", fx.at(-5));
+        UUID guest = fx.guestBooking(b.masterId(), null, GUEST_PHONE, "Чужа", "Гостя", "COMPLETED", fx.at(-4));
+        String tokenA = fx.token(a.email());
+
+        assertNotFound(fx.get(tokenA, ME_URL + "/users/" + c));
+        assertNotFound(fx.get(tokenA, ME_URL + "/guests/" + guest));
+        assertThat(fx.get(fx.token(b.email()), ME_URL + "/users/" + c).getStatusCode())
+                .as("control: the owning IM opens it").isEqualTo(HttpStatus.OK);
+    }
+
+    @Test
+    @DisplayName("B550 owner rule: a salon owner opening another salon's guest card via the own salon path gets 404")
+    void should_return404_when_ownerRequestsOtherSalonsGuestCard() throws Exception {
+        Salon a = fx.salon();
+        Salon b = fx.salon();
+        UUID guest = fx.guestBooking(b.masterId(), b.salonId(), GUEST_PHONE, "Чужа", "Гостя", "COMPLETED", fx.at(-5));
+
+        ResponseEntity<String> resp = fx.get(fx.token(a.ownerEmail()), guestCard(a.salonId(), guest));
+
+        assertNotFound(resp);
+        assertThat(resp.getBody()).doesNotContain("Чужа");
     }
 }

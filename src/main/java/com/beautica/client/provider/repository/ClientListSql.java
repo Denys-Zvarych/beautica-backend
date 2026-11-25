@@ -10,6 +10,8 @@ package com.beautica.client.provider.repository;
  * has neither a client_id nor a phone and falls out of the first filter. {@code :now} is the injected Clock's instant.
  *
  * <p>{@code :q} is passed already trimmed with {@code % _ \} escaped (ESCAPE '\'), or NULL for no filter.
+ * {@code :digits} (B550, CLI-40) is NULL or 3+ ASCII digits, set only for a phone audience; it adds an OR inside the
+ * search predicate and never widens the scope WHERE.
  */
 final class ClientListSql {
 
@@ -62,6 +64,9 @@ final class ClientListSql {
             """;
 
     // CLI-41 search: a registered row matches its ACCOUNT name, a guest row its (same-booking) guest name.
+    // B550: :digits also matches the phone digits — registered: VERIFIED phone only; guest: the grouping phone. The
+    // filter runs on `grouped` (already cut to the scope by the bookings salon/master index), so the leading-wildcard
+    // LIKE is a per-provider in-memory filter, never a users/bookings scan; no phone index (phase doc out of scope).
     // `filtered` is MATERIALIZED (computed once) and carries COUNT(*) OVER (): the total rides on the page rows, no
     // second aggregate statement. A page past the end has no row to carry it: only then does COALESCE reach the
     // lazily-run InitPlan COUNT(*) over the already-materialised `filtered` (same shape as ClientCardSql visits).
@@ -77,7 +82,12 @@ final class ClientListSql {
                WHERE (CAST(:q AS text) IS NULL
                       OR CASE WHEN g.client_id IS NOT NULL THEN concat_ws(' ', u.first_name, u.last_name)
                               ELSE concat_ws(' ', g.guest_name, g.guest_surname) END
-                         ILIKE '%' || CAST(:q AS text) || '%' ESCAPE '\\')
+                         ILIKE '%' || CAST(:q AS text) || '%' ESCAPE '\\'
+                      OR (CAST(:digits AS text) IS NOT NULL
+                          AND regexp_replace(CASE WHEN g.client_id IS NOT NULL
+                                                  THEN CASE WHEN u.phone_verified_at IS NOT NULL THEN u.phone_number END
+                                                  ELSE g.guest_phone END, '\\D', '', 'g')
+                              LIKE '%' || CAST(:digits AS text) || '%'))
             )
             SELECT COALESCE(p.total, (SELECT COUNT(*) FROM filtered)) AS total,
                    p.client_id AS clientId, p.guest_phone AS guestPhone, p.last_visit_at AS lastVisitAt,

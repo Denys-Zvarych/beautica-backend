@@ -32,4 +32,12 @@ public class ClientPhonePolicy {
         }
         return authz.isGuestPhoneAudience() ? phone : null;
     }
+
+    /**
+     * B550 (CLI-40, D3) — whether a phone-shaped list search may match phone digits: the same audience as the card
+     * phone, so a search reveals nothing the card would not. A SALON_MASTER never gets a phone oracle.
+     */
+    public boolean allowsPhoneSearch() {
+        return authz.isGuestPhoneAudience();
+    }
 }
