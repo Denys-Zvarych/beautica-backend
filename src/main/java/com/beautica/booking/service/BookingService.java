@@ -1626,11 +1626,11 @@ public class BookingService {
         Set<String> seenProperties = new HashSet<>();
         for (Sort.Order order : effectiveSort) {
             if (!SORTABLE_BOOKING_PROPERTIES.contains(order.getProperty())) {
-                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                throw BusinessException.withUserInput(HttpStatus.BAD_REQUEST,
                         "Unsupported sort property: " + order.getProperty());
             }
             if (!seenProperties.add(order.getProperty())) {
-                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                throw BusinessException.withUserInput(HttpStatus.BAD_REQUEST,
                         "Duplicate sort property: " + order.getProperty());
             }
         }

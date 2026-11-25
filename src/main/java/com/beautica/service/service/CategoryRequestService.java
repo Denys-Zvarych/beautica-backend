@@ -440,7 +440,7 @@ public class CategoryRequestService {
     }
 
     private static BusinessException duplicateCategory(String name) {
-        return new BusinessException(HttpStatus.CONFLICT, DUPLICATE_CATEGORY_MESSAGE_PREFIX + name);
+        return BusinessException.withUserInput(HttpStatus.CONFLICT, DUPLICATE_CATEGORY_MESSAGE_PREFIX + name);
     }
 
     /** Blank or null becomes {@code null}; otherwise the trimmed value. */

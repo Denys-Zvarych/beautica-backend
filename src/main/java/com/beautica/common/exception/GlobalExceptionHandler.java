@@ -18,6 +18,8 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
@@ -38,12 +40,16 @@ import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
+import org.springframework.web.servlet.HandlerMapping;
 import org.springframework.web.servlet.NoHandlerFoundException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -101,6 +107,29 @@ public class GlobalExceptionHandler {
 
     /** The generic 409 text ({@link #handleBusiness}, {@link #handlePessimisticLockingFailure}); byte-stable. */
     public static final String GENERIC_CONFLICT_MESSAGE = "Request could not be completed due to a conflict";
+
+    /** Phase 500 business 4xx line: status value, status name, HTTP method, path template, message. */
+    private static final String BUSINESS_LOG_FORMAT = "Business {} {} on {} {}: {}";
+    private static final String UNKNOWN_REQUEST_PART = "[unknown]";
+    /** Phase 500 audit — one line per throttled window: suppressed count, HTTP method, path template. */
+    private static final String BUSINESS_SUPPRESSED_FORMAT = "Business 4xx suppressed {} lines on {} {}";
+
+    private final BusinessLogThrottle businessLogThrottle;
+
+    /** Direct instantiation (standalone MockMvc / unit tests); Spring uses the {@link Clock}-bean constructor. */
+    public GlobalExceptionHandler() {
+        this(new BusinessLogThrottle(Clock.systemUTC()));
+    }
+
+    /** Spring entry point — the shared {@link Clock} bean when present (absent in some {@code @WebMvcTest} slices). */
+    @Autowired
+    public GlobalExceptionHandler(ObjectProvider<Clock> clock) {
+        this(new BusinessLogThrottle(clock.getIfAvailable(Clock::systemUTC)));
+    }
+
+    GlobalExceptionHandler(BusinessLogThrottle businessLogThrottle) {
+        this.businessLogThrottle = businessLogThrottle;
+    }
 
     /**
      * Phase 379 audit (perf LOW F1) — a retired booking link is never re-issued, so its 410 is immutable:
@@ -444,7 +473,7 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<ApiResponse<Void>> handleBusiness(BusinessException ex) {
-        log.debug("Business exception: {}", ex.getMessage());
+        logBusiness(ex);
         String clientMessage = switch (ex.getStatus()) {
             case CONFLICT -> GENERIC_CONFLICT_MESSAGE;
             case BAD_REQUEST -> "Invalid request";
@@ -462,6 +491,61 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(ex.getStatus())
                 .body(ApiResponse.error(clientMessage));
+    }
+
+    /**
+     * Phase 500 — a 4xx business rejection leaves a line on prod/staging (both log {@code com.beautica} at INFO),
+     * so a user report can be traced: 409 at WARN, every other 4xx at INFO, as
+     * {@code Business {status} {code} on {METHOD} {path-template}: {message}}. Only the handler's path TEMPLATE
+     * ({@link HandlerMapping#BEST_MATCHING_PATTERN_ATTRIBUTE}) is logged, never the raw URI or query string, so
+     * tokens and ids in the path stay out of the line. WARN is below Sentry's {@code minimum-event-level: error},
+     * so no Sentry event is raised (D2).
+     *
+     * <p>5xx keeps the previous DEBUG line, and so does any message built with
+     * {@link BusinessException#withUserInput} (it interpolates caller input).
+     *
+     * <p>Audit (perf LOW): capped per {@code METHOD template} by {@link BusinessLogThrottle} — at most
+     * {@value BusinessLogThrottle#LINES_PER_WINDOW} lines a minute, then one
+     * {@code Business 4xx suppressed {n} lines on {METHOD} {template}} WARN line at the next window's first hit.
+     * The response body is unaffected.
+     */
+    private void logBusiness(BusinessException ex) {
+        HttpStatus status = ex.getStatus();
+        if (!status.is4xxClientError() || ex.messageCarriesUserInput()) {
+            log.debug("Business exception: {}", ex.getMessage());
+            return;
+        }
+        HttpServletRequest request = currentRequest();
+        String method = request != null ? request.getMethod() : UNKNOWN_REQUEST_PART;
+        String template = pathTemplateOf(request);
+        BusinessLogThrottle.Decision decision = businessLogThrottle.acquire(method, template);
+        if (decision.suppressedInPreviousWindow() > 0) {
+            log.warn(BUSINESS_SUPPRESSED_FORMAT, decision.suppressedInPreviousWindow(), method, template);
+        }
+        if (!decision.logLine()) {
+            return;
+        }
+        if (status == HttpStatus.CONFLICT) {
+            log.warn(BUSINESS_LOG_FORMAT, status.value(), status.name(), method, template, ex.getMessage());
+        } else {
+            log.info(BUSINESS_LOG_FORMAT, status.value(), status.name(), method, template, ex.getMessage());
+        }
+    }
+
+    private static HttpServletRequest currentRequest() {
+        return RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attributes
+                ? attributes.getRequest()
+                : null;
+    }
+
+    /** The matched handler's path template, or {@code [unknown]} — never the raw request URI. */
+    private static String pathTemplateOf(HttpServletRequest request) {
+        if (request == null) {
+            return UNKNOWN_REQUEST_PART;
+        }
+        return request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE) instanceof String template
+                ? template
+                : UNKNOWN_REQUEST_PART;
     }
 
     @ExceptionHandler(ResendThrottledException.class)

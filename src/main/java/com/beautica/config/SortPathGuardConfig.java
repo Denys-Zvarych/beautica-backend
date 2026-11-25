@@ -115,7 +115,7 @@ public class SortPathGuardConfig implements WebMvcConfigurer {
             if (order.getProperty().contains(NESTED_PATH_SEPARATOR)) {
                 // Message is internal only (debug log); GlobalExceptionHandler genericises the
                 // BAD_REQUEST body so the rejected path is never reflected back to the caller.
-                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                throw BusinessException.withUserInput(HttpStatus.BAD_REQUEST,
                         "Nested sort property is not permitted: " + order.getProperty());
             }
         }
