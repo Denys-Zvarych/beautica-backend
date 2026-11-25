@@ -2205,6 +2205,8 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
      * 465. The response body is compared, normalised for generated ids/timestamps and the seeded
      * type's catalogue strings, against {@link #RULE2_RECORDED_BODY} — recorded from the pre-465
      * service (phase-464 head) and replayed byte-for-byte against the per-copy resolver.
+     * B504 (track D18) later added the additive, nullable {@code serviceDefinition.categoryDisplayName}
+     * (null on write responses) to the recording; nothing else in the body moved.
      */
     @Test
     @DisplayName("Phase 465 D1 rule 2: single salon copy reused by another master at another duration — body byte-identical to pre-465")

@@ -94,6 +94,12 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
         fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 
+    /** Statement counts are per-request; see {@link AbstractIntegrationTest#warmCategoryLabelCache()}. */
+    @BeforeEach
+    void warmCategoryLabels() {
+        warmCategoryLabelCache();
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // 1 — authorization: owner/admin OF THIS salon only
     // ══════════════════════════════════════════════════════════════════════════

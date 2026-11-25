@@ -13,6 +13,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.EntityManagerFactory;
 import org.hibernate.stat.Statistics;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -64,6 +65,12 @@ class BookingClientReviewExposureIT extends AbstractIntegrationTest {
     private static final String TEST_PASSWORD = "Str0ngP@ss1!";
     private static final String REVIEW_COMMENT =
             "Дуже уважна майстриня, все сподобалось — прийду ще!";
+
+    /** Statement counts are per-request; see {@link AbstractIntegrationTest#warmCategoryLabelCache()}. */
+    @BeforeEach
+    void warmCategoryLabels() {
+        warmCategoryLabelCache();
+    }
 
     @Autowired
     private TestRestTemplate restTemplate;

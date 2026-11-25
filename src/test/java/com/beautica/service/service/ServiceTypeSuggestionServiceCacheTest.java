@@ -72,6 +72,8 @@ class ServiceTypeSuggestionServiceCacheTest {
     }
 
     @MockBean ServiceTypeSuggestionRepository suggestionRepository;
+    // Constructor dependency (submit-side category row lock); unused by the approve/reject paths under test.
+    @MockBean com.beautica.service.repository.PlatformCategoryRepository platformCategoryRepository;
     @MockBean TokenGenerator tokenGenerator;
     @MockBean EmailService emailService;
     @MockBean InAppNotificationService inAppNotificationService;

@@ -111,6 +111,12 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
         fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 
+    /** Statement counts are per-request; see {@link AbstractIntegrationTest#warmCategoryLabelCache()}. */
+    @BeforeEach
+    void warmCategoryLabels() {
+        warmCategoryLabelCache();
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // THE FREEZE — creation writes the ceiling; later service edits cannot move it
     // ══════════════════════════════════════════════════════════════════════════
