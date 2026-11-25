@@ -21,6 +21,8 @@ import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
@@ -43,6 +45,10 @@ final class ProviderClientFixtures {
     static final String PASSWORD = "Str0ngP@ss1!";
 
     private static String encodedPassword;
+
+    /** 7-digit subscriber numbers, JVM-wide, so two {@link #freshPhone} calls never return the same number. */
+    private static final AtomicInteger PHONE_SEQ =
+            new AtomicInteger(1_000_000 + ThreadLocalRandom.current().nextInt(8_000_000));
 
     record Salon(UUID salonId, UUID ownerId, String ownerEmail, UUID masterId, UUID masterUserId,
                  String masterEmail) {}
@@ -71,6 +77,14 @@ final class ProviderClientFixtures {
     }
 
     // ── seeding ──────────────────────────────────────────────────────────────
+
+    /**
+     * A fresh {@code +380<operator>xxxxxxx} per call so verified phones never collide with
+     * {@code ux_users_verified_phone}. {@code operator} is the 2-digit code (e.g. {@code "63"}, {@code "67"}).
+     */
+    static String freshPhone(String operator) {
+        return "+380" + operator + PHONE_SEQ.getAndIncrement();
+    }
 
     String email(String prefix) {
         return "pc-" + prefix + "-" + UUID.randomUUID() + "@beautica.test";

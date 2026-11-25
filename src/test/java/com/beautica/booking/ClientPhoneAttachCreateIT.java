@@ -10,9 +10,11 @@ import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.sms.SmsService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -52,6 +54,7 @@ import static org.mockito.Mockito.verify;
  */
 @Import(TestSecurityConfig.class)
 @TestPropertySource(properties = "FIREBASE_ENABLED=true")
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @DisplayName("Client phone attach at booking create — B527")
 class ClientPhoneAttachCreateIT extends AbstractIntegrationTest {
 
@@ -76,6 +79,25 @@ class ClientPhoneAttachCreateIT extends AbstractIntegrationTest {
     @BeforeEach
     void setUp() {
         pages = new PublicBookingPageFixtures(jdbcTemplate, restTemplate, objectMapper, passwordEncoder);
+    }
+
+    /**
+     * Pays the cold-start cost (first link + walk-in HTTP round trips, login, Hibernate/Jackson warm-up on a context
+     * that may have just started) once, outside any timed test. Without it whichever test JUnit orders first (2d) took
+     * ~2.6 s alone and 10.5 s under batch load against SlowTestExtension's 10 s ceiling while its siblings take ~0.4 s.
+     * Mirrors MultiServiceNotificationIT#warmUpColdStart: the real attached link + walk-in create path, then a full DB
+     * wipe and the mock interactions cleared, so nothing leaks into the first test's assertions.
+     */
+    @BeforeAll
+    void warmUpColdStart() throws Exception {
+        setUp();
+        IndependentMaster master = pages.independentMaster(true);
+        verifiedClient(PHONE);
+        created(linkBook(master, PHONE, slot(3, 12)));
+        created(walkIn(master, "0671234501", slot(4, 12)));
+        cleanDb();
+        providerTokens.clear();
+        org.mockito.Mockito.clearInvocations(smsService, firebaseSender);
     }
 
     // ── seeding ──────────────────────────────────────────────────────────────

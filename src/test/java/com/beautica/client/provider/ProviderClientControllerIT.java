@@ -32,6 +32,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
+import static com.beautica.client.provider.ProviderClientFixtures.freshPhone;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -632,5 +633,153 @@ class ProviderClientControllerIT extends AbstractIntegrationTest {
                 "APP", null, null, GUEST_PHONE, false, false))
                 .as("APP row carrying a guest phone").isInstanceOf(DataIntegrityViolationException.class)
                 .hasMessageContaining("chk_bookings_guest_fields");
+    }
+
+    // ── B550: phone digits in q (CLI-40, D1/D3) ──────────────────────────────
+
+    /** Operator code of the fresh phones this class seeds (+38067xxxxxxx). */
+    private static final String OPERATOR = "67";
+
+    /** The phone written the way a person types it: local format with spaces, no '+'. */
+    private static String typed(String e164) {
+        String local = "0" + e164.substring(4);
+        return local.substring(0, 3) + " " + local.substring(3, 6) + " " + local.substring(6);
+    }
+
+    private List<JsonNode> search(String token, String url, String q) throws Exception {
+        return rows(fx.get(token, url + "?q={q}", q));
+    }
+
+    private UUID verifiedClient(String first, String last, String phone) {
+        UUID id = fx.client(first, last);
+        jdbcTemplate.update("UPDATE users SET phone_number = ?, phone_verified_at = NOW() WHERE id = ?", phone, id);
+        return id;
+    }
+
+    @Test
+    @DisplayName("B550: a guest is found by its phone digits typed as '067 123'")
+    void should_matchGuestByPhoneDigits_when_qIsPhone() throws Exception {
+        Salon s = fx.salon();
+        fx.guestBooking(s.masterId(), s.salonId(), "STAFF", "+380671234567", "Оля", "Гостя", "COMPLETED", fx.at(-5));
+        fx.guestBooking(s.masterId(), s.salonId(), "STAFF", "+380501112299", "Інша", "Гостя", "COMPLETED", fx.at(-4));
+
+        List<JsonNode> rows = search(fx.token(s.ownerEmail()), SALON_URL.formatted(s.salonId()), "067 123");
+
+        assertThat(rows).extracting(r -> r.path("displayName").asText()).containsExactly("Оля Гостя");
+        assertThat(rows.get(0).has("phone")).as("CLI-40: list rows never carry a phone").isFalse();
+    }
+
+    @Test
+    @DisplayName("B550: a registered client is found by the VERIFIED account phone")
+    void should_matchRegisteredByVerifiedPhone_when_qIsPhone() throws Exception {
+        Independent im = fx.independent();
+        String phone = freshPhone(OPERATOR);
+        UUID c = verifiedClient("Марія", "Верифікована", phone);
+        fx.booking(im.masterId(), null, c, "COMPLETED", fx.at(-5));
+        fx.booking(im.masterId(), null, fx.client("Без", "Телефону"), "COMPLETED", fx.at(-4));
+
+        List<JsonNode> rows = search(fx.token(im.email()), ME_URL, typed(phone));
+
+        assertThat(rows).extracting(r -> r.path("userId").asText()).containsExactly(c.toString());
+    }
+
+    @Test
+    @DisplayName("B550: an UNVERIFIED account phone never matches")
+    void should_notMatchRegistered_when_phoneUnverified() throws Exception {
+        Salon s = fx.salon();
+        String phone = freshPhone(OPERATOR);
+        UUID c = fx.client("Марія", "Неверифікована");
+        jdbcTemplate.update("UPDATE users SET phone_number = ? WHERE id = ?", phone, c);
+        fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-5));
+
+        List<JsonNode> rows = search(fx.token(s.ownerEmail()), SALON_URL.formatted(s.salonId()), typed(phone));
+
+        assertThat(rows).isEmpty();
+    }
+
+    @Test
+    @DisplayName("B550 D3: a SALON_MASTER gets no phone search (empty) although the own guest has that phone")
+    void should_ignorePhoneMode_when_salonMaster() throws Exception {
+        Salon s = fx.salon();
+        fx.guestBooking(s.masterId(), s.salonId(), "STAFF", "+380671234567", "Оля", "Гостя", "COMPLETED", fx.at(-5));
+
+        List<JsonNode> asMaster = search(fx.token(s.masterEmail()), ME_URL, "0671234");
+        List<JsonNode> asOwner = search(fx.token(s.ownerEmail()), SALON_URL.formatted(s.salonId()), "0671234");
+
+        assertThat(asMaster).isEmpty();
+        assertThat(asOwner).as("control: the same digits match for the owner").hasSize(1);
+    }
+
+    @Test
+    @DisplayName("B550 owner rule: an IM never finds another IM's client by phone")
+    void should_neverReturnOtherMastersClient_when_phoneSearchByIM() throws Exception {
+        Independent a = fx.independent();
+        Independent b = fx.independent();
+        String phone = freshPhone(OPERATOR);
+        fx.booking(b.masterId(), null, verifiedClient("Чужа", "Клієнтка", phone), "COMPLETED", fx.at(-5));
+        fx.booking(a.masterId(), null, fx.client("Своя", "Клієнтка"), "COMPLETED", fx.at(-4));
+
+        List<JsonNode> asA = search(fx.token(a.email()), ME_URL, typed(phone));
+        List<JsonNode> asB = search(fx.token(b.email()), ME_URL, typed(phone));
+
+        assertThat(asA).isEmpty();
+        assertThat(asB).as("control: the owning IM finds it").hasSize(1);
+    }
+
+    @Test
+    @DisplayName("B550 owner rule: a salon owner never finds another salon's client (guest or registered) by phone")
+    void should_neverReturnOtherSalonsClient_when_phoneSearchByOwner() throws Exception {
+        Salon a = fx.salon();
+        Salon b = fx.salon();
+        String guestPhone = freshPhone(OPERATOR);
+        String accountPhone = freshPhone(OPERATOR);
+        fx.guestBooking(b.masterId(), b.salonId(), "STAFF", guestPhone, "Чужа", "Гостя", "COMPLETED", fx.at(-5));
+        fx.booking(b.masterId(), b.salonId(), verifiedClient("Чужа", "Клієнтка", accountPhone), "COMPLETED",
+                fx.at(-4));
+        fx.booking(a.masterId(), a.salonId(), fx.client("Своя", "Клієнтка"), "COMPLETED", fx.at(-3));
+        String tokenA = fx.token(a.ownerEmail());
+
+        assertThat(search(tokenA, SALON_URL.formatted(a.salonId()), typed(guestPhone))).isEmpty();
+        assertThat(search(tokenA, SALON_URL.formatted(a.salonId()), typed(accountPhone))).isEmpty();
+        assertThat(search(fx.token(b.ownerEmail()), SALON_URL.formatted(b.salonId()), typed(guestPhone)))
+                .as("control: salon B finds its own guest").hasSize(1);
+    }
+
+    @Test
+    @DisplayName("B550 owner rule: a verified platform user who never booked with the caller is never returned")
+    void should_neverReturnPlatformUser_when_noBookingWithProvider() throws Exception {
+        Salon s = fx.salon();
+        String phone = freshPhone(OPERATOR);
+        verifiedClient("Платформна", "Користувачка", phone);
+        fx.booking(s.masterId(), s.salonId(), fx.client("Своя", "Клієнтка"), "COMPLETED", fx.at(-5));
+
+        List<JsonNode> rows = search(fx.token(s.ownerEmail()), SALON_URL.formatted(s.salonId()), typed(phone));
+
+        assertThat(rows).isEmpty();
+    }
+
+    @Test
+    @DisplayName("B550: a blocked client found by phone is still listed, with blocked=true")
+    void should_listBlockedClientFlagged_when_foundByPhone() throws Exception {
+        Salon s = fx.salon();
+        String phone = freshPhone(OPERATOR);
+        fx.guestBooking(s.masterId(), s.salonId(), "STAFF", phone, "Заблокована", "Гостя", "COMPLETED", fx.at(-5));
+        fx.blockGuestInSalon(s.salonId(), phone);
+
+        List<JsonNode> rows = search(fx.token(s.ownerEmail()), SALON_URL.formatted(s.salonId()), typed(phone));
+
+        assertThat(rows).singleElement().satisfies(r -> assertThat(r.path("blocked").asBoolean()).isTrue());
+    }
+
+    @Test
+    @DisplayName("B550: a mixed q ('Оля 067') is a name search, never a phone search")
+    void should_treatMixedQueryAsName() throws Exception {
+        Salon s = fx.salon();
+        fx.guestBooking(s.masterId(), s.salonId(), "STAFF", "+380671234567", "Оля", "Петренко", "COMPLETED",
+                fx.at(-5));
+        String token = fx.token(s.ownerEmail());
+
+        assertThat(search(token, SALON_URL.formatted(s.salonId()), "Оля 067")).isEmpty();
+        assertThat(search(token, SALON_URL.formatted(s.salonId()), "Оля Пет")).hasSize(1);
     }
 }

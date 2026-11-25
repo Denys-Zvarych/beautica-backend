@@ -45,6 +45,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 /**
  * B507 — the provider's client list (CLI-38..41): one page statement, one count statement and one block statement
@@ -58,6 +59,10 @@ public class ProviderClientService {
 
     static final int MIN_QUERY_LENGTH = 2;
     static final int MAX_QUERY_LENGTH = 50;
+    /** B550 (CLI-40) — a phone-shaped {@code q} needs at least this many digits to search phones. */
+    static final int MIN_PHONE_DIGITS = 3;
+    private static final Pattern PHONE_SHAPED = Pattern.compile("^[+0-9 ()\\-.]+$");
+    private static final Pattern NON_DIGIT = Pattern.compile("\\D");
 
     private final ProviderClientRepository repository;
     private final ClientBlockService clientBlockService;
@@ -98,28 +103,39 @@ public class ProviderClientService {
     }
 
     /**
-     * @param q raw search text (null = no filter); trimmed, 2-50 chars, no control characters, else 400
+     * @param q raw search text (null = no filter); trimmed, 2-50 chars, no control characters, else 400. B550: a
+     *          phone-shaped {@code q} with >= 3 digits also matches the client's phone digits, only for a phone
+     *          audience (CLI-44 roles); for a SALON_MASTER it stays a name search. The scope WHERE is unchanged.
      * @param pageable page + size only; any sort is ignored (the order is fixed: latest activity first)
      */
     @Transactional(readOnly = true)
     public Page<ClientListItemResponse> listClients(ClientScope scope, @Nullable String q, Pageable pageable) {
         String escapedQuery = normaliseQuery(q);
+        String digits = escapedQuery == null ? null : phoneSearchDigits(q);
         OffsetDateTime now = OffsetDateTime.now(clock);
         int limit = pageable.getPageSize();
         long offset = pageable.getOffset();
 
         List<ClientListRowProjection> page = switch (scope) {
             case SalonScope(UUID salonId, UUID masterId) when masterId == null ->
-                    repository.pageBySalon(salonId, now, escapedQuery, limit, offset);
+                    repository.pageBySalon(salonId, now, escapedQuery, digits, limit, offset);
             case SalonScope(UUID salonId, UUID masterId) ->
-                    repository.pageBySalonAndMaster(salonId, masterId, now, escapedQuery, limit, offset);
+                    repository.pageBySalonAndMaster(salonId, masterId, now, escapedQuery, digits, limit,
+                            offset);
             case MasterScope(UUID masterId, UUID ignoredSalonId) ->
-                    repository.pageByMaster(masterId, now, escapedQuery, limit, offset);
+                    repository.pageByMaster(masterId, now, escapedQuery, digits, limit, offset);
         };
         // One statement: the total rides on every row; an empty page is one placeholder row (anchor null).
         long total = page.isEmpty() || page.get(0).getTotal() == null ? 0 : page.get(0).getTotal();
         List<ClientRow> rows = page.stream().filter(p -> p.getAnchorBookingId() != null).map(ClientRow::of).toList();
         return new PageImpl<>(toResponses(scope, rows), pageable, total);
+    }
+
+    /** D3: phone digits only for the CLI-44 phone audience; the policy is asked only for a phone-shaped query. */
+    @Nullable
+    private String phoneSearchDigits(String q) {
+        String digits = phoneDigits(q);
+        return digits != null && phonePolicy.allowsPhoneSearch() ? digits : null;
     }
 
     private List<ClientListItemResponse> toResponses(ClientScope scope, List<ClientRow> rows) {
@@ -180,6 +196,15 @@ public class ProviderClientService {
         return joined.isEmpty() ? null : joined;
     }
 
+    /** B550 (CLI-79) — one name part, stripped; null when blank. */
+    @Nullable
+    private static String namePart(@Nullable String part) {
+        if (part == null || part.isBlank()) {
+            return null;
+        }
+        return part.strip();
+    }
+
     // ── B508: client card + visit history (CLI-42..45) ───────────────────────
 
     /**
@@ -215,7 +240,8 @@ public class ProviderClientService {
                         phonePolicy.phoneFor(row.getVerifiedPhone()), blocked,
                         ratingCount > 0 ? row.getAvgRating() : null, ratingCount, distribution,
                         utc(row.getFirstVisitAt()),
-                        utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats, servedBy);
+                        utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats, servedBy,
+                        namePart(row.getFirstName()), namePart(row.getLastName()));
             }
             case GuestAnchor ignored -> {
                 String guestPhone = row.getGuestPhone();
@@ -227,7 +253,7 @@ public class ProviderClientService {
                         phonePolicy.phoneFor(guestPhone), blocked, null, 0,
                         ClientRatingSummaryService.zeroDistribution(),
                         utc(row.getFirstVisitAt()), utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats,
-                        servedBy);
+                        servedBy, namePart(row.getGuestName()), namePart(row.getGuestSurname()));
             }
         };
     }
@@ -426,5 +452,22 @@ public class ProviderClientService {
             throw new BusinessException("Invalid search text");
         }
         return trimmed.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
+    }
+
+    /**
+     * B550 (CLI-40) — the digits of a phone-shaped query ({@code + 0-9 space ( ) - .} only) holding at least
+     * {@link #MIN_PHONE_DIGITS} digits; null otherwise (name mode). Digits only, so no LIKE escaping is needed.
+     */
+    @Nullable
+    static String phoneDigits(@Nullable String q) {
+        if (q == null) {
+            return null;
+        }
+        String trimmed = q.strip();
+        if (!PHONE_SHAPED.matcher(trimmed).matches()) {
+            return null;
+        }
+        String digits = NON_DIGIT.matcher(trimmed).replaceAll("");
+        return digits.length() >= MIN_PHONE_DIGITS ? digits : null;
     }
 }

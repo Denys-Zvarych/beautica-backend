@@ -27,6 +27,10 @@ import java.util.UUID;
  * @param servedByMasters CLI-73: SALON scope only — the salon's masters with at least one booking of this client (any
  *                       status), most recent booking first, salon-wide whatever {@code ?masterId=}; always empty for
  *                       the independent-master and SALON_MASTER cards
+ * @param firstName      B550 (CLI-79): REGISTERED = the account first name; GUEST = the guest name of the card's named
+ *                       booking (the same booking as {@code lastName}); null when blank. Added last: additive only
+ * @param lastName       B550 (CLI-79): REGISTERED = the account last name; GUEST = the guest surname of that same
+ *                       booking; null when blank
  */
 public record ClientCardResponse(
         ClientKind kind,
@@ -43,7 +47,9 @@ public record ClientCardResponse(
         OffsetDateTime lastVisitAt,
         OffsetDateTime nextVisitAt,
         Stats stats,
-        List<ServedMaster> servedByMasters
+        List<ServedMaster> servedByMasters,
+        String firstName,
+        String lastName
 ) {
 
     public ClientCardResponse {
