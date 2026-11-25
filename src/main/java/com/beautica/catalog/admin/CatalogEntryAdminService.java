@@ -9,6 +9,9 @@ import com.beautica.catalog.admin.repository.CatalogEntryQueryRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.service.service.PlatformCatalogEditService;
+import com.beautica.service.service.PlatformCatalogDeleteService;
+import com.beautica.service.service.PlatformCatalogDeleteService.CategoryDeletion;
+import com.beautica.service.service.PlatformCatalogDeleteService.ServiceTypeDeletion;
 import com.beautica.service.service.PlatformCatalogEditService.CategoryEdit;
 import com.beautica.service.service.PlatformCatalogEditService.ServiceTypeEdit;
 import lombok.RequiredArgsConstructor;
@@ -19,6 +22,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
@@ -30,6 +34,11 @@ import java.util.regex.Pattern;
  * one audit row per changed aspect in the SAME transaction — {@code RENAME} (the name fields only), then {@code HIDE}
  * or {@code UNHIDE} ({@code active} only) — and, when anything changed, calls {@link CatalogCacheEvictor#evictAll()},
  * which runs after commit (a rollback evicts nothing). A PATCH whose values equal the current ones writes nothing.
+ *
+ * <p>B505 (SVC-57) — delete of an UNUSED category / type: the domain half (lock, usage count, delete) is
+ * {@link PlatformCatalogDeleteService}; here one {@code DELETE} audit row with the deleted row's catalog fields in
+ * {@code before} ({@code after} null), then {@link CatalogCacheEvictor#evictPlatformCatalog()} after commit (an unused
+ * row is in no per-master label cache, so those stay warm). A refused delete writes and evicts nothing.
  */
 @Service
 @RequiredArgsConstructor
@@ -38,6 +47,7 @@ public class CatalogEntryAdminService {
     static final String RENAME_ACTION = "RENAME";
     static final String HIDE_ACTION = "HIDE";
     static final String UNHIDE_ACTION = "UNHIDE";
+    static final String DELETE_ACTION = "DELETE";
     private static final String ACTIVE = "active";
 
     /** Same rule as {@code chk_platform_categories_name}; anything else cannot be a wire name. */
@@ -45,6 +55,7 @@ public class CatalogEntryAdminService {
 
     private final CatalogEntryQueryRepository queryRepository;
     private final PlatformCatalogEditService editService;
+    private final PlatformCatalogDeleteService deleteService;
     private final CatalogAdminAuditService auditService;
     private final CatalogCacheEvictor cacheEvictor;
 
@@ -95,6 +106,36 @@ public class CatalogEntryAdminService {
         if (edit.renamed() || edit.visibilityChanged()) {
             cacheEvictor.evictAll();
         }
+    }
+
+    /** Deletes an unused live category, keyed by its wire name (400 malformed, 404 unknown, 409 in use). */
+    @Transactional
+    public void deleteCategory(AdminActor actor, String categoryName) {
+        requireWireName(categoryName);
+        CategoryDeletion deleted = deleteService.deleteCategory(categoryName);
+        Map<String, Object> before = new LinkedHashMap<>();
+        before.put("name", deleted.name());
+        before.put("displayName", deleted.displayName());
+        before.put("status", deleted.status().name());
+        before.put(ACTIVE, deleted.active());
+        before.put("initialServiceName", deleted.initialServiceName());
+        before.put("serviceCategoryId", Objects.toString(deleted.serviceCategoryId(), null));
+        auditService.record(actor, DELETE_ACTION, CatalogAuditTargetType.CATEGORY, categoryName, before, null);
+        cacheEvictor.evictPlatformCatalog();
+    }
+
+    /** Deletes an unused service type (404 unknown, 409 in use). */
+    @Transactional
+    public void deleteServiceType(AdminActor actor, UUID id) {
+        ServiceTypeDeletion deleted = deleteService.deleteServiceType(id);
+        Map<String, Object> before = new LinkedHashMap<>();
+        before.put("id", deleted.id().toString());
+        before.put("platformCategoryName", deleted.platformCategoryName());
+        before.put("slug", deleted.slug());
+        before.putAll(typeNames(deleted.nameUk(), deleted.nameEn()));
+        before.put(ACTIVE, deleted.active());
+        auditService.record(actor, DELETE_ACTION, CatalogAuditTargetType.SERVICE_TYPE, id.toString(), before, null);
+        cacheEvictor.evictPlatformCatalog();
     }
 
     private void recordVisibility(AdminActor actor, CatalogAuditTargetType targetType, String targetId,

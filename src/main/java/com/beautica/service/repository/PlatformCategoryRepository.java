@@ -94,7 +94,12 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
 
     /**
      * B504 — the live category a catalog-admin rename / hide / unhide mutates, keyed by its immutable wire name and
-     * locked ({@code FOR UPDATE}) so the write serialises with a concurrent request decision on the same row.
+     * row-locked. Hibernate 6 renders {@code PESSIMISTIC_WRITE} on PostgreSQL as {@code FOR NO KEY UPDATE} (not
+     * {@code FOR UPDATE}). That is enough here: {@code FOR NO KEY UPDATE} conflicts with itself, so a second portal edit
+     * and a request decision (the id / token finders above, also {@code PESSIMISTIC_WRITE}) on the same row serialise,
+     * and none of them changes the key ({@code name} is immutable). It does NOT conflict with the {@code FOR KEY SHARE}
+     * an FK check takes, so it cannot fence a concurrent insert of a referencing row — the B505 delete uses
+     * {@link #findByNameForDelete} for that.
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select c from PlatformCategory c where c.name = :name")
@@ -181,5 +186,35 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
         boolean isActive();
         java.time.OffsetDateTime getCreatedAt();
         long getUsageCount();
+    }
+
+    /**
+     * B505 — the category a catalog-admin DELETE removes, locked with a real {@code FOR UPDATE} (native on purpose).
+     * Hibernate 6 renders {@code PESSIMISTIC_WRITE} on PostgreSQL as {@code FOR NO KEY UPDATE}, which does NOT conflict
+     * with the {@code FOR KEY SHARE} an FK check takes; {@code FOR UPDATE} does, so a concurrent insert of a type under
+     * this category (V73 FK) either commits before the usage count and is counted, or waits and then fails its FK.
+     */
+    @Query(value = "SELECT pc.* FROM platform_categories pc WHERE pc.name = :name FOR UPDATE", nativeQuery = true)
+    Optional<PlatformCategory> findByNameForDeleteNoLockTimeout(@Param("name") String name);
+
+    /** {@link #findByNameForDeleteNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default Optional<PlatformCategory> findByNameForDelete(String name) {
+        applyTransactionLockTimeout();
+        return findByNameForDeleteNoLockTimeout(name);
+    }
+
+    /**
+     * B505 — a shared lock ({@code FOR SHARE}, native on purpose: JPA has no portable mapping) on the category a new
+     * PENDING service-type suggestion names. It conflicts with the delete's {@code FOR UPDATE}
+     * ({@link #findByNameForDelete}), so a suggestion create and a category delete serialise: the delete counts a
+     * committed suggestion (409), or the create sees the category gone. Concurrent creates share it.
+     */
+    @Query(value = "SELECT pc.* FROM platform_categories pc WHERE pc.name = :name FOR SHARE", nativeQuery = true)
+    Optional<PlatformCategory> findByNameForShareNoLockTimeout(@Param("name") String name);
+
+    /** {@link #findByNameForShareNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default Optional<PlatformCategory> findByNameForShare(String name) {
+        applyTransactionLockTimeout();
+        return findByNameForShareNoLockTimeout(name);
     }
 }

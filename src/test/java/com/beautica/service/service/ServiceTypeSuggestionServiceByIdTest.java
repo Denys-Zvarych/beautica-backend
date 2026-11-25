@@ -10,6 +10,7 @@ import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.service.RequestKind;
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.entity.ServiceTypeSuggestionStatus;
+import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceTypeSuggestionRepository;
 import com.beautica.service.service.ServiceTypeSuggestionService.DecisionOutcome;
 import org.junit.jupiter.api.BeforeEach;
@@ -49,6 +50,7 @@ class ServiceTypeSuggestionServiceByIdTest {
     private static final UUID ID = UUID.fromString("00000000-0000-0000-0000-000000000503");
 
     @Mock private ServiceTypeSuggestionRepository suggestionRepository;
+    @Mock private PlatformCategoryRepository platformCategoryRepository;
     @Mock private TokenGenerator tokenGenerator;
     @Mock private EmailService emailService;
     @Mock private PublicBaseUrlProperties publicBaseUrlProperties;
@@ -60,7 +62,7 @@ class ServiceTypeSuggestionServiceByIdTest {
 
     @BeforeEach
     void setUp() {
-        service = new ServiceTypeSuggestionService(suggestionRepository, tokenGenerator, emailService,
+        service = new ServiceTypeSuggestionService(suggestionRepository, platformCategoryRepository, tokenGenerator, emailService,
                 publicBaseUrlProperties, promotionService, Clock.fixed(NOW, ZoneOffset.UTC), inAppNotificationService,
                 notificationOutboxService);
         ReflectionTestUtils.setField(service, "adminEmail", "admin@beautica.test");

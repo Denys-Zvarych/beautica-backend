@@ -9,6 +9,11 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.service.service.PlatformCatalogEditService;
+import com.beautica.common.exception.CatalogUsage;
+import com.beautica.service.entity.PlatformCategoryStatus;
+import com.beautica.service.service.PlatformCatalogDeleteService;
+import com.beautica.service.service.PlatformCatalogDeleteService.CategoryDeletion;
+import com.beautica.service.service.PlatformCatalogDeleteService.ServiceTypeDeletion;
 import com.beautica.service.service.PlatformCatalogEditService.CategoryEdit;
 import com.beautica.service.service.PlatformCatalogEditService.ServiceTypeEdit;
 import org.junit.jupiter.api.BeforeEach;
@@ -20,6 +25,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -29,6 +35,7 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -43,6 +50,7 @@ class CatalogEntryAdminServiceTest {
 
     @Mock private CatalogEntryQueryRepository queryRepository;
     @Mock private PlatformCatalogEditService editService;
+    @Mock private PlatformCatalogDeleteService deleteService;
     @Mock private CatalogAdminAuditService auditService;
     @Mock private CatalogCacheEvictor cacheEvictor;
 
@@ -50,7 +58,7 @@ class CatalogEntryAdminServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new CatalogEntryAdminService(queryRepository, editService, auditService, cacheEvictor);
+        service = new CatalogEntryAdminService(queryRepository, editService, deleteService, auditService, cacheEvictor);
     }
 
     // ── lists ──────────────────────────────────────────────────────────────────
@@ -197,5 +205,75 @@ class CatalogEntryAdminServiceTest {
         service.updateServiceType(ACTOR, id, new UpdateCatalogServiceTypeRequest("Масаж", null, true));
 
         verifyNoInteractions(auditService, cacheEvictor);
+    }
+
+    // ── delete (B505) ──────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("category delete: one DELETE audit row with the catalog fields in before (after null), then evict")
+    void should_auditDeleteWithBeforeThenEvict_when_categoryDeleted() {
+        UUID bucket = UUID.randomUUID();
+        when(deleteService.deleteCategory(CATEGORY)).thenReturn(new CategoryDeletion(CATEGORY, "Масаж ніг",
+                PlatformCategoryStatus.APPROVED, false, null, bucket));
+
+        service.deleteCategory(ACTOR, CATEGORY);
+
+        Map<String, Object> before = new LinkedHashMap<>();
+        before.put("name", CATEGORY);
+        before.put("displayName", "Масаж ніг");
+        before.put("status", "APPROVED");
+        before.put("active", false);
+        before.put("initialServiceName", null);
+        before.put("serviceCategoryId", bucket.toString());
+        InOrder order = inOrder(auditService, cacheEvictor);
+        order.verify(auditService).record(ACTOR, "DELETE", CatalogAuditTargetType.CATEGORY, CATEGORY, before, null);
+        order.verify(cacheEvictor).evictPlatformCatalog();
+        verify(cacheEvictor, never()).evictAll();
+    }
+
+    @Test
+    @DisplayName("type delete: one DELETE audit row with id, category, slug, names, active; then evict")
+    void should_auditDeleteWithBeforeThenEvict_when_typeDeleted() {
+        UUID id = UUID.randomUUID();
+        when(deleteService.deleteServiceType(id)).thenReturn(
+                new ServiceTypeDeletion(id, CATEGORY, "masazh-nih", "Масаж ніг", "", true));
+
+        service.deleteServiceType(ACTOR, id);
+
+        Map<String, Object> before = new LinkedHashMap<>();
+        before.put("id", id.toString());
+        before.put("platformCategoryName", CATEGORY);
+        before.put("slug", "masazh-nih");
+        before.put("nameUk", "Масаж ніг");
+        before.put("nameEn", "");
+        before.put("active", true);
+        InOrder order = inOrder(auditService, cacheEvictor);
+        order.verify(auditService).record(ACTOR, "DELETE", CatalogAuditTargetType.SERVICE_TYPE, id.toString(), before,
+                null);
+        order.verify(cacheEvictor).evictPlatformCatalog();
+        verify(cacheEvictor, never()).evictAll();
+    }
+
+    @Test
+    @DisplayName("a refused delete (in use) propagates the 409 and writes / evicts nothing")
+    void should_propagateInUseWithoutAuditOrEviction_when_deleteRefused() {
+        UUID id = UUID.randomUUID();
+        when(deleteService.deleteServiceType(id)).thenThrow(new CatalogRequestConflictException(
+                CatalogRequestConflictException.Code.CATALOG_IN_USE, CatalogUsage.ofServiceType(2)));
+
+        Throwable thrown = catchThrowable(() -> service.deleteServiceType(ACTOR, id));
+
+        assertThat(thrown).isInstanceOf(CatalogRequestConflictException.class);
+        assertThat(((CatalogRequestConflictException) thrown).getUsage()).isEqualTo(CatalogUsage.ofServiceType(2));
+        verifyNoInteractions(auditService, cacheEvictor);
+    }
+
+    @Test
+    @DisplayName("a malformed category wire name on delete is a 400 before the domain call")
+    void should_throwBadRequestBeforeDelete_when_categoryPathMalformed() {
+        Throwable thrown = catchThrowable(() -> service.deleteCategory(ACTOR, "bad name"));
+
+        assertThat(thrown).isInstanceOf(BusinessException.class);
+        verifyNoInteractions(deleteService, auditService, cacheEvictor);
     }
 }

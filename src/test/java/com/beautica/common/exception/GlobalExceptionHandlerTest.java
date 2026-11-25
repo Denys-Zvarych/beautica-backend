@@ -1327,6 +1327,19 @@ class GlobalExceptionHandlerTest {
                 .isNotBlank();
     }
 
+    @Test
+    @DisplayName("handleCatalogRequestConflict — a fixed wireMessage override replaces the per-code text; data.code kept")
+    void should_useWireMessage_when_catalogConflictCarriesOverride() {
+        var ex = new CatalogRequestConflictException(CatalogRequestConflictException.Code.DUPLICATE_PENDING,
+                "internal text", GlobalExceptionHandler.GENERIC_CONFLICT_MESSAGE);
+
+        ResponseEntity<ApiResponse<CatalogRequestConflictResponse>> response = handler.handleCatalogRequestConflict(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().data().code()).isEqualTo("DUPLICATE_PENDING");
+        assertThat(response.getBody().message()).isEqualTo("Request could not be completed due to a conflict");
+    }
+
     // ── guest reschedule cap (Phase 431, D4b) ──────────────────────────────────
 
     @Test

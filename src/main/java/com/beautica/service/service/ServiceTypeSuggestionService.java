@@ -3,6 +3,7 @@ package com.beautica.service.service;
 import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.CatalogRequestConflictException;
+import com.beautica.common.exception.GlobalExceptionHandler;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
@@ -11,12 +12,14 @@ import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.service.RequestKind;
 import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.entity.ServiceTypeSuggestion;
+import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceTypeSuggestionRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Caching;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -66,6 +69,7 @@ public class ServiceTypeSuggestionService {
     private static final int MAX_EDITED_NAME_LENGTH = 100;
 
     private final ServiceTypeSuggestionRepository suggestionRepository;
+    private final PlatformCategoryRepository platformCategoryRepository;
     private final TokenGenerator tokenGenerator;
     private final EmailService emailService;
     private final PublicBaseUrlProperties publicBaseUrlProperties;
@@ -113,7 +117,39 @@ public class ServiceTypeSuggestionService {
     @Transactional
     public void submitSuggestion(
             String categoryName, String suggestedName, String description, UUID requestedByUserId) {
+        lockSelectableCategory(categoryName);
         persistPendingAndNotify(categoryName, suggestedName, description, requestedByUserId);
+    }
+
+    /**
+     * B505 — takes {@code FOR SHARE} on the named category for the rest of this transaction and re-checks it is still
+     * APPROVED + active under the lock. The suggestion names its category by string only (no FK), so without this a
+     * catalog-admin delete ({@code FOR UPDATE}) running at the same moment could count zero pending suggestions and
+     * remove the category under an uncommitted one. With it the two serialise: a committed suggestion makes the delete
+     * a 409; a committed delete makes this the caller's existing 400 for an unknown category.
+     *
+     * <p>Not on {@link #submitSuggestionInternal}: that runs in REQUIRES_NEW under the category approval, whose own row
+     * lock on the same category would make this wait on its own outer transaction; the approval's lock already fences
+     * a delete.
+     *
+     * <p>Accepted cost: the share lock waits behind a portal rename / hide / decision on the same category (its
+     * {@code FOR NO KEY UPDATE} conflicts with {@code FOR SHARE}) — normally milliseconds; past the 3 s
+     * {@code lock_timeout} it is 409 {@code CATEGORY_BUSY}.
+     */
+    private void lockSelectableCategory(String categoryName) {
+        boolean selectable;
+        try {
+            selectable = platformCategoryRepository.findByNameForShare(categoryName)
+                    .filter(category -> category.isApproved() && category.isActive())
+                    .isPresent();
+        } catch (PessimisticLockingFailureException ex) {
+            // 3 s lock_timeout behind a portal write on the same category: a typed, retry-able 409 instead of the
+            // generic lock-conflict body. Nothing was written (the transaction rolls back).
+            throw categoryBusy();
+        }
+        if (!selectable) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Unknown category: " + categoryName);
+        }
     }
 
     /**
@@ -181,6 +217,11 @@ public class ServiceTypeSuggestionService {
                 throw duplicatePending();
             }
             throw ex;
+        } catch (PessimisticLockingFailureException ex) {
+            // B505: the V197 unique-index wait behind an identical, still-uncommitted submit outlasted the 3 s
+            // lock_timeout the share lock set for this transaction — the same retry-able CATEGORY_BUSY as the share
+            // lock itself. Nothing was written. (Only the user path sets lock_timeout; the internal path waits.)
+            throw categoryBusy();
         }
     }
 
@@ -199,8 +240,18 @@ public class ServiceTypeSuggestionService {
         return false;
     }
 
+    /**
+     * B505 — typed {@code DUPLICATE_PENDING} (B502 convention, {@code data.code}). The exception message and the
+     * response {@code message} (the generic 409 text the provider path always returned) stay byte-identical. Still a
+     * {@code BusinessException} with status 409, so {@code CategoryRequestService}'s 409 swallow is unchanged.
+     */
     private static BusinessException duplicatePending() {
-        return new BusinessException(HttpStatus.CONFLICT, DUPLICATE_PENDING_MESSAGE);
+        return new CatalogRequestConflictException(CatalogRequestConflictException.Code.DUPLICATE_PENDING,
+                DUPLICATE_PENDING_MESSAGE, GlobalExceptionHandler.GENERIC_CONFLICT_MESSAGE);
+    }
+
+    private static CatalogRequestConflictException categoryBusy() {
+        return new CatalogRequestConflictException(CatalogRequestConflictException.Code.CATEGORY_BUSY);
     }
 
     /** B502 — the suggested name before and after a portal edit (for the caller's audit row). */

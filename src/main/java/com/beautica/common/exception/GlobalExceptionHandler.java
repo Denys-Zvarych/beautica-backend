@@ -99,6 +99,9 @@ public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
+    /** The generic 409 text ({@link #handleBusiness}, {@link #handlePessimisticLockingFailure}); byte-stable. */
+    public static final String GENERIC_CONFLICT_MESSAGE = "Request could not be completed due to a conflict";
+
     /**
      * Phase 379 audit (perf LOW F1) — a retired booking link is never re-issued, so its 410 is immutable:
      * {@code public, max-age=0, s-maxage=3600} lets a shared cache/CDN absorb repeated dead-link hits for an
@@ -355,9 +358,12 @@ public class GlobalExceptionHandler {
     /**
      * B502 (SVC-55) — distinct 409 for a refused catalog-admin request edit: the
      * {@link CatalogRequestConflictResponse} body carries {@code REQUEST_NOT_PENDING} / {@code DUPLICATE_PENDING} /
-     * {@code TYPE_EXISTS} (B504 adds {@code CATEGORY_NAME_EXISTS} / {@code CATEGORY_NOT_APPROVED}) under
+     * {@code TYPE_EXISTS} (B504 adds {@code CATEGORY_NAME_EXISTS} / {@code CATEGORY_NOT_APPROVED}; B505 adds
+     * {@code CATALOG_IN_USE} with its usage counts next to the code, and {@code CATEGORY_BUSY}) under
      * {@code data.code}, which {@link #handleBusiness}'s genericised CONFLICT branch would
-     * otherwise drop. The message is fixed here, never {@code ex.getMessage()}. A new code; no existing body changes.
+     * otherwise drop. The message is fixed here, never {@code ex.getMessage()}: the per-code text below, or the
+     * exception's fixed {@code wireMessage} constant (B505: the provider-path {@code DUPLICATE_PENDING} keeps its
+     * pre-existing generic text byte-identical). A new code; no existing body changes.
      */
     @ExceptionHandler(CatalogRequestConflictException.class)
     public ResponseEntity<ApiResponse<CatalogRequestConflictResponse>> handleCatalogRequestConflict(
@@ -366,13 +372,15 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.CONFLICT)
                 .body(new ApiResponse<>(false,
-                        new CatalogRequestConflictResponse(ex.getCode().name()),
-                        switch (ex.getCode()) {
+                        CatalogRequestConflictResponse.of(ex.getCode().name(), ex.getUsage()),
+                        ex.getWireMessage() != null ? ex.getWireMessage() : switch (ex.getCode()) {
                             case REQUEST_NOT_PENDING -> "Request is no longer pending";
                             case DUPLICATE_PENDING -> "A matching request is already pending";
                             case TYPE_EXISTS -> "A service type with this name already exists";
                             case CATEGORY_NAME_EXISTS -> "A category with this name already exists";
                             case CATEGORY_NOT_APPROVED -> "Category is not approved";
+                            case CATALOG_IN_USE -> "Catalog entry is in use; hide it instead";
+                            case CATEGORY_BUSY -> "Category is being updated; please try again";
                         }));
     }
 
@@ -438,7 +446,7 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleBusiness(BusinessException ex) {
         log.debug("Business exception: {}", ex.getMessage());
         String clientMessage = switch (ex.getStatus()) {
-            case CONFLICT -> "Request could not be completed due to a conflict";
+            case CONFLICT -> GENERIC_CONFLICT_MESSAGE;
             case BAD_REQUEST -> "Invalid request";
             // 422 carries deliberate, user-facing domain copy (e.g. the Ukrainian
             // cancel-window-closed message in Phase 13.4) that the client must display
@@ -752,7 +760,7 @@ public class GlobalExceptionHandler {
         log.debug("Pessimistic locking failure (lock_timeout wait or deadlock): {}", ex.getClass().getSimpleName());
         return ResponseEntity
                 .status(HttpStatus.CONFLICT)
-                .body(ApiResponse.error("Request could not be completed due to a conflict"));
+                .body(ApiResponse.error(GENERIC_CONFLICT_MESSAGE));
     }
 
     /**

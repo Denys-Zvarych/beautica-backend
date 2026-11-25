@@ -88,6 +88,46 @@ class CatalogCacheEvictorTest {
     }
 
     @Test
+    @DisplayName("B505 — the platform list is CACHE_NAMES minus the label-holding per-master caches")
+    void should_partitionCacheNames_when_comparingPlatformAndLabelLists() {
+        assertThat(CatalogCacheEvictor.PLATFORM_CATALOG_CACHES)
+                .doesNotContainAnyElementsOf(CatalogCacheEvictor.LABEL_HOLDING_CACHES);
+        assertThat(CatalogCacheEvictor.CACHE_NAMES).containsExactlyElementsOf(java.util.stream.Stream.concat(
+                CatalogCacheEvictor.PLATFORM_CATALOG_CACHES.stream(),
+                CatalogCacheEvictor.LABEL_HOLDING_CACHES.stream()).toList());
+    }
+
+    @Test
+    @DisplayName("B505 — evictPlatformCatalog empties every platform-catalog cache and leaves masterServices / "
+            + "booking-slug-info warm")
+    void should_keepLabelHoldingCaches_when_evictingPlatformCatalogOnly() {
+        evictor.evictPlatformCatalog();
+
+        assertThat(CatalogCacheEvictor.PLATFORM_CATALOG_CACHES).allSatisfy(name ->
+                assertThat(cacheManager.getCache(name).get(KEY)).as(name).isNull());
+        assertThat(CatalogCacheEvictor.LABEL_HOLDING_CACHES).containsExactlyInAnyOrder(
+                "masterServices", "booking-slug-info");
+        assertThat(CatalogCacheEvictor.LABEL_HOLDING_CACHES).allSatisfy(name ->
+                assertThat(cacheManager.getCache(name).get(KEY)).as(name).isNotNull());
+    }
+
+    @Test
+    @DisplayName("B505 — evictPlatformCatalog inside a transaction empties only after commit")
+    void should_evictPlatformCatalogOnlyAfterCommit_when_transactionActive() {
+        TransactionSynchronizationManager.initSynchronization();
+
+        evictor.evictPlatformCatalog();
+        boolean presentBeforeCommit = CatalogCacheEvictor.PLATFORM_CATALOG_CACHES.stream()
+                .allMatch(name -> cacheManager.getCache(name).get(KEY) != null);
+        TransactionSynchronizationUtils.invokeAfterCommit(TransactionSynchronizationManager.getSynchronizations());
+
+        assertThat(presentBeforeCommit).isTrue();
+        assertThat(CatalogCacheEvictor.PLATFORM_CATALOG_CACHES).allSatisfy(name ->
+                assertThat(cacheManager.getCache(name).get(KEY)).as(name).isNull());
+        assertThat(cacheManager.getCache("masterServices").get(KEY)).isNotNull();
+    }
+
+    @Test
     @DisplayName("inside a rolled-back transaction nothing is evicted")
     void should_evictNothing_when_transactionRollsBack() {
         TransactionSynchronizationManager.initSynchronization();

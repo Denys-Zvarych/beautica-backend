@@ -31,7 +31,8 @@ import java.util.UUID;
  *   <li>Hide is {@code active = false} (D1). It does not cascade from a category to its types, and services already
  *       using a hidden row keep working (D4); only new use is blocked.</li>
  * </ul>
- * A value equal to the current one is not a change, so an all-unchanged PATCH changes nothing.
+ * A value equal to the current one is not a change, so an all-unchanged PATCH changes nothing. The B505 delete of an
+ * unused row lives in {@link PlatformCatalogDeleteService}.
  */
 @Service
 @RequiredArgsConstructor

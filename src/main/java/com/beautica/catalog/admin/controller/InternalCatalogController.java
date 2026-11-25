@@ -9,19 +9,23 @@ import com.beautica.catalog.admin.dto.UpdateCatalogServiceTypeRequest;
 import com.beautica.common.ApiResponse;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
 import java.util.UUID;
 
 /**
- * B504 (SVC-56) — the catalog portal's live-catalog page: list, rename, hide and unhide categories and service types.
+ * B504 (SVC-56) — the catalog portal's live-catalog page: list, rename, hide and unhide categories and service types;
+ * B505 (SVC-57) — delete one that nothing uses.
  * Under {@code /api/v1/internal/catalog/} so {@code InternalApiKeyFilter} admits the master key or the catalog-only
  * key (SVC-54); no JWT. Same behaviour on every profile.
  *
@@ -29,7 +33,8 @@ import java.util.UUID;
  * upload {@code PUT /categories/{name}/icon} extends, B539); types by id.
  *
  * <p>Errors: a refused write is a 409 with the stable code under {@code data.code} ({@code TYPE_EXISTS},
- * {@code CATEGORY_NAME_EXISTS}, {@code CATEGORY_NOT_APPROVED}); an empty body, a bad name, a malformed id or wire name
+ * {@code CATEGORY_NAME_EXISTS}, {@code CATEGORY_NOT_APPROVED}, B505 {@code CATALOG_IN_USE} with the usage counts next to
+ * the code); an empty body, a bad name, a malformed id or wire name
  * and a missing / invalid {@value AdminActor#HEADER} are a 400; an unknown category or type is a 404.
  */
 @RestController
@@ -72,5 +77,31 @@ public class InternalCatalogController {
             @Valid @RequestBody UpdateCatalogServiceTypeRequest request) {
         adminService.updateServiceType(AdminActor.of(actorHeader), id, request);
         return ApiResponse.ok(null);
+    }
+
+    /**
+     * B505 — deletes an unused APPROVED category: zero service types (hidden included), zero service definitions naming
+     * it (inactive included) and zero PENDING suggestions. 204; in use is 409 {@code CATALOG_IN_USE} with
+     * {@code {serviceTypes, definitions, pendingSuggestions}}; a pending / rejected request is 409
+     * {@code CATEGORY_NOT_APPROVED}.
+     */
+    @DeleteMapping("/categories/{name}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void deleteCategory(
+            @RequestHeader(value = AdminActor.HEADER, required = false) String actorHeader,
+            @PathVariable String name) {
+        adminService.deleteCategory(AdminActor.of(actorHeader), name);
+    }
+
+    /**
+     * B505 — deletes a service type no service definition (active or inactive) uses. 204; in use is 409
+     * {@code CATALOG_IN_USE} with {@code {definitions}}.
+     */
+    @DeleteMapping("/service-types/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void deleteServiceType(
+            @RequestHeader(value = AdminActor.HEADER, required = false) String actorHeader,
+            @PathVariable UUID id) {
+        adminService.deleteServiceType(AdminActor.of(actorHeader), id);
     }
 }

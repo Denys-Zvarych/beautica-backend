@@ -59,7 +59,7 @@ public class CatalogCacheEvictor {
      * {@code approved-categories} is {@code CategoryRequestService.APPROVED_CATEGORIES_CACHE}; both are literals here
      * and kept honest by the pin test.
      */
-    private static final List<String> PLATFORM_CATALOG_CACHES = List.of(
+    public static final List<String> PLATFORM_CATALOG_CACHES = List.of(
             "service-categories",
             "approved-categories",
             "service-types",
@@ -82,20 +82,34 @@ public class CatalogCacheEvictor {
 
     /** Empties every catalog cache after the current transaction commits (immediately outside one). */
     public void evictAll() {
+        evictAfterCommit(CACHE_NAMES);
+    }
+
+    /**
+     * B505 — empties only {@link #PLATFORM_CATALOG_CACHES}, leaving the hot per-master {@link #LABEL_HOLDING_CACHES}
+     * warm. For a delete of an UNUSED category / type: no service definition references the row, so no
+     * {@code masterServices} / {@code booking-slug-info} entry can hold its label. Same after-commit ordering as
+     * {@link #evictAll}.
+     */
+    public void evictPlatformCatalog() {
+        evictAfterCommit(PLATFORM_CATALOG_CACHES);
+    }
+
+    private void evictAfterCommit(List<String> names) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            evictNow();
+            evictNow(names);
             return;
         }
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                evictNow();
+                evictNow(names);
             }
         });
     }
 
-    private void evictNow() {
-        for (String name : CACHE_NAMES) {
+    private void evictNow(List<String> names) {
+        for (String name : names) {
             Cache cache = cacheManager.getCache(name);
             if (cache == null) {
                 // Never throw: after commit, an exception would turn a committed write into a 500.

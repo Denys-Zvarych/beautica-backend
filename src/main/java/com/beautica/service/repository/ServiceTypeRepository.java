@@ -175,8 +175,11 @@ public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID>,
             @Param("categoryName") String categoryName, @Param("nameUk") String nameUk);
 
     /**
-     * B504 — the type a catalog-admin rename / hide / unhide mutates, locked ({@code FOR UPDATE}) so two concurrent
-     * portal writes on one type serialise. No graph: the write reads only plain columns.
+     * B504 — the type a catalog-admin rename / hide / unhide mutates, row-locked so two concurrent portal writes on one
+     * type serialise. Hibernate 6 renders {@code PESSIMISTIC_WRITE} on PostgreSQL as {@code FOR NO KEY UPDATE} (not
+     * {@code FOR UPDATE}); that conflicts with itself, which is all edit-vs-edit needs (the key {@code id} never
+     * changes). It does NOT block the {@code FOR KEY SHARE} of an FK check, so it cannot fence a concurrent service
+     * insert — the B505 delete uses {@link #findByIdForDelete}. No graph: the write reads only plain columns.
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select t from ServiceType t where t.id = :id")
@@ -203,4 +206,25 @@ public interface ServiceTypeRepository extends JpaRepository<ServiceType, UUID>,
                                                     @Param("nameUk") String nameUk,
                                                     @Param("excludeId") UUID excludeId,
                                                     @Param("activeOnly") boolean activeOnly);
+
+    /**
+     * B505 (SVC-57) — every type under the category, hidden ones included; the catalog-admin delete refuses a category
+     * with any (V73 FK RESTRICT is the backstop). Backed by the full {@code idx_service_types_platform_category} (V265).
+     */
+    @Query("SELECT COUNT(t) FROM ServiceType t WHERE t.platformCategoryName = :categoryName")
+    long countAllByPlatformCategoryName(@Param("categoryName") String categoryName);
+
+    /**
+     * B505 — the type a catalog-admin DELETE removes, locked with a real {@code FOR UPDATE} (native on purpose; see
+     * {@code PlatformCategoryRepository#findByNameForDeleteNoLockTimeout}): a concurrent service-definition insert on
+     * this type (V111 FK, {@code FOR KEY SHARE}) either commits before the usage count or waits and then fails its FK.
+     */
+    @Query(value = "SELECT st.* FROM service_types st WHERE st.id = :id FOR UPDATE", nativeQuery = true)
+    Optional<ServiceType> findByIdForDeleteNoLockTimeout(@Param("id") UUID id);
+
+    /** {@link #findByIdForDeleteNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default Optional<ServiceType> findByIdForDelete(UUID id) {
+        applyTransactionLockTimeout();
+        return findByIdForDeleteNoLockTimeout(id);
+    }
 }

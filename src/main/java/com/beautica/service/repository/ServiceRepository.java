@@ -448,4 +448,18 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
     List<ServiceDefinition> findBookableServicesBySalon(
             @Param("salonId") UUID salonId,
             Pageable pageable);
+
+    /**
+     * B505 (SVC-57) — every service definition, ACTIVE OR INACTIVE (SVC-29: never purged), on this service type; the
+     * catalog-admin delete refuses a type with any. Backed by {@code idx_service_def_service_type}.
+     */
+    @Query("SELECT COUNT(sd) FROM ServiceDefinition sd WHERE sd.serviceType.id = :serviceTypeId")
+    long countAllByServiceTypeId(@Param("serviceTypeId") UUID serviceTypeId);
+
+    /**
+     * B505 (SVC-57) — every service definition, active or inactive, whose plain {@code category} string (no FK) names
+     * this category; the catalog-admin delete refuses a category with any. Backed by {@code idx_service_def_category}.
+     */
+    @Query("SELECT COUNT(sd) FROM ServiceDefinition sd WHERE sd.category = :category")
+    long countAllByCategory(@Param("category") String category);
 }

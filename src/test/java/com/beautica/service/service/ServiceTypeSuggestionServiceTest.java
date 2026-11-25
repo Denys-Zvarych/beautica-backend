@@ -9,8 +9,10 @@ import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.service.RequestKind;
+import com.beautica.service.entity.PlatformCategory;
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.entity.ServiceTypeSuggestionStatus;
+import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceTypeSuggestionRepository;
 import com.beautica.service.service.ServiceTypeSuggestionService.DecisionOutcome;
 import org.junit.jupiter.api.BeforeEach;
@@ -21,6 +23,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.hibernate.exception.ConstraintViolationException;
+import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.test.util.ReflectionTestUtils;
 
@@ -38,6 +41,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -65,6 +69,7 @@ class ServiceTypeSuggestionServiceTest {
     private static final String DESCRIPTION = "Освітлення кінчиків";
 
     @Mock private ServiceTypeSuggestionRepository suggestionRepository;
+    @Mock private PlatformCategoryRepository platformCategoryRepository;
     @Mock private TokenGenerator tokenGenerator;
     @Mock private EmailService emailService;
     @Mock private PublicBaseUrlProperties publicBaseUrlProperties;
@@ -78,10 +83,13 @@ class ServiceTypeSuggestionServiceTest {
     void setUp() {
         Clock fixedClock = Clock.fixed(NOW, ZoneOffset.UTC);
         service = new ServiceTypeSuggestionService(
-                suggestionRepository, tokenGenerator, emailService,
+                suggestionRepository, platformCategoryRepository, tokenGenerator, emailService,
                 publicBaseUrlProperties, promotionService, fixedClock, inAppNotificationService,
                 notificationOutboxService);
         ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
+        // B505: submitSuggestion takes FOR SHARE on its category first; the default is a selectable one.
+        lenient().when(platformCategoryRepository.findByNameForShare(CATEGORY))
+                .thenReturn(Optional.of(PlatformCategory.ofApproved(CATEGORY, "Волосся")));
     }
 
     private ServiceTypeSuggestion pendingSuggestion(OffsetDateTime expiresAt) {
@@ -191,6 +199,96 @@ class ServiceTypeSuggestionServiceTest {
                 .isSameAs(other);
 
         verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("B505: a category deleted (or gone) by the time the FOR SHARE lock is granted is a 400; nothing is "
+            + "persisted or emailed")
+    void should_throwBadRequest_when_categoryGoneUnderShareLock() {
+        when(platformCategoryRepository.findByNameForShare(CATEGORY)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.submitSuggestion(CATEGORY, SUGGESTED, DESCRIPTION, UUID.randomUUID()))
+                .isInstanceOf(BusinessException.class)
+                .extracting("status").hasToString("400 BAD_REQUEST");
+
+        verifyNoInteractions(suggestionRepository, emailService, tokenGenerator);
+    }
+
+    @Test
+    @DisplayName("B505: a category hidden under the share lock is the same 400")
+    void should_throwBadRequest_when_categoryHiddenUnderShareLock() {
+        PlatformCategory hidden = PlatformCategory.ofApproved(CATEGORY, "Волосся");
+        hidden.changeActive(false);
+        when(platformCategoryRepository.findByNameForShare(CATEGORY)).thenReturn(Optional.of(hidden));
+
+        assertThatThrownBy(() -> service.submitSuggestion(CATEGORY, SUGGESTED, DESCRIPTION, UUID.randomUUID()))
+                .isInstanceOf(BusinessException.class)
+                .extracting("status").hasToString("400 BAD_REQUEST");
+
+        verifyNoInteractions(suggestionRepository, emailService);
+    }
+
+    @Test
+    @DisplayName("B505: a share-lock timeout behind a portal write on the category is the typed, retry-able 409 "
+            + "CATEGORY_BUSY; nothing persisted or emailed")
+    void should_throwCategoryBusy_when_shareLockTimesOut() {
+        when(platformCategoryRepository.findByNameForShare(CATEGORY))
+                .thenThrow(new CannotAcquireLockException("lock_timeout"));
+
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(
+                () -> service.submitSuggestion(CATEGORY, SUGGESTED, DESCRIPTION, UUID.randomUUID()));
+
+        assertThat(thrown).isInstanceOf(CatalogRequestConflictException.class);
+        assertThat(((CatalogRequestConflictException) thrown).getCode())
+                .isEqualTo(CatalogRequestConflictException.Code.CATEGORY_BUSY);
+        verifyNoInteractions(suggestionRepository, emailService, tokenGenerator);
+    }
+
+    @Test
+    @DisplayName("B505: a committed identical suggestion is the typed DUPLICATE_PENDING; exception message and wire "
+            + "message unchanged")
+    void should_throwTypedDuplicatePending_when_identicalPendingSuggestionExists() {
+        when(suggestionRepository.existsPendingByCategoryNameAndSuggestedNameIgnoreCase(CATEGORY, SUGGESTED))
+                .thenReturn(true);
+
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(
+                () -> service.submitSuggestion(CATEGORY, SUGGESTED, DESCRIPTION, UUID.randomUUID()));
+
+        assertThat(thrown).isInstanceOf(CatalogRequestConflictException.class)
+                .hasMessage("A matching suggestion is already pending review");
+        CatalogRequestConflictException typed = (CatalogRequestConflictException) thrown;
+        assertThat(typed.getCode()).isEqualTo(CatalogRequestConflictException.Code.DUPLICATE_PENDING);
+        assertThat(typed.getWireMessage()).isEqualTo("Request could not be completed due to a conflict");
+    }
+
+    @Test
+    @DisplayName("B505: the V197 unique-index wait timing out at the insert is the same CATEGORY_BUSY; no email")
+    void should_throwCategoryBusy_when_insertLockTimesOut() {
+        when(suggestionRepository.existsPendingByCategoryNameAndSuggestedNameIgnoreCase(CATEGORY, SUGGESTED))
+                .thenReturn(false);
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(suggestionRepository.saveAndFlush(any())).thenThrow(new CannotAcquireLockException("lock_timeout"));
+
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(
+                () -> service.submitSuggestion(CATEGORY, SUGGESTED, DESCRIPTION, UUID.randomUUID()));
+
+        assertThat(((CatalogRequestConflictException) thrown).getCode())
+                .isEqualTo(CatalogRequestConflictException.Code.CATEGORY_BUSY);
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("B505: the internal (category-approval) submit takes no share lock — it would wait on its own outer "
+            + "approval transaction")
+    void should_notLockCategory_when_submittedInternally() {
+        when(suggestionRepository.existsPendingByCategoryNameAndSuggestedNameIgnoreCase(CATEGORY, SUGGESTED))
+                .thenReturn(true);
+
+        assertThatThrownBy(() -> service.submitSuggestionInternal(CATEGORY, SUGGESTED, null, UUID.randomUUID()))
+                .isInstanceOf(BusinessException.class);
+
+        verifyNoInteractions(platformCategoryRepository);
     }
 
     private static DataIntegrityViolationException integrityViolation(String constraintName) {

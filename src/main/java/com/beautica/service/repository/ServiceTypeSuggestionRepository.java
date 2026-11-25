@@ -93,4 +93,13 @@ public interface ServiceTypeSuggestionRepository extends JpaRepository<ServiceTy
             @Param("categoryName") String categoryName,
             @Param("suggestedName") String suggestedName,
             @Param("excludedId") UUID excludedId);
+
+    /**
+     * B505 (SVC-57) — PENDING suggestions naming the category (a plain string, no FK); the catalog-admin delete refuses
+     * a category with any. Decided rows are kept as history and do not block. The literal {@code 'PENDING'} (not a
+     * bind parameter) lets the planner always match the V197 partial index {@code WHERE status = 'PENDING'}.
+     */
+    @Query(value = "SELECT COUNT(*) FROM service_type_suggestion WHERE category_name = :categoryName "
+            + "AND status = 'PENDING'", nativeQuery = true)
+    long countPendingByCategoryName(@Param("categoryName") String categoryName);
 }
