@@ -148,7 +148,7 @@ public class ServiceTypeSuggestionService {
             throw categoryBusy();
         }
         if (!selectable) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST, "Unknown category: " + categoryName);
+            throw BusinessException.withUserInput(HttpStatus.BAD_REQUEST, "Unknown category: " + categoryName);
         }
     }
 

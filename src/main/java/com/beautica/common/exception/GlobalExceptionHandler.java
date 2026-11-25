@@ -397,7 +397,9 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(CatalogRequestConflictException.class)
     public ResponseEntity<ApiResponse<CatalogRequestConflictResponse>> handleCatalogRequestConflict(
             CatalogRequestConflictException ex) {
-        log.debug("Catalog request edit refused: {}", ex.getCode());
+        // Phase 500: a typed catalog 409 keeps the WARN «Business 409» line handleBusiness would have written (the
+        // provider-path DUPLICATE_PENDING was a plain BusinessException before B505). Messages are fixed constants.
+        logBusiness(ex);
         return ResponseEntity
                 .status(HttpStatus.CONFLICT)
                 .body(new ApiResponse<>(false,

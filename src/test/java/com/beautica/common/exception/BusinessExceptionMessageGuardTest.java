@@ -65,6 +65,12 @@ class BusinessExceptionMessageGuardTest {
                     "message", 1, PASS_THROUGH),
             new Reviewed("com/beautica/common/exception/ConflictException.java",
                     "message", 1, "super pass-through; every new ConflictException(...) is a scanned throw site"),
+            new Reviewed("com/beautica/common/exception/CatalogRequestConflictException.java",
+                    "message", 1, "enum name, or the caller's fixed constant (ServiceTypeSuggestionService "
+                            + "DUPLICATE_PENDING_MESSAGE); not a PassThroughHelper: the (code, usage) overload "
+                            + "puts a CatalogUsage at the message position"),
+            new Reviewed("com/beautica/catalog/admin/CatalogAdminAuditService.java",
+                    "\"Invalid catalog audit entry: \" + detail", 1, PASS_THROUGH),
             new Reviewed("com/beautica/common/exception/IdentityException.java",
                     "code.clientMessage()", 1, "enum-constant client messages"),
             new Reviewed("com/beautica/common/exception/OwnerAccountDeletionBlockedException.java",
@@ -127,7 +133,9 @@ class BusinessExceptionMessageGuardTest {
                     Set.of("assertBookingStillConfirmedAndFree", "assertVisitItemsStillConfirmedAndFree", "evaluate"),
                     "staleMessage"),
             new PassThroughHelper("com/beautica/common/exception/InviteTokenException.java",
-                    "com/beautica/", Set.of("InviteTokenException"), "message"));
+                    "com/beautica/", Set.of("InviteTokenException"), "message"),
+            new PassThroughHelper("com/beautica/catalog/admin/CatalogAdminAuditService.java",
+                    "com/beautica/catalog/admin/CatalogAdminAuditService.java", Set.of("invalid"), "detail"));
 
     @Test
     @DisplayName("every interpolated business message is withUserInput or reviewed, with the pinned site count")
