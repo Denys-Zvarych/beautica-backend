@@ -5,7 +5,6 @@ import com.beautica.common.util.ContactMask;
 import com.beautica.notification.service.ContactChangeKind;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
 import com.beautica.booking.BookingTestFixtures;
 import com.beautica.common.TimeZones;
 import com.beautica.notification.service.BookingVisit;
@@ -17,7 +16,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 
 import java.time.ZonedDateTime;
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -25,7 +23,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
-import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
@@ -39,27 +36,12 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
 
     private static final String REQUEST_URL = "/api/v1/users/me/email/request-code";
     private static final String VERIFY_URL = "/api/v1/users/me/email/verify";
-    private static final long MAIL_WAIT_MS = 5_000;
 
     @Autowired
     private NotificationOutboxDrainWorker drainWorker;
 
     @Autowired
     private org.springframework.security.crypto.password.PasswordEncoder passwordEncoder;
-
-    private String mailedCode(String email) {
-        ArgumentCaptor<String> code = ArgumentCaptor.forClass(String.class);
-        verify(emailNotificationService).sendVerificationEmail(eq(email), code.capture());
-        return code.getValue();
-    }
-
-    /** The LAST code mailed to {@code email} (several requests in one test). */
-    private String lastMailedCode(String email) {
-        ArgumentCaptor<String> code = ArgumentCaptor.forClass(String.class);
-        verify(emailNotificationService, atLeastOnce()).sendVerificationEmail(eq(email), code.capture());
-        List<String> codes = code.getAllValues();
-        return codes.get(codes.size() - 1);
-    }
 
     /** Moves the pending row's sent_at past the 60 s cooldown (sent_at stays before expires_at — V245 CHECK). */
     private void passCooldown(UUID id) {
@@ -95,7 +77,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         assertThat(jdbcTemplate.queryForObject("SELECT email FROM user_pending_emails WHERE user_id = ?",
                 String.class, id)).isEqualTo(email);
 
-        ResponseEntity<String> verified = postAs(token, VERIFY_URL, Map.of("email", email, "code", mailedCode(email), "currentPassword", PASSWORD));
+        ResponseEntity<String> verified = postAs(token, VERIFY_URL, Map.of("email", email, "code", mailedCodeTo(email), "currentPassword", PASSWORD));
 
         assertThat(verified.getStatusCode()).as("body: %s", verified.getBody()).isEqualTo(HttpStatus.OK);
         assertThat(emailRow(id)).containsEntry("email", email).containsEntry("email_verified", true);
@@ -116,7 +98,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         String token = accessToken(phone);
         String email = newEmail();
         postAs(token, REQUEST_URL, Map.of("email", email));
-        String wrong = mailedCode(email).equals("000000") ? "111111" : "000000";
+        String wrong = mailedCodeTo(email).equals("000000") ? "111111" : "000000";
 
         ResponseEntity<String> response = postAs(token, VERIFY_URL, Map.of("email", email, "code", wrong, "currentPassword", PASSWORD));
 
@@ -136,7 +118,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
 
         ResponseEntity<String> requested = postAs(token, REQUEST_URL, Map.of("email", taken));
         ResponseEntity<String> verified = postAs(token, VERIFY_URL,
-                Map.of("email", taken, "code", mailedCode(taken), "currentPassword", PASSWORD));
+                Map.of("email", taken, "code", mailedCodeTo(taken), "currentPassword", PASSWORD));
 
         assertThat(requested.getStatusCode()).as("no registration oracle at request").isEqualTo(HttpStatus.OK);
         assertThat(verified.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
@@ -169,7 +151,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         postAs(token, REQUEST_URL, Map.of("email", email));
 
         ResponseEntity<String> response = postAs(token, VERIFY_URL,
-                Map.of("email", email, "code", mailedCode(email), "currentPassword", "Wr0ng!Passw0rd#"));
+                Map.of("email", email, "code", mailedCodeTo(email), "currentPassword", "Wr0ng!Passw0rd#"));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(json(response).at("/data/code").asText()).isEqualTo("CURRENT_PASSWORD_INVALID");
@@ -186,7 +168,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         String token = accessToken(phone);
         String email = newEmail();
         postAs(token, REQUEST_URL, Map.of("email", email));
-        String code = mailedCode(email);
+        String code = mailedCodeTo(email);
         for (int i = 0; i < 5; i++) {
             postAs(token, VERIFY_URL, Map.of("email", email, "code", code, "currentPassword", "Wr0ng!Passw0rd#"));
         }
@@ -223,7 +205,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         String email = newEmail();
         postAs(token, REQUEST_URL, Map.of("email", email));
 
-        ResponseEntity<String> response = postAs(token, VERIFY_URL, Map.of("email", email, "code", mailedCode(email)));
+        ResponseEntity<String> response = postAs(token, VERIFY_URL, Map.of("email", email, "code", mailedCodeTo(email)));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(json(response).at("/data/code").asText()).isEqualTo("CURRENT_PASSWORD_INVALID");
@@ -238,7 +220,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         String token = accessToken(phone);
         String email = newEmail();
         postAs(token, REQUEST_URL, Map.of("email", email));
-        String code = mailedCode(email);
+        String code = mailedCodeTo(email);
         seedUser("CLIENT", email, true, null, null);
 
         ResponseEntity<String> response = postAs(token, VERIFY_URL, Map.of("email", email, "code", code, "currentPassword", PASSWORD));
@@ -268,7 +250,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         String token = accessToken(phone);
         String requested = newEmail();
         postAs(token, REQUEST_URL, Map.of("email", requested));
-        String code = mailedCode(requested);
+        String code = mailedCodeTo(requested);
 
         ResponseEntity<String> response = postAs(token, VERIFY_URL, Map.of("email", newEmail(), "code", code, "currentPassword", PASSWORD));
 
@@ -290,7 +272,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         assertThat(emailRow(id)).as("requested, not verified: the old address stays")
                 .containsEntry("email", oldEmail).containsEntry("email_verified", true);
         ResponseEntity<String> verified = postAs(token, VERIFY_URL,
-                Map.of("email", newEmail, "code", mailedCode(newEmail), "currentPassword", PASSWORD));
+                Map.of("email", newEmail, "code", mailedCodeTo(newEmail), "currentPassword", PASSWORD));
         assertThat(verified.getStatusCode()).as("body: %s", verified.getBody()).isEqualTo(HttpStatus.OK);
         assertThat(emailRow(id)).containsEntry("email", newEmail).containsEntry("email_verified", true);
         assertThat(post(LOGIN_URL, Map.of("identifier", oldEmail, "password", PASSWORD)).getStatusCode())
@@ -310,7 +292,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         for (int round = 0; round < 2; round++) {
             passCooldown(id);
             postAs(token, REQUEST_URL, Map.of("email", email));
-            String wrong = wrongCodeFor(lastMailedCode(email));
+            String wrong = wrongCodeFor(mailedCodeTo(email, round + 1));
             for (int i = 0; i < 5; i++) {
                 postAs(token, VERIFY_URL, Map.of("email", email, "code", wrong, "currentPassword", PASSWORD));
             }
@@ -319,7 +301,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         postAs(token, REQUEST_URL, Map.of("email", email));
 
         ResponseEntity<String> right = postAs(token, VERIFY_URL,
-                Map.of("email", email, "code", lastMailedCode(email), "currentPassword", PASSWORD));
+                Map.of("email", email, "code", mailedCodeTo(email, 3), "currentPassword", PASSWORD));
 
         assertThat(right.getStatusCode()).as("cumulative lockout survives a resend").isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(json(right).at("/data/code").asText()).isEqualTo("INVALID_CODE");
@@ -370,7 +352,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         verify(emailNotificationService).sendNewBookingEmail(isNull(), any(BookingVisit.class));
         verify(emailNotificationService, never()).sendNewBookingEmail(eq(email), any(BookingVisit.class));
 
-        postAs(providerToken, VERIFY_URL, Map.of("email", email, "code", mailedCode(email), "currentPassword", PASSWORD));
+        postAs(providerToken, VERIFY_URL, Map.of("email", email, "code", mailedCodeTo(email), "currentPassword", PASSWORD));
         clientBooks(fixtures, clientToken, masterId, masterServiceId, 3);
         drainWorker.drain();
 
@@ -391,7 +373,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         }
 
         ResponseEntity<String> verified = postAs(token, VERIFY_URL,
-                Map.of("email", email, "code", mailedCode(email), "currentPassword", PASSWORD));
+                Map.of("email", email, "code", mailedCodeTo(email), "currentPassword", PASSWORD));
 
         assertThat(verified.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(json(verified).at("/data/code").asText()).isEqualTo("CURRENT_PASSWORD_INVALID");
@@ -408,7 +390,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         String first = newEmail();
         String second = newEmail();
         postAs(token, REQUEST_URL, Map.of("email", first));
-        postAs(token, VERIFY_URL, Map.of("email", first, "code", lastMailedCode(first), "currentPassword", PASSWORD));
+        postAs(token, VERIFY_URL, Map.of("email", first, "code", mailedCodeTo(first), "currentPassword", PASSWORD));
         // two changes inside one second share the TYPE:<user>:<epoch s> dedup key; move the first one aside
         jdbcTemplate.update("UPDATE in_app_notification SET dedup_key = type || ':' || recipient_user_id || ':1' "
                 + "WHERE recipient_user_id = ?", id);
@@ -416,7 +398,7 @@ class NotificationEmailIT extends AbstractPhoneIdentityIT {
         postAs(token, REQUEST_URL, Map.of("email", second));
 
         ResponseEntity<String> verified = postAs(token, VERIFY_URL,
-                Map.of("email", second, "code", lastMailedCode(second), "currentPassword", PASSWORD));
+                Map.of("email", second, "code", mailedCodeTo(second), "currentPassword", PASSWORD));
 
         assertThat(verified.getStatusCode()).as("body: %s", verified.getBody()).isEqualTo(HttpStatus.OK);
         assertThat(jdbcTemplate.queryForList("SELECT masked_contact FROM in_app_notification "

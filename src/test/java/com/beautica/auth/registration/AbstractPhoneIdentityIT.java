@@ -54,6 +54,8 @@ public abstract class AbstractPhoneIdentityIT extends AbstractIntegrationTest {
     protected static final String VERIFY_URL = "/api/v1/auth/register/phone/otp/verify";
     protected static final String PASSWORD = "Str0ng!Passw0rd#";
     protected static final String SUPPORT_INBOX = "support-inbox@beautica.test";
+    /** Email codes are handed to {@code emailExecutor} after commit, so they land after the response returns. */
+    protected static final long MAIL_WAIT_MS = 5_000;
 
     @Autowired
     protected TestRestTemplate restTemplate;
@@ -190,6 +192,24 @@ public abstract class AbstractPhoneIdentityIT extends AbstractIntegrationTest {
         Mockito.verify(otpSmsSender, Mockito.atLeastOnce()).send(eq(phoneE164), text.capture());
         List<String> texts = text.getAllValues();
         return texts.get(texts.size() - 1).replaceAll("(?s).*?(\\d{6}).*", "$1");
+    }
+
+    /** The code of the ONE verification mail sent to {@code email}; waits for the after-commit hand-off. */
+    protected String mailedCodeTo(String email) {
+        return mailedCodeTo(email, 1);
+    }
+
+    /**
+     * The code of the {@code nth} verification mail to {@code email}: waits until exactly {@code nth} were sent (the
+     * mail goes out after commit on {@code emailExecutor}), then returns the last one.
+     */
+    protected String mailedCodeTo(String email, int nth) {
+        Mockito.verify(emailNotificationService, Mockito.timeout(MAIL_WAIT_MS).times(nth))
+                .sendVerificationEmail(eq(email), Mockito.anyString());
+        ArgumentCaptor<String> code = ArgumentCaptor.forClass(String.class);
+        Mockito.verify(emailNotificationService, Mockito.times(nth)).sendVerificationEmail(eq(email), code.capture());
+        List<String> codes = code.getAllValues();
+        return codes.get(codes.size() - 1);
     }
 
     /** send → capture code → verify; returns the registration ticket. */
