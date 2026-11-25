@@ -24,6 +24,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.domain.Page;
@@ -658,7 +660,7 @@ class ProviderClientServiceTest {
         when(row.getTotal()).thenReturn(41L);
         when(row.getAnchorBookingId()).thenReturn(bookingId);
         when(row.getClientId()).thenReturn(userId);
-        when(repository.pageBySalon(eq(salonId), any(), eq(null), eq(20), eq(0L))).thenReturn(List.of(row));
+        when(repository.pageBySalon(eq(salonId), any(), eq(null), eq(null), eq(20), eq(0L))).thenReturn(List.of(row));
         when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
                 .thenReturn(new BlockedAmong(Set.of(), Set.of()));
 
@@ -668,7 +670,7 @@ class ProviderClientServiceTest {
         assertThat(page.getTotalElements()).isEqualTo(41);
         assertThat(page.getContent()).hasSize(1);
         assertThat(page.getContent().get(0).userId()).isEqualTo(userId);
-        verify(repository).pageBySalon(eq(salonId), any(), eq(null), eq(20), eq(0L));
+        verify(repository).pageBySalon(eq(salonId), any(), eq(null), eq(null), eq(20), eq(0L));
         verifyNoMoreInteractions(repository);
     }
 
@@ -679,7 +681,7 @@ class ProviderClientServiceTest {
                 mock(com.beautica.client.provider.repository.ClientListRowProjection.class);
         when(placeholder.getTotal()).thenReturn(7L);
         when(placeholder.getAnchorBookingId()).thenReturn(null);
-        when(repository.pageByMaster(eq(masterId), any(), eq(null), eq(5), eq(25L))).thenReturn(List.of(placeholder));
+        when(repository.pageByMaster(eq(masterId), any(), eq(null), eq(null), eq(5), eq(25L))).thenReturn(List.of(placeholder));
         when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
                 .thenReturn(new BlockedAmong(Set.of(), Set.of()));
 
@@ -708,7 +710,7 @@ class ProviderClientServiceTest {
 
     private List<com.beautica.client.provider.dto.ClientListItemResponse> list(
             com.beautica.client.provider.repository.ClientListRowProjection... rows) {
-        when(repository.pageBySalon(eq(salonId), any(), eq(null), eq(20), eq(0L))).thenReturn(List.of(rows));
+        when(repository.pageBySalon(eq(salonId), any(), eq(null), eq(null), eq(20), eq(0L))).thenReturn(List.of(rows));
         return service.listClients(new SalonScope(salonId, null), null, PageRequest.of(0, 20)).getContent();
     }
 
@@ -803,5 +805,87 @@ class ProviderClientServiceTest {
         assertThat(rows.get(0).ratingCount()).isZero();
         assertThat(rows.get(1).ratingAvg()).isEqualByComparingTo("3.50");
         assertThat(rows.get(1).ratingCount()).isEqualTo(2);
+    }
+
+    // ── B550: phone mode for q + name parts on the card ──────────────────────
+
+    private void stubEmptyMasterPage() {
+        com.beautica.client.provider.repository.ClientListRowProjection placeholder =
+                mock(com.beautica.client.provider.repository.ClientListRowProjection.class);
+        lenient().when(placeholder.getTotal()).thenReturn(0L);
+        when(repository.pageByMaster(eq(masterId), any(), any(), any(), eq(20), eq(0L)))
+                .thenReturn(List.of(placeholder));
+        when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+    }
+
+    @ParameterizedTest(name = "q=''{0}'' -> digits {1}")
+    @CsvSource(value = {
+            "067|067",
+            "+380 67|38067",
+            "(067) 123-45.67|0671234567",
+            "06|NULL",
+            "abc|NULL",
+            "Оля 067|NULL",
+            "+ 0 6|NULL"
+    }, delimiter = '|', nullValues = "NULL")
+    @DisplayName("normaliseQuery phone mode: only a phone-shaped q with >= 3 digits sends digits; the name text is kept")
+    void should_classifyPhoneMode_when_phoneAudienceSearches(String q, String expectedDigits) {
+        // lenient: a name-shaped q never asks the policy (pinned by should_notAskPhonePolicy_when_qIsNotPhoneShaped)
+        lenient().when(authz.isGuestPhoneAudience()).thenReturn(true);
+        stubEmptyMasterPage();
+
+        service.listClients(new MasterScope(masterId, null), q, PageRequest.of(0, 20));
+
+        verify(repository).pageByMaster(eq(masterId), any(), eq(q.strip()), eq(expectedDigits), eq(20), eq(0L));
+    }
+
+    @Test
+    @DisplayName("phone mode is ignored for a non-phone audience (SALON_MASTER): digits never reach the SQL")
+    void should_sendNoDigits_when_audienceMayNotSeePhones() {
+        when(authz.isGuestPhoneAudience()).thenReturn(false);
+        stubEmptyMasterPage();
+
+        service.listClients(new MasterScope(masterId, salonId), "0671234", PageRequest.of(0, 20));
+
+        verify(repository).pageByMaster(eq(masterId), any(), eq("0671234"), eq(null), eq(20), eq(0L));
+    }
+
+    @Test
+    @DisplayName("a name-shaped q never asks the phone policy")
+    void should_notAskPhonePolicy_when_qIsNotPhoneShaped() {
+        stubEmptyMasterPage();
+
+        service.listClients(new MasterScope(masterId, null), "Оля", PageRequest.of(0, 20));
+
+        verify(authz, never()).isGuestPhoneAudience();
+        verify(repository).pageByMaster(eq(masterId), any(), eq("Оля"), eq(null), eq(20), eq(0L));
+    }
+
+    @Test
+    @DisplayName("registered card returns the account first and last name separately")
+    void should_returnFirstAndLastName_when_registeredCardRead() {
+        when(repository.cardUserByMaster(masterId, userId, utc(NOW))).thenAnswer(i -> registeredRow(0, BigDecimal.ZERO));
+        when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        ClientCardResponse card = service.getCard(new MasterScope(masterId, salonId), new ClientRef.Registered(userId));
+
+        assertThat(card.firstName()).isEqualTo("Анна");
+        assertThat(card.lastName()).isEqualTo("Коваль");
+        assertThat(card.displayName()).isEqualTo("Анна Коваль");
+    }
+
+    @Test
+    @DisplayName("guest card returns the named booking's name pair; a blank surname is null")
+    void should_returnGuestNameParts_when_guestCardRead() {
+        when(repository.cardGuestByMaster(masterId, bookingId, utc(NOW))).thenAnswer(i -> guestRow());
+        when(phoneHasher.tryHash(PHONE)).thenReturn(Optional.empty());
+
+        ClientCardResponse card = service.getCard(new MasterScope(masterId, salonId),
+                new ClientRef.GuestAnchor(bookingId));
+
+        assertThat(card.firstName()).isEqualTo("Іванна");
+        assertThat(card.lastName()).isNull();
     }
 }

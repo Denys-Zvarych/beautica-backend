@@ -22,17 +22,18 @@ public interface ProviderClientRepository extends Repository<Booking, UUID> {
     @Query(value = ClientListSql.PAGE_SALON, nativeQuery = true)
     List<ClientListRowProjection> pageBySalon(
             @Param("salonId") UUID salonId, @Param("now") OffsetDateTime now, @Param("q") String q,
-            @Param("limit") int limit, @Param("offset") long offset);
+            @Param("digits") String digits, @Param("limit") int limit, @Param("offset") long offset);
 
     @Query(value = ClientListSql.PAGE_SALON_MASTER, nativeQuery = true)
     List<ClientListRowProjection> pageBySalonAndMaster(
             @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("now") OffsetDateTime now,
-            @Param("q") String q, @Param("limit") int limit, @Param("offset") long offset);
+            @Param("q") String q, @Param("digits") String digits, @Param("limit") int limit,
+            @Param("offset") long offset);
 
     @Query(value = ClientListSql.PAGE_MASTER, nativeQuery = true)
     List<ClientListRowProjection> pageByMaster(
             @Param("masterId") UUID masterId, @Param("now") OffsetDateTime now, @Param("q") String q,
-            @Param("limit") int limit, @Param("offset") long offset);
+            @Param("digits") String digits, @Param("limit") int limit, @Param("offset") long offset);
 
     // ── B508: client card (one aggregate row, always returned; totalVisits 0 = unknown / out of scope) ──
 
