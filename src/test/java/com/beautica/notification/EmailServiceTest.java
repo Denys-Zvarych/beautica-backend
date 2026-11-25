@@ -156,7 +156,7 @@ class EmailServiceTest {
         log.debug("Act: sendCategoryRequestNotification with a clean payload");
         realEmailService.sendCategoryRequestNotification(
                 admin, "user-123", "NAIL_ART", "Нейл-арт",
-                "https://api.beautica.app/api/v1/service-categories/requests/review?token=abc123");
+                "https://beautica.app/admin/requests");
 
         verify(mailSender).send(realMessage);
         assertThat(realMessage.getAllRecipients())
@@ -182,7 +182,7 @@ class EmailServiceTest {
         log.debug("Act: render with a markup-laden displayName — Thymeleaf th:text must escape it");
         realEmailService.sendCategoryRequestNotification(
                 "admin@beautica.app", "user-123", "NAIL_ART", malicious,
-                "https://api.beautica.app/api/v1/service-categories/requests/review?token=abc123");
+                "https://beautica.app/admin/requests");
 
         String html = realMessage.getContent().toString();
         assertThat(html)
@@ -191,26 +191,6 @@ class EmailServiceTest {
         assertThat(html)
                 .as("the markup must appear HTML-entity-escaped")
                 .contains("&lt;script&gt;");
-    }
-
-    @Test
-    @DisplayName("sendCategoryRequestNotification carries the reviewUrl token unbroken in the approve link")
-    void should_carryReviewUrlTokenUnbroken_when_categoryRequestNotificationRendered() throws Exception {
-        var realEmailService = emailServiceWithRealEngine();
-        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
-        when(mailSender.createMimeMessage()).thenReturn(realMessage);
-
-        String reviewUrl =
-                "https://api.beautica.app/api/v1/service-categories/requests/review?token=tok-EN_unbroken-123";
-
-        log.debug("Act: render and inspect the href for the unbroken token");
-        realEmailService.sendCategoryRequestNotification(
-                "admin@beautica.app", "user-123", "NAIL_ART", "Нейл-арт", reviewUrl);
-
-        String html = realMessage.getContent().toString();
-        assertThat(html)
-                .as("the approval href must contain the full reviewUrl with its token intact")
-                .contains(reviewUrl);
     }
 
     // ── phase 441: one ERROR per failed send at every MailSendFailures call site ─────
@@ -250,7 +230,7 @@ class EmailServiceTest {
     @DisplayName("phase 441: category-request SMTP failure — exactly one brevo-smtp ERROR")
     void should_logOneBrevoSmtpError_when_categoryRequestSendFails() {
         var events = logsOfFailedSend(() -> emailService.sendCategoryRequestNotification(ADMIN_EMAIL,
-                java.util.UUID.randomUUID().toString(), "Нігті", "Owner", "https://beautica.app/r?t=x"));
+                java.util.UUID.randomUUID().toString(), "Нігті", "Owner", "https://beautica.app/admin/requests"));
 
         assertOneSmtpError(events, "category-request");
     }
@@ -259,7 +239,7 @@ class EmailServiceTest {
     @DisplayName("phase 441: service-type-suggestion SMTP failure — exactly one brevo-smtp ERROR")
     void should_logOneBrevoSmtpError_when_serviceTypeSuggestionSendFails() {
         var events = logsOfFailedSend(() -> emailService.sendServiceTypeSuggestionNotification(ADMIN_EMAIL,
-                java.util.UUID.randomUUID().toString(), "Нігті", "Гель", "desc", "https://beautica.app/r?t=x"));
+                java.util.UUID.randomUUID().toString(), "Нігті", "Гель", "desc", "https://beautica.app/admin/requests"));
 
         assertOneSmtpError(events, "service-type-suggestion");
     }

@@ -1,7 +1,6 @@
 package com.beautica.service;
 
 import com.beautica.AbstractIntegrationTest;
-import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.CategoryRequestResponse;
@@ -16,10 +15,11 @@ import com.beautica.service.service.CategoryRequestService.DecisionOutcome;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
+import org.junit.jupiter.api.TestInstance;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
@@ -38,37 +38,33 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 
 /**
- * Cross-layer round trip for the self-service category request + email-approval
- * workflow against a real PostgreSQL (Testcontainers, {@code @ActiveProfiles("test")}).
+ * Cross-layer round trip for the self-service category request workflow against a real PostgreSQL
+ * (Testcontainers, {@code @ActiveProfiles("test")}).
  *
  * <p>Proves the contract that unit mocks cannot:
  * <ol>
- *   <li>{@code submitRequest} persists a PENDING row with a HASHED token
- *       ({@code token_hash} != the raw token captured from the notification).</li>
+ *   <li>{@code submitRequest} persists a PENDING row and emails the operator the portal link (B545: no token).</li>
  *   <li>While PENDING, the category is rejected by the service-create validation gate.</li>
- *   <li>{@code loadForReview} does NOT mutate the row (defeats email-scanner pre-fetch).</li>
- *   <li>{@code approve} flips it to APPROVED + active and clears {@code token_hash}.</li>
+ *   <li>{@code approveById} (the portal decision, the only one since B545) flips it to APPROVED + active.</li>
  *   <li>After approval, the category is accepted by the service-create validation gate.</li>
  * </ol>
  *
  * <p>{@link com.beautica.notification.EmailService} is a {@code @MockBean} (inherited
- * from {@link AbstractIntegrationTest}) so no real SMTP fires; the raw token is captured
- * from the {@code sendCategoryRequestNotification} call to drive the approve step.
+ * from {@link AbstractIntegrationTest}) so no real SMTP fires.
  */
 @Import(TestSecurityConfig.class)
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @DisplayName("Category request workflow — full-flow integration")
 class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
 
     private static final String CATEGORY_NAME = "ITWORKFLOW_NAILART";
-    // Token now rides as the trailing path segment (.../review/{token}); extract
-    // it as the substring after this separator.
-    private static final String REVIEW_TOKEN_SEPARATOR = "/review/";
+    /** test profile {@code app.frontend.base-url} + the portal requests page. */
+    private static final String PORTAL_URL = "http://localhost:3000/admin/requests";
 
     @Autowired private CategoryRequestService categoryRequestService;
     @Autowired private ServiceCatalogService serviceCatalogService;
     @Autowired private PlatformCategoryRepository platformCategoryRepository;
     @Autowired private com.beautica.service.repository.ServiceTypeSuggestionRepository serviceTypeSuggestionRepository;
-    @Autowired private TokenGenerator tokenGenerator;
 
     @Autowired private TestRestTemplate restTemplate;
     @Autowired private ObjectMapper objectMapper;
@@ -77,9 +73,36 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
 
     private ServiceTestFixtures fixtures;
 
+    /**
+     * Pays the cold-start cost (first login + salon-create HTTP round trips, BCrypt, the submit / approve service path)
+     * once, outside any timed test, so whichever test JUnit runs first is not measured against
+     * {@code SlowTestExtension}'s 10 s ceiling for it (it used to spend 50-90 % of it here). Same pattern as
+     * {@code MultiServiceNotificationIT#warmUpColdStart}. Then wipes every row it made, so no test sees it.
+     */
+    @BeforeAll
+    void warmUpColdStart() throws Exception {
+        setUpFixtures();
+        UUID requesterId = newRequesterWithSalon("it-cat-warmup").requesterId();
+        categoryRequestService.submitRequest(
+                new CreateCategoryRequestRequest(CATEGORY_NAME, "Воркфлоу-арт", null), requesterId);
+        categoryRequestService.approveById(pendingRow().getId());
+        cleanCategory();
+        cleanDb();
+    }
+
     @BeforeEach
     void setUpFixtures() {
         fixtures = new ServiceTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
+    }
+
+    /** A logged-in SALON_OWNER with one salon; the owner is the request's requester. */
+    private record RequesterWithSalon(UUID requesterId, UUID salonId) {}
+
+    private RequesterWithSalon newRequesterWithSalon(String emailPrefix) throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(emailPrefix + "-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Category Workflow Salon");
+        UUID requesterId = jdbcTemplate.queryForObject("SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+        return new RequesterWithSalon(requesterId, salonId);
     }
 
     @AfterEach
@@ -114,39 +137,31 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
                 PriceType.FIXED, new BigDecimal("500.00"), null, null, serviceTypeId);
     }
 
+    private PlatformCategory pendingRow() {
+        return platformCategoryRepository.findByName(CATEGORY_NAME)
+                .orElseThrow(() -> new AssertionError("PENDING row not found by name"));
+    }
+
     @Test
-    @DisplayName("submit → review (no mutation) → approve flips state and gates service creation")
+    @DisplayName("submit (portal-link email) → approve by id flips state and gates service creation")
     void should_completeRequestApprovalRoundTrip_when_adminApproves() throws Exception {
         // Arrange — a salon + owner so addServiceToSalon has a real salon to validate against.
-        String ownerToken = fixtures.createSalonOwnerAndGetToken(
-                "it-cat-owner-" + System.nanoTime() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "Category Workflow Salon");
-        UUID requesterId = jdbcTemplate.queryForObject(
-                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+        RequesterWithSalon arranged = newRequesterWithSalon("it-cat-owner");
+        UUID salonId = arranged.salonId();
+        UUID requesterId = arranged.requesterId();
 
         // Act 1 — submit the request.
         CategoryRequestResponse submitted = categoryRequestService.submitRequest(
                 new CreateCategoryRequestRequest(CATEGORY_NAME, "Воркфлоу-арт", null), requesterId);
 
-        // Assert 1 — row persisted PENDING with a HASHED token (stored value != raw token).
+        // Assert 1 — row persisted PENDING; the operator email carries only the portal link.
         assertThat(submitted.status()).isEqualTo("PENDING");
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
         verify(emailService).sendCategoryRequestNotification(
-                anyString(), eq(requesterId.toString()), eq(CATEGORY_NAME), eq("Воркфлоу-арт"),
-                urlCaptor.capture());
-        String rawToken = urlCaptor.getValue()
-                .substring(urlCaptor.getValue().indexOf(REVIEW_TOKEN_SEPARATOR) + REVIEW_TOKEN_SEPARATOR.length());
+                anyString(), eq(requesterId.toString()), eq(CATEGORY_NAME), eq("Воркфлоу-арт"), eq(PORTAL_URL));
 
-        PlatformCategory persisted = platformCategoryRepository
-                .findByTokenHash(tokenGenerator.hash(rawToken))
-                .orElseThrow(() -> new AssertionError("PENDING row not found by token hash"));
+        PlatformCategory persisted = pendingRow();
         assertThat(persisted.getStatus()).isEqualTo(PlatformCategoryStatus.PENDING);
         assertThat(persisted.isActive()).isFalse();
-        assertThat(persisted.getTokenHash())
-                .as("stored token must be the hash, never the raw token")
-                .isNotNull()
-                .isNotEqualTo(rawToken)
-                .isEqualTo(tokenGenerator.hash(rawToken));
 
         // Assert 2 — while PENDING, service creation with this category is rejected.
         assertThatThrownBy(() -> serviceCatalogService.addServiceToSalon(salonId, serviceWithCategory(CATEGORY_NAME)))
@@ -154,28 +169,14 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Unknown category");
 
-        // Act 2 — load for review: MUST NOT mutate the row.
-        var review = categoryRequestService.loadForReview(rawToken);
-        assertThat(review.valid()).isTrue();
-        PlatformCategory afterReview = platformCategoryRepository.findById(persisted.getId()).orElseThrow();
-        assertThat(afterReview.getStatus())
-                .as("GET review must not change state")
-                .isEqualTo(PlatformCategoryStatus.PENDING);
-        assertThat(afterReview.getTokenHash())
-                .as("GET review must not clear the token")
-                .isNotNull();
+        // Act 2 — approve by id (the portal decision).
+        DecisionOutcome outcome = categoryRequestService.approveById(persisted.getId());
 
-        // Act 3 — approve.
-        DecisionOutcome outcome = categoryRequestService.approve(rawToken);
-
-        // Assert 3 — APPROVED + active, token cleared (single-use).
+        // Assert 3 — APPROVED + active.
         assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
         PlatformCategory approved = platformCategoryRepository.findById(persisted.getId()).orElseThrow();
         assertThat(approved.getStatus()).isEqualTo(PlatformCategoryStatus.APPROVED);
         assertThat(approved.isActive()).isTrue();
-        assertThat(approved.getTokenHash())
-                .as("token_hash must be cleared after the decision (single-use)")
-                .isNull();
 
         // Assert 4 — service creation now succeeds (was rejected while PENDING).
         // V111 makes service_type_id mandatory and category-consistent (Phase 16.3), so seed an
@@ -200,26 +201,16 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("approve with initial service name persists a PENDING service_type_suggestion (behavior #3)")
     void should_createPendingSuggestion_when_approvingCategoryWithInitialServiceName() throws Exception {
         // Arrange — a real persisted user (FK fk_platform_categories_requested_by).
-        String ownerToken = fixtures.createSalonOwnerAndGetToken(
-                "it-cat-suggest-" + System.nanoTime() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "Suggest Workflow Salon");
-        UUID requesterId = jdbcTemplate.queryForObject(
-                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+        UUID requesterId = newRequesterWithSalon("it-cat-suggest").requesterId();
 
         // Submit a request carrying an initial service-type name.
         categoryRequestService.submitRequest(
                 new CreateCategoryRequestRequest(CATEGORY_NAME, "Воркфлоу-арт", "  Класичний манікюр  "),
                 requesterId);
 
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendCategoryRequestNotification(
-                anyString(), eq(requesterId.toString()), eq(CATEGORY_NAME), eq("Воркфлоу-арт"),
-                urlCaptor.capture());
-        String rawToken = urlCaptor.getValue()
-                .substring(urlCaptor.getValue().indexOf(REVIEW_TOKEN_SEPARATOR) + REVIEW_TOKEN_SEPARATOR.length());
 
         // Act — approve the category.
-        DecisionOutcome outcome = categoryRequestService.approve(rawToken);
+        DecisionOutcome outcome = categoryRequestService.approveById(pendingRow().getId());
 
         // Assert — category APPROVED and a PENDING suggestion now exists for its slug.
         assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
@@ -244,22 +235,12 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("approve without initial service name creates no suggestion (behavior #3 negative)")
     void should_notCreateSuggestion_when_approvingCategoryWithoutInitialServiceName() throws Exception {
-        String ownerToken = fixtures.createSalonOwnerAndGetToken(
-                "it-cat-nosuggest-" + System.nanoTime() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "No-Suggest Workflow Salon");
-        UUID requesterId = jdbcTemplate.queryForObject(
-                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+        UUID requesterId = newRequesterWithSalon("it-cat-nosuggest").requesterId();
         categoryRequestService.submitRequest(
                 new CreateCategoryRequestRequest(CATEGORY_NAME, "Воркфлоу-арт", null), requesterId);
 
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendCategoryRequestNotification(
-                anyString(), eq(requesterId.toString()), eq(CATEGORY_NAME), eq("Воркфлоу-арт"),
-                urlCaptor.capture());
-        String rawToken = urlCaptor.getValue()
-                .substring(urlCaptor.getValue().indexOf(REVIEW_TOKEN_SEPARATOR) + REVIEW_TOKEN_SEPARATOR.length());
 
-        categoryRequestService.approve(rawToken);
+        categoryRequestService.approveById(pendingRow().getId());
 
         assertThat(serviceTypeSuggestionRepository.findAll().stream()
                 .filter(s -> CATEGORY_NAME.equals(s.getCategoryName())).toList())
@@ -271,9 +252,7 @@ class CategoryRequestWorkflowIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("retired OTHER category (V66) is excluded from approved list and rejected on service create")
     void should_excludeAndRejectOther_when_categoryRetired() throws Exception {
         // Arrange — a salon to validate service creation against.
-        String ownerToken = fixtures.createSalonOwnerAndGetToken(
-                "it-cat-other-" + System.nanoTime() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "Other Retired Salon");
+        UUID salonId = newRequesterWithSalon("it-cat-other").salonId();
 
         // Act + Assert 1 — OTHER must not appear in the approved (selectable) list.
         assertThat(platformCategoryRepository.findApprovedActive())

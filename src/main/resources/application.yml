@@ -139,13 +139,12 @@ server:
     #     handler plus GlobalExceptionHandler (a @RestControllerAdvice returning ApiResponse,
     #     i.e. application/json — NOT problem+json). No ProblemDetail exists anywhere, so the
     #     problem+json alias was dead forward-cover and is dropped (YAGNI).
-    #   - text/html is produced by exactly two endpoints, the Thymeleaf review pages
-    #     (CategoryRequestReviewController, ServiceTypeSuggestionReviewController). Their FORM
-    #     pages embed a 32-byte review token TWICE next to attacker-chosen displayName /
-    #     suggestedName — the ONE place in the app where a secret and attacker-influenced text
-    #     share one compressible body (a textbook BREACH oracle). Dropping text/html costs
-    #     nothing (result pages are ~807 B, and the threshold below is inert anyway) and closes
-    #     that co-location. text/plain had no producer at all.
+    #   - text/html is produced only by small server-rendered Thymeleaf pages (the moderation
+    #     action pages and, since B545, the retired catalog-request link page). The former
+    #     catalog review FORM pages (removed by B545) embedded a review token next to
+    #     attacker-chosen text — a textbook BREACH oracle — which is why text/html stays
+    #     excluded: a page pairing a secret with attacker-influenced text must never be
+    #     compressed. text/plain had no producer at all.
     #
     # BREACH on the remaining application/json auth responses is ACCEPTED, not mitigated.
     # POST /auth/{login,refresh,register} return an AuthResponse carrying two raw JWTs plus a

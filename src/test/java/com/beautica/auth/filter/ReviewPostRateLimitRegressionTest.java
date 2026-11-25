@@ -18,9 +18,9 @@ import java.time.Duration;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Per-IP throttle on the four token-authenticated, {@code permitAll} admin review POSTs
- * (category-request and service-type-suggestion approve/reject). They previously fell through to the
- * unthrottled branch, so a garbage-token flood hit the DB on every call. All four share ONE bucket.
+ * Per-IP throttle on the four {@code permitAll} admin review POSTs (category-request and service-type-suggestion
+ * approve/reject; retired by B545 to a 410 portal page, still throttled as anonymous routes). They previously fell
+ * through to the unthrottled branch. All four share ONE bucket.
  */
 @DisplayName("AuthRateLimitFilter — admin review POSTs per-IP throttle")
 class ReviewPostRateLimitRegressionTest {

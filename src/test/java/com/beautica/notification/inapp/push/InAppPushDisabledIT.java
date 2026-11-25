@@ -5,16 +5,12 @@ import com.beautica.service.dto.CreateCategoryRequestRequest;
 import com.beautica.service.service.CategoryRequestService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MultiValueMap;
 
 import java.util.UUID;
 
@@ -65,21 +61,14 @@ class InAppPushDisabledIT extends AbstractInAppPushFlowIT {
                 requester, "fcm-dark-372-" + requester);
         categoryRequestService.submitRequest(
                 new CreateCategoryRequestRequest("PUSHDARK372_CAT", "Темна категорія", null), requester);
-        ArgumentCaptor<String> url = ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendCategoryRequestNotification(
-                anyString(), anyString(), anyString(), anyString(), url.capture());
-        MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
-        form.add("token", url.getValue().substring(url.getValue().lastIndexOf('/') + 1));
-        form.add("reason", "dark reason");
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+        long requestId = jdbcTemplate.queryForObject(
+                "SELECT id FROM platform_categories WHERE name = 'PUSHDARK372_CAT'", Long.class);
 
         try {
-            ResponseEntity<String> decision = restTemplate.postForEntity(
-                    "/api/v1/service-categories/requests/reject", new HttpEntity<>(form, headers), String.class);
+            // B545: the portal decision (the emailed reject link is retired).
+            categoryRequestService.rejectById(requestId, "dark reason");
             drainWorker.drain();
 
-            assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
             assertThat(feedRowIds()).as("the decision item is still written").hasSize(1);
             assertThat(countOutbox("INAPP_PUSH")).as("dark prod: no push outbox row for the decision").isZero();
             verify(firebaseSender, never()).send(any());

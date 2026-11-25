@@ -31,8 +31,8 @@ import java.util.UUID;
  *   <li>{@code GET /approved} — authenticated; feeds the mobile picker.</li>
  * </ul>
  *
- * <p>The token-bearing review/approve/reject pages live in
- * {@link CategoryRequestReviewController} (permitAll, token is the auth).
+ * <p>The former emailed review/approve/reject links answer 410 in
+ * {@link RetiredCatalogRequestLinksController} (B545); requests are decided in the catalog portal.
  */
 @RestController
 @RequestMapping("/api/v1/service-categories")

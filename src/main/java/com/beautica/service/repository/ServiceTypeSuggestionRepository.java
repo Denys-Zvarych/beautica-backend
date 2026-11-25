@@ -13,31 +13,10 @@ import java.util.Optional;
 import java.util.UUID;
 
 /**
- * Data access for {@link ServiceTypeSuggestion}. Mirrors the token-lookup +
- * dedup-existence shape of {@code PlatformCategoryRepository}.
+ * Data access for {@link ServiceTypeSuggestion}. Dedup-existence and row-lock
+ * finders mirror {@code PlatformCategoryRepository}.
  */
 public interface ServiceTypeSuggestionRepository extends JpaRepository<ServiceTypeSuggestion, UUID>, TransactionLockTimeout {
-
-    /**
-     * Token lookup for the approve/reject POST. Matched on the hashed token only;
-     * expiry, status, and the constant-time comparison are enforced in the service.
-     * Returns at most one row — token_hash is effectively unique while PENDING.
-     */
-    Optional<ServiceTypeSuggestion> findByTokenHash(String tokenHash);
-
-    /**
-     * Locking variant ({@code FOR UPDATE}) for the decision (write) path only, so concurrent approve/reject
-     * on one token serialize. The read-only review page keeps {@link #findByTokenHash}.
-     */
-    @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @Query("select s from ServiceTypeSuggestion s where s.tokenHash = :tokenHash")
-    Optional<ServiceTypeSuggestion> findByTokenHashForUpdateNoLockTimeout(@Param("tokenHash") String tokenHash);
-
-    /** {@link #findByTokenHashForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
-    default Optional<ServiceTypeSuggestion> findByTokenHashForUpdate(String tokenHash) {
-        applyTransactionLockTimeout();
-        return findByTokenHashForUpdateNoLockTimeout(tokenHash);
-    }
 
     /**
      * Dedup guard: returns {@code true} when a PENDING suggestion already exists for
@@ -63,7 +42,7 @@ public interface ServiceTypeSuggestionRepository extends JpaRepository<ServiceTy
 
     /**
      * B502 — the row a catalog-admin name edit mutates, locked ({@code FOR UPDATE}) so the edit serialises with a
-     * concurrent email-link approve/reject ({@link #findByTokenHashForUpdate}); the loser then sees the new status.
+     * concurrent portal approve/reject on the same row; the loser then sees the new status.
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select s from ServiceTypeSuggestion s where s.id = :id")

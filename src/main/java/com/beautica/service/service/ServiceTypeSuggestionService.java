@@ -1,23 +1,20 @@
 package com.beautica.service.service;
 
-import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.common.exception.GlobalExceptionHandler;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.service.RequestKind;
-import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceTypeSuggestionRepository;
+import com.beautica.user.AfterCommitHandOff;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.cache.annotation.CacheEvict;
-import org.springframework.cache.annotation.Caching;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
@@ -25,54 +22,38 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Clock;
-import java.time.Duration;
 import java.time.OffsetDateTime;
-import java.util.Optional;
 import java.util.UUID;
 
 /**
- * Self-service service-type suggestion + email-approval workflow.
+ * Self-service service-type suggestion workflow.
  *
- * <p>A suggestion is persisted as a PENDING {@code service_type_suggestion} row
- * carrying a hashed single-use token; a platform admin approves or rejects it via an
- * emailed token-authenticated link. Approve marks the record {@code APPROVED} and then
- * materializes the requested service for the requesting master via
- * {@link ServiceTypePromotionService} — in the SAME transaction, so a promotion failure
- * rolls back the approval and keeps it retryable (Phase 16.9; supersedes the Phase 16.8
- * "no auto-promotion" decision).
+ * <p>A suggestion is persisted as a PENDING {@code service_type_suggestion} row; the platform operator gets a
+ * notification-only email linking to the catalog portal and approves or rejects it there ({@link #approveById} /
+ * {@link #rejectById}, B503). Approve marks the record {@code APPROVED} and then promotes it into a catalog-level
+ * {@code ServiceType} (created, or an existing active one reused) via {@link ServiceTypePromotionService} — in the SAME
+ * transaction, so a promotion failure rolls back the approval and keeps it retryable (Phase 16.9). It creates no
+ * {@code ServiceDefinition} for the requesting master; the master adds their own service later by picking the type.
  *
- * <p>Structurally a copy of {@link CategoryRequestService}. Security properties
- * enforced here, verbatim from that workflow:
- * <ul>
- *   <li>Raw token never persisted — only {@code SHA-256(token)} hex is stored.</li>
- *   <li>Token matched in constant time ({@link MessageDigest#isEqual}).</li>
- *   <li>7-day expiry; single-use (token nulled on decision).</li>
- *   <li>Decisions only mutate state on the POST paths (approve/reject), never on
- *       the GET review load — defeats email-scanner link pre-fetch.</li>
- *   <li>Invalid/expired/already-decided tokens map to a neutral outcome so the
- *       caller cannot probe suggestion existence.</li>
- * </ul>
+ * <p>B545 (SVC-61): email approve / reject is retired. No token is minted or stored; the former emailed links answer
+ * 410 ({@code RetiredCatalogRequestLinksController}) and never reach this service.
  */
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class ServiceTypeSuggestionService {
 
-    private static final Duration TOKEN_TTL = Duration.ofDays(7);
     /** V197 partial UNIQUE index enforcing one PENDING row per (category_name, lower(suggested_name)). */
     static final String PENDING_DEDUP_INDEX = "ux_service_type_suggestion_pending_dedup";
     private static final String DUPLICATE_PENDING_MESSAGE = "A matching suggestion is already pending review";
-    private static final String REVIEW_PATH = "/api/v1/service-types/suggestions/review?token=";
     /** SVC-08 cap on a portal-edited suggested name (B502), re-checked after canonicalisation. */
     private static final int MAX_EDITED_NAME_LENGTH = 100;
 
     private final ServiceTypeSuggestionRepository suggestionRepository;
     private final PlatformCategoryRepository platformCategoryRepository;
-    private final TokenGenerator tokenGenerator;
     private final EmailService emailService;
-    private final PublicBaseUrlProperties publicBaseUrlProperties;
+    private final AdminRequestsPortalLink adminRequestsPortalLink;
     private final ServiceTypePromotionService promotionService;
     private final Clock clock;
     private final InAppNotificationService inAppNotificationService;
@@ -81,30 +62,15 @@ public class ServiceTypeSuggestionService {
     @Value("${app.admin-email}")
     private String adminEmail;
 
-    /** SpEL guard: evict only when the decision actually changed state. */
-    private static final String APPROVED_ONLY = "#result.name() == 'APPROVED'";
-
-    /**
-     * Outcome of a token-bearing review/decision operation. The controller maps it
-     * to a neutral HTML page; no variant leaks whether a suggestion existed.
-     */
+    /** Outcome of a portal decision. */
     public enum DecisionOutcome {
         APPROVED,
-        REJECTED,
-        ALREADY_DECIDED,
-        INVALID_OR_EXPIRED
-    }
-
-    /** Loaded suggestion details for the read-only review page (no state change). */
-    public record ReviewView(boolean valid, String categoryName, String suggestedName, String description) {
-        static ReviewView invalid() {
-            return new ReviewView(false, null, null, null);
-        }
+        REJECTED
     }
 
     /**
      * Submits a new service-type suggestion: inserts a PENDING row and emails the
-     * admin a single-use review link. The token is never returned.
+     * operator a notification-only message linking to the portal's requests page (B545; direct send, NTF-D12).
      *
      * <p>The caller ({@code ServiceCatalogService.suggestServiceType}) has already
      * validated the category slug is active + APPROVED (Phase 16.7 guard) before
@@ -182,22 +148,19 @@ public class ServiceTypeSuggestionService {
             throw duplicatePending();
         }
 
-        String rawToken = tokenGenerator.generateToken();
-        String tokenHash = tokenGenerator.hash(rawToken);
-        OffsetDateTime now = OffsetDateTime.now(clock);
-
         ServiceTypeSuggestion suggestion = ServiceTypeSuggestion.ofPending(
-                categoryName, suggestedName, description, requestedByUserId, tokenHash, now.plus(TOKEN_TTL));
+                categoryName, suggestedName, description, requestedByUserId);
         insertPending(suggestion);
 
-        String reviewUrl = publicBaseUrlProperties.getPublicBaseUrl() + REVIEW_PATH + rawToken;
-        emailService.sendServiceTypeSuggestionNotification(
-                adminEmail,
-                requestedByUserId != null ? requestedByUserId.toString() : "—",
-                categoryName,
-                suggestedName,
-                description,
-                reviewUrl);
+        String requester = requestedByUserId != null ? requestedByUserId.toString() : "—";
+        String portalUrl = adminRequestsPortalLink.requestsUrl();
+        // B545 — after the (possibly REQUIRES_NEW) transaction commits only: a rolled-back insert never announces a
+        // suggestion. EmailService is @Async("emailExecutor"), so the direct runner just calls the async proxy; a
+        // saturated pool is logged and dropped by the hand-off instead of failing a committed request.
+        AfterCommitHandOff.submit(Runnable::run,
+                () -> emailService.sendServiceTypeSuggestionNotification(
+                        adminEmail, requester, categoryName, suggestedName, description, portalUrl),
+                log, "Service-type suggestion operator email");
     }
 
     /**
@@ -261,8 +224,7 @@ public class ServiceTypeSuggestionService {
     /**
      * B502 (SVC-55) — the platform operator corrects the suggested name while the suggestion is PENDING. The name goes
      * through the SAME validator as {@link #submitSuggestion} ({@code ServiceCatalogService.canonicalSuggestedName}:
-     * NFKC, space-collapse, SVC-07 allow-list → 400). The outstanding email token stays valid (track D2), so the link
-     * then approves the corrected name. The row is locked, so a concurrent approve/reject serialises with the edit.
+     * NFKC, space-collapse, SVC-07 allow-list → 400). The row is locked, so a concurrent approve/reject serialises with the edit.
      *
      * @throws NotFoundException               no suggestion with this id
      * @throws CatalogRequestConflictException {@code REQUEST_NOT_PENDING} when already decided;
@@ -310,92 +272,13 @@ public class ServiceTypeSuggestionService {
     }
 
     /**
-     * Read-only load for the review page. NO state change. Returns an invalid view
-     * for any token that does not match a live PENDING suggestion, so the page is
-     * neutral and does not reveal suggestion existence.
-     */
-    @Transactional(readOnly = true)
-    public ReviewView loadForReview(String rawToken) {
-        return findLivePending(rawToken)
-                .map(s -> new ReviewView(true, s.getCategoryName(), s.getSuggestedName(), s.getDescription()))
-                .orElseGet(ReviewView::invalid);
-    }
-
-    /**
-     * Approves the PENDING suggestion identified by the token: APPROVED, token cleared
-     * (single-use), and the requested service materialized for the requesting master via
-     * {@link ServiceTypePromotionService} in this same transaction (Phase 16.9). A
-     * promotion failure rolls the whole approval back, so the admin can retry cleanly.
-     * Idempotent: a second call returns {@link DecisionOutcome#ALREADY_DECIDED} (or
-     * INVALID_OR_EXPIRED) BEFORE reaching the promote call — no 500, no double-create.
-     *
-     * <p>Approval materializes a catalogue row, so it evicts every cache derived from service
-     * types ({@code service-types}, {@code service-type-search}, the search-suggestion
-     * catalogue). Eviction happens ONLY when the outcome is {@code APPROVED} (a real state change):
-     * the endpoint is public (token is the credential; per-IP throttled), so a garbage/replayed token (ALREADY_DECIDED /
-     * INVALID_OR_EXPIRED) must not flush the caches platform-wide. This
-     * conditional {@code @CacheEvict} set is the single eviction mechanism and runs POST-commit: the
-     * caching advisor is outermost ({@code CacheConfig}, {@code @EnableCaching(order =
-     * HIGHEST_PRECEDENCE)}), so it wraps the transaction advisor; a rollback (e.g. {@code promote()}
-     * throwing) evicts nothing. A load already in flight at commit time can still cache a stale
-     * snapshot, bounded only by the TTL. Reject changes no catalogue rows and evicts nothing.
-     */
-    @Transactional
-    @Caching(evict = {
-            @CacheEvict(value = "service-types", allEntries = true, condition = APPROVED_ONLY),
-            @CacheEvict(value = "service-type-search", allEntries = true, condition = APPROVED_ONLY),
-            @CacheEvict(value = SearchSuggestionCatalogue.CACHE_NAME, allEntries = true, condition = APPROVED_ONLY)
-    })
-    public DecisionOutcome approve(String rawToken) {
-        return decide(rawToken, true, null);
-    }
-
-    /**
-     * Rejects the PENDING suggestion identified by the token: REJECTED, token
-     * cleared. Idempotent (see {@link #approve}).
-     */
-    @Transactional
-    public DecisionOutcome reject(String rawToken) {
-        return reject(rawToken, null);
-    }
-
-    /**
-     * Rejects with an optional admin reason (already trimmed/sanitised/length-validated by the
-     * controller; null when none). Stored on the suggestion, surfaced via the in-app feed, never logged.
-     */
-    @Transactional
-    public DecisionOutcome reject(String rawToken, String reason) {
-        return decide(rawToken, false, reason);
-    }
-
-    private DecisionOutcome decide(String rawToken, boolean approve, String reason) {
-        Optional<ServiceTypeSuggestion> match = findByTokenConstantTime(rawToken, true);
-        if (match.isEmpty()) {
-            // Token unknown. The row may already be decided (token nulled) — we
-            // cannot distinguish, so return a neutral already-decided outcome.
-            return DecisionOutcome.ALREADY_DECIDED;
-        }
-
-        ServiceTypeSuggestion suggestion = match.get();
-        if (!suggestion.isPending()) {
-            return DecisionOutcome.ALREADY_DECIDED;
-        }
-        if (isExpired(suggestion)) {
-            return DecisionOutcome.INVALID_OR_EXPIRED;
-        }
-        return decide(suggestion, approve, reason);
-    }
-
-    /**
-     * B503 (SVC-06) — the platform operator approves the suggestion from the catalog portal. Same outcome as the
-     * email link: it runs the SAME {@link #decide(ServiceTypeSuggestion, boolean, String)} (promotion, in-app item,
-     * decision e-mail) and clears the email token, so a later link click shows «already decided». The row is
-     * locked ({@code FOR UPDATE}, the lock B502's edit and the token path take), so the first decision wins.
-     * Token expiry does not apply: it bounds the e-mailed link, not the request.
+     * B503 (SVC-06) — the platform operator approves the suggestion from the catalog portal. Since B545 the only
+     * decision path. It runs {@link #decide(ServiceTypeSuggestion, boolean, String)} (promotion, in-app item, decision
+     * e-mail). The row is locked ({@code FOR UPDATE}, the lock B502's edit takes), so the first decision wins.
      *
      * <p>No cache annotation here: the caller ({@code CatalogRequestAdminService}) runs this inside its own
-     * transaction and calls {@code CatalogCacheEvictor.evictAll()} after commit, a superset of {@link #approve}'s
-     * evict set; a nested {@code @CacheEvict} would fire before that outer commit (Anti-Bug §F-2).
+     * transaction and calls {@code CatalogCacheEvictor.evictPlatformCatalog()} after commit; a nested {@code @CacheEvict} would
+     * fire before that outer commit (Anti-Bug §F-2).
      *
      * @throws NotFoundException               no suggestion with this id
      * @throws CatalogRequestConflictException {@code REQUEST_NOT_PENDING} when already decided
@@ -407,7 +290,7 @@ public class ServiceTypeSuggestionService {
 
     /**
      * B503 — portal reject; see {@link #approveById}. {@code reason} is already cleaned and length-checked by the
-     * caller ({@code DecisionReason}, the email path's rules); {@code null} when none.
+     * caller ({@code DecisionReason}); {@code null} when none.
      */
     @Transactional
     public DecisionOutcome rejectById(UUID suggestionId, String reason) {
@@ -424,16 +307,15 @@ public class ServiceTypeSuggestionService {
     }
 
     /**
-     * The ONE decision for a locked PENDING suggestion, shared by the email-link path ({@link #approve} /
-     * {@link #reject}) and the portal path ({@link #approveById} / {@link #rejectById}) — B503 D1. B541 adds its
-     * approve-branch check here.
+     * The ONE decision for a locked PENDING suggestion ({@link #approveById} / {@link #rejectById}) — B503 D1. B541
+     * adds its approve-branch check here.
      */
     private DecisionOutcome decide(ServiceTypeSuggestion suggestion, boolean approve, String reason) {
         OffsetDateTime now = OffsetDateTime.now(clock);
         if (approve) {
-            suggestion.approve(now);          // flips APPROVED + clears the single-use token
-            // Materialize the requested service in the SAME transaction (Phase 16.9). A throw
-            // here rolls back the approve() flip (status stays PENDING, token intact) so the
+            suggestion.approve(now);          // flips APPROVED
+            // Add the requested catalog service type in the SAME transaction (Phase 16.9). A throw
+            // here rolls back the approve() flip (status stays PENDING) so the
             // admin can retry — no "approved but not created" split-brain.
             promotionService.promote(suggestion);
             // Same transaction (MANDATORY): a promotion failure above rolls the item back with the approval.
@@ -457,36 +339,4 @@ public class ServiceTypeSuggestionService {
                 String.valueOf(suggestion.getId()), approved, suggestion.getRequestedByUserId());
     }
 
-    private Optional<ServiceTypeSuggestion> findLivePending(String rawToken) {
-        return findByTokenConstantTime(rawToken, false)
-                .filter(ServiceTypeSuggestion::isPending)
-                .filter(s -> !isExpired(s));
-    }
-
-    /**
-     * Looks up the suggestion by hashed token, then re-verifies the stored hash
-     * against the recomputed hash in constant time ({@link MessageDigest#isEqual}).
-     * The DB lookup is an equality match; the constant-time re-check is
-     * defense-in-depth so the decision branch never depends on a non-constant-time
-     * String compare.
-     */
-    private Optional<ServiceTypeSuggestion> findByTokenConstantTime(String rawToken, boolean forUpdate) {
-        if (rawToken == null || rawToken.isBlank()) {
-            return Optional.empty();
-        }
-        String candidateHash = tokenGenerator.hash(rawToken);
-        Optional<ServiceTypeSuggestion> found = forUpdate
-                ? suggestionRepository.findByTokenHashForUpdate(candidateHash)
-                : suggestionRepository.findByTokenHash(candidateHash);
-        return found
-                .filter(s -> s.getTokenHash() != null
-                        && MessageDigest.isEqual(
-                                s.getTokenHash().getBytes(StandardCharsets.UTF_8),
-                                candidateHash.getBytes(StandardCharsets.UTF_8)));
-    }
-
-    private boolean isExpired(ServiceTypeSuggestion suggestion) {
-        OffsetDateTime expiresAt = suggestion.getTokenExpiresAt();
-        return expiresAt == null || expiresAt.isBefore(OffsetDateTime.now(clock));
-    }
 }

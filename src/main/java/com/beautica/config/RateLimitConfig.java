@@ -392,23 +392,21 @@ public class RateLimitConfig {
 
     private static final Duration CATEGORY_REQUEST_WINDOW = Duration.ofMinutes(60);
 
-    // Per-IP cap for the four token-authenticated admin review POSTs (60-minute window):
+    // Per-IP cap for the four retired (B545) admin review POSTs (60-minute window):
     // /service-categories/requests/{approve,reject} and /service-types/suggestions/{approve,reject}.
-    // They are permitAll (the single-use token IS the credential) and previously fell through
-    // AuthRateLimitFilter unthrottled, so a garbage-token flood hit the DB on every call. One
-    // human admin decides a handful of requests per hour; 20/hr is generous headroom. ONE shared
-    // bucket for all four paths. Configurable so ITs on 127.0.0.1 can raise the cap.
+    // They are permitAll and answer a static 410 «use the portal» page (no token read, no DB, no decision);
+    // they stay throttled like every anonymous route. ONE shared bucket for all four paths; 20/hr is ample
+    // for an operator clicking an old e-mail link. Configurable so ITs on 127.0.0.1 can raise the cap.
     @Value("${app.rate-limit.review-decision-capacity:20}")
     private long reviewDecisionCapacity;
 
     private static final Duration REVIEW_DECISION_WINDOW = Duration.ofMinutes(60);
     private static final Duration REVIEW_PAGE_WINDOW = Duration.ofMinutes(60);
 
-    // Per-IP cap for the two token-bearing admin review GET pages (60-minute window):
-    // /service-categories/requests/review/{token} and /service-types/suggestions/review. A garbage
-    // token still hits the DB via loadForReview. A SIBLING of reviewDecisionCapacity (own bucket) so
-    // opening the page and then pressing Approve never exhausts the POST bucket; 60/hr leaves room
-    // for page reloads. Configurable so ITs on 127.0.0.1 can raise the cap.
+    // Per-IP cap for the two retired (B545) admin review GET links (60-minute window):
+    // /service-categories/requests/review/{token} and /service-types/suggestions/review — a static 410 «use the
+    // portal» page, the token is never read and no DB is touched. Own bucket, a SIBLING of reviewDecisionCapacity;
+    // 60/hr leaves room for reloads. Configurable so ITs on 127.0.0.1 can raise the cap.
     @Value("${app.rate-limit.review-page-capacity:60}")
     private long reviewPageCapacity;
 
@@ -1135,7 +1133,7 @@ public class RateLimitConfig {
     }
 
     /**
-     * Per-IP bucket shared by the four admin review-decision POSTs. See
+     * Per-IP bucket shared by the four retired (B545, 410) admin review-decision POSTs. See
      * {@link #reviewDecisionCapacity}. {@code expireAfterAccess(65 min)} gives a 5-minute grace
      * past the window.
      */
@@ -1149,7 +1147,7 @@ public class RateLimitConfig {
     }
 
     /**
-     * Per-IP bucket for the two admin review GET pages. See {@link #reviewPageCapacity}; separate
+     * Per-IP bucket for the two retired (B545, 410) admin review GET links. See {@link #reviewPageCapacity}; separate
      * from {@link #reviewDecisionBuckets()}.
      */
     @Bean

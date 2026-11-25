@@ -4,6 +4,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.booking.BookingTestFixtures;
+import com.beautica.catalog.admin.AdminActor;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.ServiceTestFixtures;
 import com.beautica.service.dto.CreateCategoryRequestRequest;
@@ -31,10 +32,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MultiValueMap;
+import org.springframework.test.context.TestPropertySource;
 
-import java.net.URI;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.time.Duration;
@@ -53,26 +52,32 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.verify;
 
 /**
- * Phase 372 — the platform admin's approve/reject on the token-authenticated review pages writes ONE
- * in-app feed item for the REQUESTER only, in the decision's transaction. Every decision here goes
- * through the real review POST; every assertion reads the real {@code GET /api/v1/notifications}.
+ * Phase 372 — the platform operator's approve/reject writes ONE in-app feed item for the REQUESTER only, in the
+ * decision's transaction. Since B545 the catalog portal is the only decision path, so every decision here goes through
+ * the real internal catalog API ({@code POST /api/v1/internal/catalog/requests/{kind}/{id}/approve|reject}); every
+ * assertion reads the real {@code GET /api/v1/notifications}.
  */
 @Import(TestSecurityConfig.class)
+@TestPropertySource(properties = "app.internal-catalog-key=" + RequestDecisionNotificationIT.CATALOG_KEY)
 @ExtendWith(OutputCaptureExtension.class)
 @DisplayName("Phase 372 — request-decision feed items (category request + service-type suggestion)")
 class RequestDecisionNotificationIT extends AbstractIntegrationTest {
 
-    private static final String CATEGORY_APPROVE = "/api/v1/service-categories/requests/approve";
-    private static final String CATEGORY_REJECT = "/api/v1/service-categories/requests/reject";
-    private static final String SUGGESTION_APPROVE = "/api/v1/service-types/suggestions/approve";
-    private static final String SUGGESTION_REJECT = "/api/v1/service-types/suggestions/reject";
+    static final String CATALOG_KEY = "test-internal-catalog-key-dddddddddddddddd";
+    private static final String BASE = "/api/v1/internal/catalog/requests";
+    private static final String ACTOR = "beautica.ua@gmail.com";
+    private static final String CATEGORY_APPROVE = "CATEGORY/approve";
+    private static final String CATEGORY_REJECT = "CATEGORY/reject";
+    private static final String SUGGESTION_APPROVE = "SERVICE_TYPE/approve";
+    private static final String SUGGESTION_REJECT = "SERVICE_TYPE/reject";
+    /** test profile {@code app.frontend.base-url} + the portal requests page (B545 operator email link). */
+    private static final String PORTAL_URL = "http://localhost:3000/admin/requests";
 
     // HAIRDRESSING is seeded APPROVED + active and mapped to a System-A bucket (V74/V78).
     private static final String SEEDED_CATEGORY = "HAIRDRESSING";
     private static final String CATEGORY_DISPLAY = "Тест-категорія Рішення";
     private static final String CATEGORY_NAME = "ITDECISION_CAT";
     private static final String SUGGESTED_TYPE = "Qzdecision Ritual Plumbix";
-    private static final String ALREADY_DECIDED_HEADING = "Рішення вже прийнято";
     private static final String REASON = "Така категорія вже існує — оберіть існуючу";
 
     @Autowired private TestRestTemplate restTemplate;
@@ -101,9 +106,9 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     @DisplayName("Category approved — the requester gets exactly one unread CATEGORY_REQUEST_APPROVED item (SERVICE_CATALOG, categoryName, no reason)")
     void should_writeOneApprovedItem_forRequester_when_categoryApproved() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester, null);
+        String requestId = submitCategory(requester, null);
 
-        ResponseEntity<String> decision = post(CATEGORY_APPROVE, token, null);
+        ResponseEntity<String> decision = post(CATEGORY_APPROVE, requestId, null);
 
         assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode feed = feed(requester);
@@ -119,12 +124,12 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Category rejected with a reason — the item carries the TRIMMED reason, stored on the request and echoed on the result page")
+    @DisplayName("Category rejected with a reason — the item carries the TRIMMED reason, stored on the request")
     void should_writeRejectedItemWithReason_when_categoryRejectedWithReason() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester, null);
+        String requestId = submitCategory(requester, null);
 
-        ResponseEntity<String> decision = post(CATEGORY_REJECT, token, "  " + REASON + "  ");
+        ResponseEntity<String> decision = post(CATEGORY_REJECT, requestId, "  " + REASON + "  ");
 
         assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode item = feed(requester).get(0);
@@ -132,7 +137,6 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
         assertThat(item.path("target").path("kind").asText()).isEqualTo("SERVICE_CATALOG");
         assertThat(item.path("params").path("categoryName").asText()).isEqualTo(CATEGORY_DISPLAY);
         assertThat(item.path("params").path("decisionReason").asText()).as("trimmed").isEqualTo(REASON);
-        assertThat(decision.getBody()).contains(REASON);
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT decision_reason FROM platform_categories WHERE name = ?", String.class, CATEGORY_NAME))
                 .isEqualTo(REASON);
@@ -142,9 +146,9 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     @DisplayName("Category rejected with a whitespace-only reason — the item and the request store no reason")
     void should_writeRejectedItemWithoutReason_when_reasonBlank() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester, null);
+        String requestId = submitCategory(requester, null);
 
-        post(CATEGORY_REJECT, token, "   \n\t ");
+        post(CATEGORY_REJECT, requestId, "   \n\t ");
 
         JsonNode item = feed(requester).get(0);
         assertThat(item.path("type").asText()).isEqualTo("CATEGORY_REQUEST_REJECTED");
@@ -155,14 +159,14 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Category reject with a 301-char reason — neutral page, request stays PENDING, no item")
+    @DisplayName("Category reject with a 301-char reason — 400, request stays PENDING, no item")
     void should_rejectOverlongReasonWithoutDeciding_when_reasonExceeds300() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester, null);
+        String requestId = submitCategory(requester, null);
 
-        ResponseEntity<String> decision = post(CATEGORY_REJECT, token, "ж".repeat(301));
+        ResponseEntity<String> decision = post(CATEGORY_REJECT, requestId, "ж".repeat(301));
 
-        assertThat(decision.getBody()).contains("Посилання недоступне");
+        assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT status FROM platform_categories WHERE name = ?", String.class, CATEGORY_NAME))
                 .isEqualTo("PENDING");
@@ -170,69 +174,41 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Category reject with a 300-char reason containing markup — accepted, HTML-escaped on the result page, verbatim in the feed")
-    void should_acceptReasonOfExactly300_and_escapeItInThePage_when_rejected() throws Exception {
+    @DisplayName("Category reject with a 300-char reason containing markup — accepted, verbatim in the feed")
+    void should_acceptReasonOfExactly300_when_rejected() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester, null);
+        String requestId = submitCategory(requester, null);
         String boundary = "<b>x</b>" + "ж".repeat(292);
 
-        ResponseEntity<String> decision = post(CATEGORY_REJECT, token, boundary);
+        ResponseEntity<String> decision = post(CATEGORY_REJECT, requestId, boundary);
 
         assertThat(boundary).hasSize(300);
-        assertThat(decision.getBody()).contains("&lt;b&gt;x&lt;/b&gt;").doesNotContain("<b>x</b>");
+        assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(feed(requester).get(0).path("params").path("decisionReason").asText()).isEqualTo(boundary);
     }
 
     @Test
-    @DisplayName("Category token replayed after a decision — «Рішення вже прийнято», still exactly one item")
-    void should_writeNoSecondItem_when_tokenReplayed() throws Exception {
+    @DisplayName("Category decided twice — the second gets 409 REQUEST_NOT_PENDING, still exactly one item")
+    void should_writeNoSecondItem_when_decidedTwice() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester, null);
+        String requestId = submitCategory(requester, null);
 
-        post(CATEGORY_REJECT, token, REASON);
-        ResponseEntity<String> replay = post(CATEGORY_APPROVE, token, null);
+        post(CATEGORY_REJECT, requestId, REASON);
+        ResponseEntity<String> replay = post(CATEGORY_APPROVE, requestId, null);
 
-        assertThat(replay.getBody()).contains("Рішення вже прийнято");
+        assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
         assertThat(feed(requester)).hasSize(1);
         assertThat(feed(requester).get(0).path("type").asText()).isEqualTo("CATEGORY_REQUEST_REJECTED");
-    }
-
-    @Test
-    @DisplayName("Category token expired — approve writes no item")
-    void should_writeNothing_when_tokenExpired() throws Exception {
-        Requester requester = newRequester();
-        String token = submitCategory(requester, null);
-        jdbcTemplate.update(
-                "UPDATE platform_categories SET token_expires_at = now() - interval '1 day' WHERE name = ?",
-                CATEGORY_NAME);
-
-        post(CATEGORY_APPROVE, token, null);
-
-        assertThat(feed(requester)).isEmpty();
-        assertThat(countFeedRows()).isZero();
-    }
-
-    @Test
-    @DisplayName("Unknown tokens on all four decision endpoints — no item written")
-    void should_writeNothing_when_tokenIsGarbage() throws Exception {
-        newRequester();
-
-        post(CATEGORY_APPROVE, "garbage-" + UUID.randomUUID(), null);
-        post(CATEGORY_REJECT, "garbage-" + UUID.randomUUID(), REASON);
-        post(SUGGESTION_APPROVE, "garbage-" + UUID.randomUUID(), null);
-        post(SUGGESTION_REJECT, "garbage-" + UUID.randomUUID(), REASON);
-
-        assertThat(countFeedRows()).isZero();
     }
 
     @Test
     @DisplayName("Category request with no requester (legacy/deleted user) — the decision commits, no item is written")
     void should_commitDecisionAndWriteNothing_when_requesterNull() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester, null);
+        String requestId = submitCategory(requester, null);
         jdbcTemplate.update("UPDATE platform_categories SET requested_by_user_id = NULL WHERE name = ?", CATEGORY_NAME);
 
-        ResponseEntity<String> decision = post(CATEGORY_REJECT, token, REASON);
+        ResponseEntity<String> decision = post(CATEGORY_REJECT, requestId, REASON);
 
         assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(jdbcTemplate.queryForObject(
@@ -246,9 +222,9 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     void should_notNotifyAutoCreatedSuggestion_and_notifyNobodyElse_when_categoryApproved() throws Exception {
         Requester requester = newRequester();
         Requester bystander = newRequester();
-        String token = submitCategory(requester, "Qzdecision Initial Service");
+        String requestId = submitCategory(requester, "Qzdecision Initial Service");
 
-        post(CATEGORY_APPROVE, token, null);
+        post(CATEGORY_APPROVE, requestId, null);
 
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM service_type_suggestion WHERE category_name = ? AND status = 'PENDING'",
@@ -265,9 +241,9 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     @DisplayName("Suggestion approved — one SERVICE_TYPE_SUGGESTION_APPROVED item with serviceName and the category's display name")
     void should_writeOneApprovedItem_forRequester_when_suggestionApproved() throws Exception {
         Requester requester = newRequester();
-        String token = submitSuggestion(requester);
+        String requestId = submitSuggestion(requester);
 
-        ResponseEntity<String> decision = post(SUGGESTION_APPROVE, token, null);
+        ResponseEntity<String> decision = post(SUGGESTION_APPROVE, requestId, null);
 
         assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode feed = feed(requester);
@@ -286,9 +262,9 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     @DisplayName("Suggestion rejected with a reason — the item carries serviceName and the reason")
     void should_writeRejectedItemWithReason_when_suggestionRejectedWithReason() throws Exception {
         Requester requester = newRequester();
-        String token = submitSuggestion(requester);
+        String requestId = submitSuggestion(requester);
 
-        post(SUGGESTION_REJECT, token, REASON);
+        post(SUGGESTION_REJECT, requestId, REASON);
 
         JsonNode item = feed(requester).get(0);
         assertThat(item.path("type").asText()).isEqualTo("SERVICE_TYPE_SUGGESTION_REJECTED");
@@ -300,9 +276,9 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     @DisplayName("Suggestion rejected with an empty reason — the item has no reason")
     void should_writeRejectedItemWithoutReason_when_suggestionReasonBlank() throws Exception {
         Requester requester = newRequester();
-        String token = submitSuggestion(requester);
+        String requestId = submitSuggestion(requester);
 
-        post(SUGGESTION_REJECT, token, "");
+        post(SUGGESTION_REJECT, requestId, "");
 
         JsonNode item = feed(requester).get(0);
         assertThat(item.path("type").asText()).isEqualTo("SERVICE_TYPE_SUGGESTION_REJECTED");
@@ -310,14 +286,14 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Suggestion reject with a 301-char reason — neutral page, suggestion stays PENDING, no item")
+    @DisplayName("Suggestion reject with a 301-char reason — 400, suggestion stays PENDING, no item")
     void should_rejectOverlongReasonWithoutDeciding_when_suggestionReasonExceeds300() throws Exception {
         Requester requester = newRequester();
-        String token = submitSuggestion(requester);
+        String requestId = submitSuggestion(requester);
 
-        ResponseEntity<String> decision = post(SUGGESTION_REJECT, token, "ж".repeat(301));
+        ResponseEntity<String> decision = post(SUGGESTION_REJECT, requestId, "ж".repeat(301));
 
-        assertThat(decision.getBody()).contains("Посилання недоступне");
+        assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT status FROM service_type_suggestion WHERE suggested_name = ?", String.class, SUGGESTED_TYPE))
                 .isEqualTo("PENDING");
@@ -325,40 +301,27 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Suggestion token replayed (approve, approve, reject) — still exactly one item")
-    void should_writeNoSecondItem_when_suggestionTokenReplayed() throws Exception {
+    @DisplayName("Suggestion decided three times (approve, approve, reject) — still exactly one item")
+    void should_writeNoSecondItem_when_suggestionDecidedRepeatedly() throws Exception {
         Requester requester = newRequester();
-        String token = submitSuggestion(requester);
+        String requestId = submitSuggestion(requester);
 
-        post(SUGGESTION_APPROVE, token, null);
-        post(SUGGESTION_APPROVE, token, null);
-        post(SUGGESTION_REJECT, token, REASON);
+        post(SUGGESTION_APPROVE, requestId, null);
+        post(SUGGESTION_APPROVE, requestId, null);
+        post(SUGGESTION_REJECT, requestId, REASON);
 
         assertThat(feed(requester)).hasSize(1);
-    }
-
-    @Test
-    @DisplayName("Suggestion token expired — reject writes no item")
-    void should_writeNothing_when_suggestionTokenExpired() throws Exception {
-        Requester requester = newRequester();
-        String token = submitSuggestion(requester);
-        jdbcTemplate.update("UPDATE service_type_suggestion SET token_expires_at = now() - interval '1 day' "
-                + "WHERE suggested_name = ?", SUGGESTED_TYPE);
-
-        post(SUGGESTION_REJECT, token, REASON);
-
-        assertThat(countFeedRows()).isZero();
     }
 
     @Test
     @DisplayName("Suggestion with no requester — the decision commits, no item is written")
     void should_commitDecisionAndWriteNothing_when_suggestionRequesterNull() throws Exception {
         Requester requester = newRequester();
-        String token = submitSuggestion(requester);
+        String requestId = submitSuggestion(requester);
         jdbcTemplate.update("UPDATE service_type_suggestion SET requested_by_user_id = NULL "
                 + "WHERE suggested_name = ?", SUGGESTED_TYPE);
 
-        post(SUGGESTION_REJECT, token, REASON);
+        post(SUGGESTION_REJECT, requestId, REASON);
 
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT status FROM service_type_suggestion WHERE suggested_name = ?", String.class, SUGGESTED_TYPE))
@@ -384,9 +347,9 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
                 """);
         try {
             Requester requester = newRequester();
-            String token = submitCategory(requester, null);
+            String requestId = submitCategory(requester, null);
 
-            ResponseEntity<String> decision = post(CATEGORY_REJECT, token, REASON);
+            ResponseEntity<String> decision = post(CATEGORY_REJECT, requestId, REASON);
 
             assertThat(decision.getStatusCode().is2xxSuccessful()).as("commit must fail: %s", decision).isFalse();
             assertThat(jdbcTemplate.queryForObject(
@@ -409,9 +372,9 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     void should_exposeOnlyNamesAndReason_and_hideItFromOtherUsers_when_rejected() throws Exception {
         Requester requester = newRequester();
         Requester other = newRequester();
-        String token = submitSuggestion(requester);
+        String requestId = submitSuggestion(requester);
 
-        post(SUGGESTION_REJECT, token, REASON);
+        post(SUGGESTION_REJECT, requestId, REASON);
 
         String rawFeed = rawFeed(requester);
         assertThat(rawFeed).doesNotContain(requester.email(), requester.id().toString());
@@ -425,20 +388,18 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
                 Long.class)).isZero();
     }
 
-    // ── end-to-end: real submit API → emailed link → review POST → requester's feed ─────────
+    // ── end-to-end: real submit API → portal-link email → portal decision → requester's feed ──
 
     @Test
-    @DisplayName("E2E — INDEPENDENT_MASTER submits a category request over the API, admin opens the emailed "
-            + "link and approves: the master's GET /notifications shows CATEGORY_REQUEST_APPROVED / SERVICE_CATALOG")
-    void should_showApprovedItemInMastersFeed_when_categoryRequestedViaApiAndApprovedViaEmailedLink() throws Exception {
+    @DisplayName("E2E — INDEPENDENT_MASTER submits a category request over the API, the operator email links to the "
+            + "portal, the portal approves: the master's GET /notifications shows CATEGORY_REQUEST_APPROVED")
+    void should_showApprovedItemInMastersFeed_when_categoryRequestedViaApiAndApprovedInPortal() throws Exception {
         Requester master = newIndependentMaster();
-        String reviewUrl = submitCategoryViaApi(master);
-        String token = reviewUrl.substring(reviewUrl.lastIndexOf('/') + 1);
-        openEmailedLink(reviewUrl);
+        String requestId = submitCategoryViaApi(master);
 
-        ResponseEntity<String> decision = post(CATEGORY_APPROVE, token, null);
+        ResponseEntity<String> decision = post(CATEGORY_APPROVE, requestId, null);
 
-        assertThat(decision.getBody()).contains("Категорію підтверджено");
+        assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode feed = feed(master);
         assertThat(feed).hasSize(1);
         JsonNode item = feed.get(0);
@@ -449,15 +410,13 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("E2E — INDEPENDENT_MASTER's API category request rejected with a reason via the emailed link: "
+    @DisplayName("E2E — INDEPENDENT_MASTER's API category request rejected with a reason in the portal: "
             + "the master's feed shows CATEGORY_REQUEST_REJECTED with categoryName and the reason")
     void should_showRejectedItemWithReasonInMastersFeed_when_categoryRequestedViaApiAndRejected() throws Exception {
         Requester master = newIndependentMaster();
-        String reviewUrl = submitCategoryViaApi(master);
-        String token = reviewUrl.substring(reviewUrl.lastIndexOf('/') + 1);
-        openEmailedLink(reviewUrl);
+        String requestId = submitCategoryViaApi(master);
 
-        post(CATEGORY_REJECT, token, REASON);
+        post(CATEGORY_REJECT, requestId, REASON);
 
         JsonNode item = feed(master).get(0);
         assertThat(item.path("type").asText()).isEqualTo("CATEGORY_REQUEST_REJECTED");
@@ -467,8 +426,8 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("E2E — INDEPENDENT_MASTER suggests a service type over the API, admin rejects with a reason via "
-            + "the emailed link: feed shows SERVICE_TYPE_SUGGESTION_REJECTED, serviceName, categoryName, reason")
+    @DisplayName("E2E — INDEPENDENT_MASTER suggests a service type over the API, the portal rejects with a "
+            + "reason: feed shows SERVICE_TYPE_SUGGESTION_REJECTED, serviceName, categoryName, reason")
     void should_showRejectedSuggestionWithReasonInMastersFeed_when_suggestedViaApiAndRejected() throws Exception {
         Requester master = newIndependentMaster();
         ResponseEntity<String> submit = restTemplate.exchange("/api/v1/service-types/suggest", HttpMethod.POST,
@@ -476,11 +435,10 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
                         new SuggestServiceTypeRequest(SUGGESTED_TYPE, SEEDED_CATEGORY, "decision e2e")),
                         jsonBearer(master)), String.class);
         assertThat(submit.getStatusCode()).as("body=%s", submit.getBody()).isEqualTo(HttpStatus.ACCEPTED);
-        String reviewUrl = capturedSuggestionReviewUrl();
-        String token = reviewUrl.substring(reviewUrl.indexOf("token=") + "token=".length());
-        openEmailedLink(reviewUrl);
+        assertThat(capturedSuggestionPortalUrl()).isEqualTo(PORTAL_URL);
+        String requestId = suggestionId();
 
-        post(SUGGESTION_REJECT, token, REASON);
+        post(SUGGESTION_REJECT, requestId, REASON);
 
         JsonNode item = feed(master).get(0);
         assertThat(item.path("type").asText()).isEqualTo("SERVICE_TYPE_SUGGESTION_REJECTED");
@@ -491,35 +449,20 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Suggestion result page HTML-escapes the admin's reason (th:text), while the feed keeps it verbatim")
-    void should_escapeReasonInSuggestionResultPage_when_rejectedWithMarkup() throws Exception {
-        Requester requester = newRequester();
-        String token = submitSuggestion(requester);
-        String markup = "<script>alert(372)</script>";
-
-        ResponseEntity<String> decision = post(SUGGESTION_REJECT, token, markup);
-
-        assertThat(decision.getBody())
-                .contains("&lt;script&gt;alert(372)&lt;/script&gt;")
-                .doesNotContain(markup);
-        assertThat(feed(requester).get(0).path("params").path("decisionReason").asText()).isEqualTo(markup);
-    }
-
-    @Test
     @DisplayName("The admin's reject reason never reaches the logs (category + suggestion), while the decision "
             + "itself IS logged — proves the capture is live, not vacuous")
     void should_neverLogReason_when_bothRequestKindsRejectedWithReason(CapturedOutput output) throws Exception {
         String sentinel = "SENTINEL-REASON-372-zq77";
         Requester requester = newRequester();
-        String categoryToken = submitCategory(requester, null);
-        String suggestionToken = submitSuggestion(requester);
+        String categoryRequestId = submitCategory(requester, null);
+        String suggestionRequestId = submitSuggestion(requester);
         // application.yml pins com.beautica at INFO; open it to TRACE so a leak at ANY level is caught.
         Logger beautica = (Logger) LoggerFactory.getLogger("com.beautica");
         Level previous = beautica.getLevel();
         beautica.setLevel(Level.TRACE);
         try {
-            post(CATEGORY_REJECT, categoryToken, sentinel);
-            post(SUGGESTION_REJECT, suggestionToken, sentinel);
+            post(CATEGORY_REJECT, categoryRequestId, sentinel);
+            post(SUGGESTION_REJECT, suggestionRequestId, sentinel);
         } finally {
             beautica.setLevel(previous);
         }
@@ -549,33 +492,25 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
         return headers;
     }
 
-    /** POSTs the category request through the real API as {@code requester}; returns the emailed review URL. */
+    /** POSTs the category request through the real API as {@code requester}; returns the request id. */
     private String submitCategoryViaApi(Requester requester) throws Exception {
         ResponseEntity<String> submit = restTemplate.exchange("/api/v1/service-categories/requests", HttpMethod.POST,
                 new HttpEntity<>(objectMapper.writeValueAsString(
                         new CreateCategoryRequestRequest(CATEGORY_NAME, CATEGORY_DISPLAY, null)),
                         jsonBearer(requester)), String.class);
         assertThat(submit.getStatusCode()).as("body=%s", submit.getBody()).isEqualTo(HttpStatus.CREATED);
-        return capturedCategoryReviewUrl();
+        assertThat(capturedCategoryPortalUrl()).isEqualTo(PORTAL_URL);
+        return categoryId();
     }
 
-    /** The admin opens the emailed link: the review page renders with the optional reason textarea. */
-    private void openEmailedLink(String reviewUrl) {
-        URI uri = URI.create(reviewUrl);
-        String pathAndQuery = uri.getRawPath() + (uri.getRawQuery() == null ? "" : "?" + uri.getRawQuery());
-        ResponseEntity<String> page = restTemplate.getForEntity(pathAndQuery, String.class);
-        assertThat(page.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(page.getBody()).contains("name=\"reason\"").contains("maxlength=\"300\"");
-    }
-
-    private String capturedCategoryReviewUrl() {
+    private String capturedCategoryPortalUrl() {
         ArgumentCaptor<String> url = ArgumentCaptor.forClass(String.class);
         verify(emailService).sendCategoryRequestNotification(
                 anyString(), anyString(), anyString(), anyString(), url.capture());
         return url.getValue();
     }
 
-    private String capturedSuggestionReviewUrl() {
+    private String capturedSuggestionPortalUrl() {
         ArgumentCaptor<String> url = ArgumentCaptor.forClass(String.class);
         verify(emailService).sendServiceTypeSuggestionNotification(
                 anyString(), anyString(), anyString(), anyString(), anyString(), url.capture());
@@ -587,16 +522,16 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Race — concurrent approve + reject on one category token: exactly one decides, "
-            + "the other gets «Рішення вже прийнято», one feed item matching the winner")
+    @DisplayName("Race — concurrent approve + reject on one category: exactly one decides, "
+            + "the other gets 409, one feed item matching the winner")
     void should_writeOneNotification_when_approveAndRejectRace() throws Exception {
         Requester requester = newRequester();
-        String categoryToken = submitCategory(requester, null);
+        String categoryRequestId = submitCategory(requester, null);
 
-        String winner = raceApproveAndReject(CATEGORY_APPROVE, CATEGORY_REJECT, categoryToken,
+        String winner = raceApproveAndReject(CATEGORY_APPROVE, CATEGORY_REJECT, categoryRequestId,
                 "SELECT id FROM platform_categories WHERE name = ? FOR UPDATE", CATEGORY_NAME, "platform_categories");
 
-        String expectedType = winner.contains("Категорію підтверджено")
+        String expectedType = CATEGORY_APPROVE.equals(winner)
                 ? "CATEGORY_REQUEST_APPROVED" : "CATEGORY_REQUEST_REJECTED";
         JsonNode feed = feed(requester);
         assertThat(feed).as("exactly one category decision item").hasSize(1);
@@ -605,17 +540,17 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Race — concurrent approve + reject on one suggestion token: exactly one decides, "
-            + "the other gets «Рішення вже прийнято», one feed item matching the winner")
+    @DisplayName("Race — concurrent approve + reject on one suggestion: exactly one decides, "
+            + "the other gets 409, one feed item matching the winner")
     void should_writeOneNotification_when_suggestionApproveAndRejectRace() throws Exception {
         Requester requester = newRequester();
-        String suggestionToken = submitSuggestion(requester);
+        String suggestionRequestId = submitSuggestion(requester);
 
-        String winner = raceApproveAndReject(SUGGESTION_APPROVE, SUGGESTION_REJECT, suggestionToken,
+        String winner = raceApproveAndReject(SUGGESTION_APPROVE, SUGGESTION_REJECT, suggestionRequestId,
                 "SELECT id FROM service_type_suggestion WHERE suggested_name = ? FOR UPDATE", SUGGESTED_TYPE,
                 "service_type_suggestion");
 
-        String expectedType = winner.contains("Пропозицію прийнято")
+        String expectedType = SUGGESTION_APPROVE.equals(winner)
                 ? "SERVICE_TYPE_SUGGESTION_APPROVED" : "SERVICE_TYPE_SUGGESTION_REJECTED";
         JsonNode feed = feed(requester);
         assertThat(feed).as("exactly one suggestion decision item").hasSize(1);
@@ -626,13 +561,12 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     /**
      * Forces a TRUE overlap: a raw connection holds the request row's lock, both POSTs are launched and
      * must be observed blocked on a row lock in {@code pg_stat_activity} BEFORE the holder commits. Only
-     * then is the outcome decided by the production lock ({@code findByTokenHashForUpdate}): the loser's
-     * re-check fails on the cleared token_hash → ALREADY_DECIDED. Without the lock both read PENDING,
-     * both UPDATE (queued behind the holder) and both decide — two decision pages, zero «already decided».
+     * then is the outcome decided by the production lock ({@code findByIdForUpdate}): the loser re-reads a
+     * decided row → 409 REQUEST_NOT_PENDING. Without the lock both read PENDING and both decide.
      *
-     * @return the winner's response body
+     * @return the winner's decision path ({@code approvePath} or {@code rejectPath})
      */
-    private String raceApproveAndReject(String approvePath, String rejectPath, String token,
+    private String raceApproveAndReject(String approvePath, String rejectPath, String requestId,
                                         String lockRowSql, String rowKey, String table) throws Exception {
         Connection holder = jdbcTemplate.getDataSource().getConnection();
         holder.setAutoCommit(false);
@@ -644,8 +578,8 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
             }
             CountDownLatch start = new CountDownLatch(1);
             List<Future<ResponseEntity<String>>> results = List.of(
-                    pool.submit(() -> { start.await(); return post(approvePath, token, null); }),
-                    pool.submit(() -> { start.await(); return post(rejectPath, token, null); }));
+                    pool.submit(() -> { start.await(); return post(approvePath, requestId, null); }),
+                    pool.submit(() -> { start.await(); return post(rejectPath, requestId, null); }));
             start.countDown();
 
             assertThat(awaitRowLockWaiters(table, 2))
@@ -654,17 +588,14 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
                     .isTrue();
             holder.commit();
 
-            List<String> bodies = new ArrayList<>();
+            List<HttpStatus> statuses = new ArrayList<>();
             for (Future<ResponseEntity<String>> f : results) {
-                ResponseEntity<String> response = f.get(30, TimeUnit.SECONDS);
-                assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-                bodies.add(response.getBody());
+                statuses.add(HttpStatus.valueOf(f.get(30, TimeUnit.SECONDS).getStatusCode().value()));
             }
-            assertThat(bodies)
-                    .as("EXACTLY ONE racer must lose with the already-decided page")
-                    .filteredOn(body -> body.contains(ALREADY_DECIDED_HEADING))
-                    .hasSize(1);
-            return bodies.stream().filter(body -> !body.contains(ALREADY_DECIDED_HEADING)).findFirst().orElseThrow();
+            assertThat(statuses)
+                    .as("EXACTLY ONE racer decides, the other loses with 409 REQUEST_NOT_PENDING")
+                    .containsExactlyInAnyOrder(HttpStatus.OK, HttpStatus.CONFLICT);
+            return statuses.get(0) == HttpStatus.OK ? approvePath : rejectPath;
         } finally {
             if (!holder.isClosed()) {
                 holder.rollback();
@@ -699,25 +630,36 @@ class RequestDecisionNotificationIT extends AbstractIntegrationTest {
     private String submitCategory(Requester requester, String initialServiceName) {
         categoryRequestService.submitRequest(
                 new CreateCategoryRequestRequest(CATEGORY_NAME, CATEGORY_DISPLAY, initialServiceName), requester.id());
-        String url = capturedCategoryReviewUrl();
-        return url.substring(url.lastIndexOf('/') + 1);
+        assertThat(capturedCategoryPortalUrl()).isEqualTo(PORTAL_URL);
+        return categoryId();
+    }
+
+    private String categoryId() {
+        return String.valueOf(jdbcTemplate.queryForObject(
+                "SELECT id FROM platform_categories WHERE name = ?", Long.class, CATEGORY_NAME));
+    }
+
+    private String suggestionId() {
+        return String.valueOf(jdbcTemplate.queryForObject(
+                "SELECT id FROM service_type_suggestion WHERE suggested_name = ?", UUID.class, SUGGESTED_TYPE));
     }
 
     private String submitSuggestion(Requester requester) {
         suggestionService.submitSuggestionInternal(SEEDED_CATEGORY, SUGGESTED_TYPE, "decision IT", requester.id());
-        String url = capturedSuggestionReviewUrl();
-        return url.substring(url.indexOf("token=") + "token=".length());
+        assertThat(capturedSuggestionPortalUrl()).isEqualTo(PORTAL_URL);
+        return suggestionId();
     }
 
-    private ResponseEntity<String> post(String path, String token, String reason) {
+    /** The portal decision: {@code action} is {@code KIND/approve|reject}, {@code id} the request id. */
+    private ResponseEntity<String> post(String action, String id, String reason) throws Exception {
         HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
-        MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
-        form.add("token", token);
-        if (reason != null) {
-            form.add("reason", reason);
-        }
-        return restTemplate.postForEntity(path, new HttpEntity<>(form, headers), String.class);
+        headers.set("X-Internal-Key", CATALOG_KEY);
+        headers.set(AdminActor.HEADER, ACTOR);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        String[] kindAndVerb = action.split("/");
+        String body = reason == null ? null : objectMapper.writeValueAsString(java.util.Map.of("reason", reason));
+        return restTemplate.postForEntity(BASE + "/" + kindAndVerb[0] + "/" + id + "/" + kindAndVerb[1],
+                new HttpEntity<>(body, headers), String.class);
     }
 
     private String rawFeed(Requester requester) {

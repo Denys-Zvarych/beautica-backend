@@ -1,6 +1,7 @@
 package com.beautica.notification;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.catalog.admin.AdminActor;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.notification.service.NotificationOutboxDrainWorker;
@@ -28,8 +29,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MultiValueMap;
+import org.springframework.test.context.TestPropertySource;
 import org.thymeleaf.spring6.SpringTemplateEngine;
 
 import java.util.Arrays;
@@ -46,6 +46,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.never;
@@ -54,18 +55,25 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
- * Phase 491 — the requester's decision e-mail (NTF-35): every approve / reject on the token review pages
- * enqueues ONE {@code REQUEST_DECIDED} outbox row in the decision transaction, and the real drain renders
+ * Phase 491 — the requester's decision e-mail (NTF-35): every approve / reject (since B545 only through the catalog
+ * portal's internal API) enqueues ONE {@code REQUEST_DECIDED} outbox row in the decision transaction, and the real drain renders
  * the real {@code email/request-decision} template over a mocked SMTP transport.
  */
 @Import(TestSecurityConfig.class)
+@TestPropertySource(properties = "app.internal-catalog-key=" + RequestDecisionEmailIT.CATALOG_KEY)
 @DisplayName("Phase 491 — request-decision e-mail (category request + service-type suggestion)")
 class RequestDecisionEmailIT extends AbstractIntegrationTest {
 
-    private static final String CATEGORY_APPROVE = "/api/v1/service-categories/requests/approve";
-    private static final String CATEGORY_REJECT = "/api/v1/service-categories/requests/reject";
-    private static final String SUGGESTION_APPROVE = "/api/v1/service-types/suggestions/approve";
-    private static final String SUGGESTION_REJECT = "/api/v1/service-types/suggestions/reject";
+    /** Same key as {@code RequestDecisionNotificationIT}, so both share one Spring context. */
+    static final String CATALOG_KEY = "test-internal-catalog-key-dddddddddddddddd";
+    private static final String BASE = "/api/v1/internal/catalog/requests";
+    private static final String ACTOR = "beautica.ua@gmail.com";
+    private static final String CATEGORY_APPROVE = "CATEGORY/approve";
+    private static final String CATEGORY_REJECT = "CATEGORY/reject";
+    private static final String SUGGESTION_APPROVE = "SERVICE_TYPE/approve";
+    private static final String SUGGESTION_REJECT = "SERVICE_TYPE/reject";
+    /** test profile {@code app.frontend.base-url} + the portal requests page (B545 operator email link). */
+    private static final String PORTAL_URL = "http://localhost:3000/admin/requests";
 
     // HAIRDRESSING is seeded APPROVED + active and mapped to a System-A bucket (V74/V78).
     private static final String SEEDED_CATEGORY = "HAIRDRESSING";
@@ -120,9 +128,9 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     @DisplayName("Reject POST writes exactly one PENDING REQUEST_DECIDED row (ids + flag only) with the status change")
     void should_writeOneIdsOnlyOutboxRow_when_categoryRejected() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester);
+        String requestId = submitCategory(requester);
 
-        ResponseEntity<String> decision = post(CATEGORY_REJECT, token, REASON);
+        ResponseEntity<String> decision = post(CATEGORY_REJECT, requestId, REASON);
 
         assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(categoryStatus()).isEqualTo("REJECTED");
@@ -145,9 +153,9 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
         installCommitFailureTrigger();
         try {
             Requester requester = newRequester();
-            String token = submitCategory(requester);
+            String requestId = submitCategory(requester);
 
-            ResponseEntity<String> decision = post(CATEGORY_REJECT, token, REASON);
+            ResponseEntity<String> decision = post(CATEGORY_REJECT, requestId, REASON);
 
             assertThat(decision.getStatusCode().is2xxSuccessful()).as("commit must fail: %s", decision).isFalse();
             assertThat(categoryStatus()).as("the decision rolled back with its outbox row").isEqualTo("PENDING");
@@ -158,14 +166,14 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Re-POSTing the used token adds no second row")
-    void should_addNoSecondRow_when_usedTokenRePosted() throws Exception {
+    @DisplayName("Deciding an already-decided request again adds no second row")
+    void should_addNoSecondRow_when_decidedAgain() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester);
+        String requestId = submitCategory(requester);
 
-        post(CATEGORY_REJECT, token, REASON);
-        post(CATEGORY_APPROVE, token, null);
-        post(CATEGORY_REJECT, token, REASON);
+        post(CATEGORY_REJECT, requestId, REASON);
+        post(CATEGORY_APPROVE, requestId, null);
+        post(CATEGORY_REJECT, requestId, REASON);
 
         assertThat(decisionRows()).hasSize(1);
     }
@@ -177,9 +185,9 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     void should_emailOnlyRequesterWithReason_when_categoryRejectDrained() throws Exception {
         Requester requester = newRequester();
         Requester bystander = newRequester();
-        String token = submitCategory(requester);
+        String requestId = submitCategory(requester);
         clearInvocations(emailService);
-        post(CATEGORY_REJECT, token, REASON);
+        post(CATEGORY_REJECT, requestId, REASON);
 
         drainWorker.drain();
 
@@ -196,8 +204,8 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     @DisplayName("Drained suggestion approve — approve copy, no reason block")
     void should_sendApproveCopyWithoutReason_when_suggestionApproveDrained() throws Exception {
         Requester requester = newRequester();
-        String token = submitSuggestion(requester);
-        post(SUGGESTION_APPROVE, token, null);
+        String requestId = submitSuggestion(requester);
+        post(SUGGESTION_APPROVE, requestId, null);
 
         drainWorker.drain();
 
@@ -212,8 +220,8 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     @DisplayName("Drained suggestion reject with a blank reason — reject copy, no reason block")
     void should_renderNoReasonBlock_when_suggestionRejectedWithBlankReason() throws Exception {
         Requester requester = newRequester();
-        String token = submitSuggestion(requester);
-        post(SUGGESTION_REJECT, token, "   ");
+        String requestId = submitSuggestion(requester);
+        post(SUGGESTION_REJECT, requestId, "   ");
 
         drainWorker.drain();
 
@@ -227,9 +235,9 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     @DisplayName("A 300-code-point reason renders in full")
     void should_renderFullReason_when_reasonIs300CodePoints() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester);
+        String requestId = submitCategory(requester);
         String boundary = "ж".repeat(300);
-        post(CATEGORY_REJECT, token, boundary);
+        post(CATEGORY_REJECT, requestId, boundary);
 
         drainWorker.drain();
 
@@ -242,8 +250,8 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     @DisplayName("Requester hard-deleted before the drain — no message, row SENT (never DEAD)")
     void should_sendNothingAndMarkSent_when_requesterDeletedBeforeDrain() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester);
-        post(CATEGORY_REJECT, token, REASON);
+        String requestId = submitCategory(requester);
+        post(CATEGORY_REJECT, requestId, REASON);
         jdbcTemplate.update("DELETE FROM users WHERE id = ?", requester.id());
 
         drainWorker.drain();
@@ -256,8 +264,8 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     @DisplayName("Requester inactive at drain time — no message, row SENT")
     void should_sendNothingAndMarkSent_when_requesterInactive() throws Exception {
         Requester requester = newRequester();
-        String token = submitSuggestion(requester);
-        post(SUGGESTION_REJECT, token, REASON);
+        String requestId = submitSuggestion(requester);
+        post(SUGGESTION_REJECT, requestId, REASON);
         jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", requester.id());
 
         drainWorker.drain();
@@ -271,8 +279,8 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     void should_sendNothingAndMarkSent_when_requesterColumnNoLongerMatches() throws Exception {
         Requester requester = newRequester();
         Requester other = newRequester();
-        String token = submitCategory(requester);
-        post(CATEGORY_REJECT, token, REASON);
+        String requestId = submitCategory(requester);
+        post(CATEGORY_REJECT, requestId, REASON);
         jdbcTemplate.update("UPDATE platform_categories SET requested_by_user_id = ? WHERE name = ?",
                 other.id(), CATEGORY_NAME);
 
@@ -288,8 +296,8 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     @DisplayName("Drained category approve — category approve subject + body line, no reason block, requester only")
     void should_sendCategoryApproveCopy_when_categoryApproveDrained() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester);
-        post(CATEGORY_APPROVE, token, null);
+        String requestId = submitCategory(requester);
+        post(CATEGORY_APPROVE, requestId, null);
 
         drainWorker.drain();
 
@@ -304,8 +312,8 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     @DisplayName("Drained suggestion reject with a reason — suggestion reject copy + «Причина: …» line")
     void should_sendSuggestionRejectWithReason_when_suggestionRejectDrained() throws Exception {
         Requester requester = newRequester();
-        String token = submitSuggestion(requester);
-        post(SUGGESTION_REJECT, token, REASON);
+        String requestId = submitSuggestion(requester);
+        post(SUGGESTION_REJECT, requestId, REASON);
 
         drainWorker.drain();
 
@@ -320,8 +328,8 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     @DisplayName("Drained category reject with the reason field omitted — reject copy, no reason block")
     void should_renderNoReasonBlock_when_categoryRejectedWithReasonOmitted() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester);
-        post(CATEGORY_REJECT, token, null);
+        String requestId = submitCategory(requester);
+        post(CATEGORY_REJECT, requestId, null);
 
         drainWorker.drain();
 
@@ -332,11 +340,11 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("A <script> reason posted on the token page reaches the e-mail HTML-escaped, never as live markup")
+    @DisplayName("A <script> reason posted in the portal reaches the e-mail HTML-escaped, never as live markup")
     void should_escapeScriptReason_when_rejectReasonCarriesMarkup() throws Exception {
         Requester requester = newRequester();
-        String token = submitCategory(requester);
-        post(CATEGORY_REJECT, token, "<script>alert('x')</script>&\"");
+        String requestId = submitCategory(requester);
+        post(CATEGORY_REJECT, requestId, "<script>alert('x')</script>&\"");
 
         drainWorker.drain();
 
@@ -349,9 +357,9 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     @DisplayName("Suggestion approve POST writes one SERVICE_TYPE_SUGGESTION row keyed by the suggestion id")
     void should_writeOneSuggestionRow_when_suggestionApproved() throws Exception {
         Requester requester = newRequester();
-        String token = submitSuggestion(requester);
+        String requestId = submitSuggestion(requester);
 
-        ResponseEntity<String> decision = post(SUGGESTION_APPROVE, token, null);
+        ResponseEntity<String> decision = post(SUGGESTION_APPROVE, requestId, null);
 
         assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
         List<Map<String, Object>> rows = decisionRows();
@@ -371,9 +379,9 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
         installCommitFailureTrigger();
         try {
             Requester requester = newRequester();
-            String token = submitSuggestion(requester);
+            String requestId = submitSuggestion(requester);
 
-            ResponseEntity<String> decision = post(SUGGESTION_APPROVE, token, null);
+            ResponseEntity<String> decision = post(SUGGESTION_APPROVE, requestId, null);
 
             assertThat(decision.getStatusCode().is2xxSuccessful()).as("commit must fail: %s", decision).isFalse();
             assertThat(suggestionStatus()).as("the approval rolled back with its outbox row").isEqualTo("PENDING");
@@ -425,29 +433,29 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
     private String submitCategory(Requester requester) {
         categoryRequestService.submitRequest(
                 new CreateCategoryRequestRequest(CATEGORY_NAME, CATEGORY_DISPLAY, null), requester.id());
-        ArgumentCaptor<String> url = ArgumentCaptor.forClass(String.class);
         verify(emailService).sendCategoryRequestNotification(
-                anyString(), anyString(), anyString(), anyString(), url.capture());
-        return url.getValue().substring(url.getValue().lastIndexOf('/') + 1);
+                anyString(), anyString(), anyString(), anyString(), eq(PORTAL_URL));
+        return String.valueOf(jdbcTemplate.queryForObject(
+                "SELECT id FROM platform_categories WHERE name = ?", Long.class, CATEGORY_NAME));
     }
 
     private String submitSuggestion(Requester requester) {
         suggestionService.submitSuggestionInternal(SEEDED_CATEGORY, SUGGESTED_TYPE, "decision mail IT", requester.id());
-        ArgumentCaptor<String> url = ArgumentCaptor.forClass(String.class);
         verify(emailService).sendServiceTypeSuggestionNotification(
-                anyString(), anyString(), anyString(), anyString(), anyString(), url.capture());
-        return url.getValue().substring(url.getValue().indexOf("token=") + "token=".length());
+                anyString(), anyString(), anyString(), anyString(), anyString(), eq(PORTAL_URL));
+        return suggestionId().toString();
     }
 
-    private ResponseEntity<String> post(String path, String token, String reason) {
+    /** The portal decision: {@code action} is {@code KIND/approve|reject}, {@code id} the request id. */
+    private ResponseEntity<String> post(String action, String id, String reason) throws Exception {
         HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
-        MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
-        form.add("token", token);
-        if (reason != null) {
-            form.add("reason", reason);
-        }
-        return restTemplate.postForEntity(path, new HttpEntity<>(form, headers), String.class);
+        headers.set("X-Internal-Key", CATALOG_KEY);
+        headers.set(AdminActor.HEADER, ACTOR);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        String[] kindAndVerb = action.split("/");
+        String body = reason == null ? null : objectMapper.writeValueAsString(Map.of("reason", reason));
+        return restTemplate.postForEntity(BASE + "/" + kindAndVerb[0] + "/" + id + "/" + kindAndVerb[1],
+                new HttpEntity<>(body, headers), String.class);
     }
 
     private List<Map<String, Object>> decisionRows() {

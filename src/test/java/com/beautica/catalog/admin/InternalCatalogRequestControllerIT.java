@@ -3,7 +3,6 @@ package com.beautica.catalog.admin;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
-import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.service.service.CategoryRequestService;
 import com.beautica.service.service.ServiceTypeSuggestionService;
@@ -66,7 +65,6 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
     @Autowired private JdbcTemplate jdbcTemplate;
     @Autowired private PasswordEncoder passwordEncoder;
     @Autowired private JwtTokenProvider jwtTokenProvider;
-    @Autowired private TokenGenerator tokenGenerator;
     @Autowired private ServiceTypeSuggestionService suggestionService;
     @Autowired private CategoryRequestService categoryRequestService;
     @Autowired private PlatformTransactionManager transactionManager;
@@ -75,7 +73,7 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
 
     @BeforeEach
     void createFixture() {
-        fixture = new CatalogRequestFixture(jdbcTemplate, passwordEncoder, tokenGenerator);
+        fixture = new CatalogRequestFixture(jdbcTemplate, passwordEncoder);
     }
 
     @AfterEach
@@ -360,16 +358,15 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
         assertThat(suggestedName(id)).isEqualTo("Масаж");
     }
 
-    // ── edit vs email-link approve (row lock) ──────────────────────────────────
+    // ── edit vs portal approve (row lock) ──────────────────────────────────────
 
-    private record RacedSuggestion(UUID id, String rawToken, String category) {}
+    private record RacedSuggestion(UUID id, String category) {}
 
     private RacedSuggestion seedApprovable(String name, Instant createdAt) {
         String category = new ServiceTestFixtures(null, jdbcTemplate, objectMapper, passwordEncoder)
                 .activeSelectableServiceTypes(1).get(0).platformCategoryName();
-        CatalogRequestFixture.Seeded<UUID> row = fixture.pendingSuggestionWithToken(category, name, null,
-                Instant.now().plus(Duration.ofDays(3)), createdAt);
-        return new RacedSuggestion(row.id(), row.rawToken(), category);
+        UUID id = fixture.pendingSuggestion(category, name, null, createdAt);
+        return new RacedSuggestion(id, category);
     }
 
     private <T> T raceAfterHeldTransaction(Runnable first, Supplier<T> second) throws Exception {
@@ -385,7 +382,7 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
         Throwable failure = null;
         try {
             raceAfterHeldTransaction(
-                    () -> assertThat(suggestionService.approve(row.rawToken()))
+                    () -> assertThat(suggestionService.approveById(row.id()))
                             .isEqualTo(ServiceTypeSuggestionService.DecisionOutcome.APPROVED),
                     () -> suggestionService.editPendingName(row.id(), "Гонка IT502 змінена"));
         } catch (CatalogRequestConflictException ex) {
@@ -396,21 +393,20 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
                 .isInstanceOfSatisfying(CatalogRequestConflictException.class, ex -> assertThat(ex.getCode())
                         .isEqualTo(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING));
         Map<String, Object> stored = jdbcTemplate.queryForMap(
-                "SELECT status, suggested_name, token_hash FROM service_type_suggestion WHERE id = ?", row.id());
+                "SELECT status, suggested_name FROM service_type_suggestion WHERE id = ?", row.id());
         assertThat(stored.get("status")).isEqualTo("APPROVED");
         assertThat(stored.get("suggested_name")).isEqualTo("Гонка IT502 перша");
-        assertThat(stored.get("token_hash")).isNull();
     }
 
     @Test
-    @DisplayName("edit holds the row → a parallel email-link approve waits, then promotes the EDITED name")
+    @DisplayName("edit holds the row → a parallel portal approve waits, then promotes the EDITED name")
     void should_promoteEditedName_when_editCommitsFirst() throws Exception {
         RacedSuggestion row = seedApprovable("Гонка IT502 друга", Instant.parse("2020-05-02T10:00:00Z"));
         fixture.trackType("Гонка IT502 виправлена");
 
         ServiceTypeSuggestionService.DecisionOutcome outcome = raceAfterHeldTransaction(
                 () -> suggestionService.editPendingName(row.id(), "Гонка IT502 виправлена"),
-                () -> suggestionService.approve(row.rawToken()));
+                () -> suggestionService.approveById(row.id()));
 
         assertThat(outcome).isEqualTo(ServiceTypeSuggestionService.DecisionOutcome.APPROVED);
         assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM service_types WHERE name_uk = ? "
@@ -419,15 +415,14 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
                 Long.class, "Гонка IT502 друга")).isZero();
     }
 
-    // ── CATEGORY edit vs email-link approve (row lock) ──────────────────────────
+    // ── CATEGORY edit vs portal approve (row lock) ──────────────────────────────
 
-    private record RacedCategory(long id, String rawToken, String name) {}
+    private record RacedCategory(long id, String name) {}
 
     private RacedCategory seedApprovableCategory(String name, String displayName, String initialServiceName,
                                                  Instant createdAt) {
-        CatalogRequestFixture.Seeded<Long> row = fixture.pendingCategoryWithToken(name, displayName, null,
-                initialServiceName, Instant.now().plus(Duration.ofDays(3)), createdAt);
-        return new RacedCategory(row.id(), row.rawToken(), name);
+        long id = fixture.pendingCategory(name, displayName, null, initialServiceName, createdAt);
+        return new RacedCategory(id, name);
     }
 
     @Test
@@ -439,7 +434,7 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
         Throwable failure = null;
         try {
             raceAfterHeldTransaction(
-                    () -> assertThat(categoryRequestService.approve(row.rawToken()))
+                    () -> assertThat(categoryRequestService.approveById(row.id()))
                             .isEqualTo(CategoryRequestService.DecisionOutcome.APPROVED),
                     () -> categoryRequestService.editPendingName(row.id(), "Гонка змінена", null));
         } catch (CatalogRequestConflictException ex) {
@@ -450,22 +445,21 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
                 .isInstanceOfSatisfying(CatalogRequestConflictException.class, ex -> assertThat(ex.getCode())
                         .isEqualTo(CatalogRequestConflictException.Code.REQUEST_NOT_PENDING));
         Map<String, Object> stored = jdbcTemplate.queryForMap(
-                "SELECT status, active, display_name, token_hash FROM platform_categories WHERE id = ?", row.id());
+                "SELECT status, active, display_name FROM platform_categories WHERE id = ?", row.id());
         assertThat(stored.get("status")).isEqualTo("APPROVED");
         assertThat(stored.get("active")).isEqualTo(true);
         assertThat(stored.get("display_name")).isEqualTo("Гонка перша");
-        assertThat(stored.get("token_hash")).isNull();
     }
 
     @Test
-    @DisplayName("category edit holds the row → a parallel email-link approve waits, then approves the EDITED name")
+    @DisplayName("category edit holds the row → a parallel portal approve waits, then approves the EDITED name")
     void should_approveEditedDisplayName_when_categoryEditCommitsFirst() throws Exception {
         RacedCategory row = seedApprovableCategory("IT502_RACE_TWO", "Гонка друга", null,
                 Instant.parse("2020-05-04T10:00:00Z"));
 
         CategoryRequestService.DecisionOutcome outcome = raceAfterHeldTransaction(
                 () -> categoryRequestService.editPendingName(row.id(), "Гонка виправлена", null),
-                () -> categoryRequestService.approve(row.rawToken()));
+                () -> categoryRequestService.approveById(row.id()));
 
         assertThat(outcome).isEqualTo(CategoryRequestService.DecisionOutcome.APPROVED);
         Map<String, Object> stored = jdbcTemplate.queryForMap(
@@ -473,60 +467,6 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
         assertThat(stored.get("name")).isEqualTo("IT502_RACE_TWO");
         assertThat(stored.get("status")).isEqualTo("APPROVED");
         assertThat(stored.get("display_name")).isEqualTo("Гонка виправлена");
-    }
-
-    // ── owner answer Q3: the portal-edited name is the name the email link approves ──
-
-    private ResponseEntity<String> approveByEmailLink(String path, String rawToken) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
-        MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
-        form.add("token", rawToken);
-        return restTemplate.exchange(path, HttpMethod.POST, new HttpEntity<>(form, headers), String.class);
-    }
-
-    @Test
-    @DisplayName("Q3 SERVICE_TYPE — portal PATCH, then the email-link approve promotes the edited name")
-    void should_promotePortalEditedName_when_suggestionApprovedByEmailLink() throws Exception {
-        RacedSuggestion row = seedApprovable("Q3 IT502 з помилкою", Instant.parse("2020-06-01T10:00:00Z"));
-        fixture.trackType("Q3 IT502 виправлена");
-        fixture.trackType("Q3 IT502 з помилкою");
-
-        ResponseEntity<String> edit = patch("SERVICE_TYPE", row.id(), Map.of("name", "Q3 IT502 виправлена"));
-        ResponseEntity<String> approve = approveByEmailLink("/api/v1/service-types/suggestions/approve", row.rawToken());
-
-        assertThat(edit.getStatusCode()).as("edit body: %s", edit.getBody()).isEqualTo(HttpStatus.OK);
-        assertThat(approve.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(jdbcTemplate.queryForObject("SELECT status FROM service_type_suggestion WHERE id = ?",
-                String.class, row.id())).as("the edit kept the email token valid (track D2)").isEqualTo("APPROVED");
-        assertThat(jdbcTemplate.queryForList("SELECT name_uk FROM service_types WHERE platform_category_name = ? "
-                        + "AND name_uk LIKE 'Q3 IT502%'", String.class, row.category()))
-                .containsExactly("Q3 IT502 виправлена");
-    }
-
-    @Test
-    @DisplayName("Q3 CATEGORY — portal PATCH, then the email-link approve publishes the edited display + initial name")
-    void should_approvePortalEditedNames_when_categoryApprovedByEmailLink() throws Exception {
-        RacedCategory row = seedApprovableCategory("IT502_Q3", "Брови з помилкою", "Корекція з помилкою",
-                Instant.parse("2020-06-02T10:00:00Z"));
-
-        ResponseEntity<String> edit = patch("CATEGORY", row.id(),
-                Map.of("name", "Брови", "initialServiceName", "Корекція брів"));
-        ResponseEntity<String> approve = approveByEmailLink("/api/v1/service-categories/requests/approve",
-                row.rawToken());
-
-        assertThat(edit.getStatusCode()).as("edit body: %s", edit.getBody()).isEqualTo(HttpStatus.OK);
-        assertThat(approve.getStatusCode()).isEqualTo(HttpStatus.OK);
-        Map<String, Object> category = jdbcTemplate.queryForMap(
-                "SELECT name, display_name, status, active FROM platform_categories WHERE id = ?", row.id());
-        assertThat(category.get("status")).as("the edit kept the email token valid (track D2)").isEqualTo("APPROVED");
-        assertThat(category.get("active")).isEqualTo(true);
-        assertThat(category.get("name")).as("wire name never changes (track D4)").isEqualTo("IT502_Q3");
-        assertThat(category.get("display_name")).isEqualTo("Брови");
-        assertThat(jdbcTemplate.queryForList("SELECT suggested_name FROM service_type_suggestion "
-                + "WHERE category_name = ?", String.class, "IT502_Q3"))
-                .as("the initial service the approve spawns carries the EDITED name")
-                .containsExactly("Корекція брів");
     }
 
     // ── list: pagination, status filter, requester label ────────────────────────

@@ -2,6 +2,7 @@ package com.beautica.search.service;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.ApiResponse;
+import com.beautica.catalog.admin.AdminActor;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.ServiceTestFixtures;
 import com.beautica.service.dto.ApprovedCategoryResponse;
@@ -30,6 +31,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.test.context.TestPropertySource;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 
@@ -46,7 +48,7 @@ import static org.mockito.Mockito.verify;
 /**
  * End-to-end regression for the "approved catalogue entry invisible until the TTL expired" bug
  * (branch fix/catalogue-cache-evictions). Real Caffeine caches, real Postgres, real HTTP filter
- * chain: the admin decision goes through the actual permitAll review POST with the e-mailed token.
+ * chain: the operator decision goes through the catalog portal's internal API (the only decision path since B545).
  *
  * <p>Before the fix, approving a service-type suggestion evicted none of {@code service-types},
  * {@code service-type-search} or {@code searchSuggestionCatalogue}, and approving a category did
@@ -57,18 +59,25 @@ import static org.mockito.Mockito.verify;
  * is asserted through the real {@link SearchSuggestionCatalogue} proxy instead, which is why this
  * IT lives in the package that owns the package-private snapshot records.
  *
- * <p>Negative half: the review POSTs are public, so a garbage token (or a valid reject) must NOT
- * flush the platform-wide caches — asserted by cached-value identity, which a re-population after
- * an eviction cannot satisfy.
+ * <p>Negative half: the retired public review POSTs (B545, 410) and a valid reject must NOT flush the
+ * platform-wide caches — asserted by cached-value identity, which a re-population after an eviction
+ * cannot satisfy.
  */
 @Import(TestSecurityConfig.class)
+@TestPropertySource(properties = "app.internal-catalog-key=" + CatalogueApprovalCacheEvictionIT.CATALOG_KEY)
 @DisplayName("Catalogue approval — caches evicted post-commit on APPROVED only, end-to-end over HTTP")
 class CatalogueApprovalCacheEvictionIT extends AbstractIntegrationTest {
 
-    private static final String SUGGESTION_APPROVE = "/api/v1/service-types/suggestions/approve";
-    private static final String SUGGESTION_REJECT = "/api/v1/service-types/suggestions/reject";
-    private static final String CATEGORY_APPROVE = "/api/v1/service-categories/requests/approve";
-    private static final String CATEGORY_REJECT = "/api/v1/service-categories/requests/reject";
+    /** Same key as {@code RequestDecisionNotificationIT}, so the contexts can be shared. */
+    static final String CATALOG_KEY = "test-internal-catalog-key-dddddddddddddddd";
+    private static final String DECISIONS = "/api/v1/internal/catalog/requests";
+    private static final String ACTOR = "beautica.ua@gmail.com";
+    private static final String SUGGESTION_APPROVE = "SERVICE_TYPE/approve";
+    private static final String SUGGESTION_REJECT = "SERVICE_TYPE/reject";
+    private static final String CATEGORY_APPROVE = "CATEGORY/approve";
+    private static final String CATEGORY_REJECT = "CATEGORY/reject";
+    private static final String RETIRED_SUGGESTION_APPROVE = "/api/v1/service-types/suggestions/approve";
+    private static final String RETIRED_CATEGORY_APPROVE = "/api/v1/service-categories/requests/approve";
     private static final String APPROVED_CATEGORIES = "/api/v1/service-categories/approved";
     private static final String INTERNAL_CATEGORIES = "/api/v1/internal/service-categories";
     // application-test.yml app.internal-api-key — keep in sync.
@@ -84,6 +93,10 @@ class CatalogueApprovalCacheEvictionIT extends AbstractIntegrationTest {
     private static final List<String> CATALOGUE_CACHES = List.of(
             "service-types", "service-type-search", SearchSuggestionCatalogue.CACHE_NAME,
             "approved-categories", "platform-category-order");
+
+    /** B545 — per-master caches a portal approve must leave warm (approve adds catalog rows, changes no label). */
+    private static final List<String> PER_MASTER_CACHES = List.of("masterServices", "booking-slug-info");
+    private static final String PER_MASTER_SENTINEL_KEY = "it-b545-sentinel";
 
     @Autowired private TestRestTemplate restTemplate;
     @Autowired private ObjectMapper objectMapper;
@@ -106,19 +119,19 @@ class CatalogueApprovalCacheEvictionIT extends AbstractIntegrationTest {
     // ── positive: approval is visible immediately ───────────────────────────────────────────
 
     @Test
-    @DisplayName("approve service-type suggestion via review POST — new type visible at once in /service-types?q=, the suggestions catalogue and slug resolution")
+    @DisplayName("approve service-type suggestion in the portal — new type visible at once in /service-types?q=, the suggestions catalogue and slug resolution")
     void should_exposeNewTypeImmediately_when_suggestionApprovedOverHttp() throws Exception {
-        String token = submitSuggestionAndCaptureToken();
+        String requestId = submitSuggestionAndFindId();
         assertThat(searchServiceTypes()).as("precondition: search warmed with no hit").isEmpty();
         assertThat(catalogueServiceNames()).as("precondition: catalogue warmed without the type")
                 .doesNotContain(SUGGESTED_TYPE);
         assertThat(cacheSize("service-type-search")).as("precondition: service-type-search warm").isPositive();
         assertThat(cacheSize(SearchSuggestionCatalogue.CACHE_NAME)).as("precondition: catalogue warm").isPositive();
+        Map<String, Object> perMaster = seedPerMasterSentinels();
 
-        ResponseEntity<String> decision = postDecision(SUGGESTION_APPROVE, token);
+        ResponseEntity<String> decision = postDecision(SUGGESTION_APPROVE, requestId);
 
-        assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(decision.getBody()).contains("Пропозицію прийнято");
+        assertThat(decision.getStatusCode()).as("body=%s", decision.getBody()).isEqualTo(HttpStatus.OK);
         assertThat(searchServiceTypes())
                 .as("GET /service-types?q= serves the approved type without waiting for the TTL")
                 .extracting(ServiceTypeResponse::nameUk)
@@ -131,28 +144,30 @@ class CatalogueApprovalCacheEvictionIT extends AbstractIntegrationTest {
         assertThat(slugResolver.resolve(List.of(slug)))
                 .as("slug resolution (service-types 'ALL' cache) resolves the approved type")
                 .containsExactly(Optional.of(new ServiceTypeMatch(promotedTypeId(), SUGGESTED_TYPE)));
+        assertPerMasterSentinelsKept(perMaster);
     }
 
     @Test
-    @DisplayName("approve category request via review POST — new category visible at once in /service-categories/approved and the suggestions catalogue")
+    @DisplayName("approve category request in the portal — new category visible at once in /service-categories/approved and the suggestions catalogue")
     void should_exposeNewCategoryImmediately_when_categoryApprovedOverHttp() throws Exception {
         String ownerToken = newOwnerToken();
-        String token = submitCategoryRequestAndCaptureToken();
+        String requestId = submitCategoryRequestAndFindId();
         assertThat(approvedCategoryNames(ownerToken)).as("precondition: approved list warmed without it")
                 .doesNotContain(NEW_CATEGORY);
         assertThat(catalogueCategoryKeys()).as("precondition: catalogue warmed without it")
                 .doesNotContain(NEW_CATEGORY);
+        Map<String, Object> perMaster = seedPerMasterSentinels();
 
-        ResponseEntity<String> decision = postDecision(CATEGORY_APPROVE, token);
+        ResponseEntity<String> decision = postDecision(CATEGORY_APPROVE, requestId);
 
-        assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(decision.getBody()).contains("Категорію підтверджено");
+        assertThat(decision.getStatusCode()).as("body=%s", decision.getBody()).isEqualTo(HttpStatus.OK);
         assertThat(approvedCategoryNames(ownerToken))
                 .as("GET /service-categories/approved lists the approved category without waiting for the TTL")
                 .contains(NEW_CATEGORY);
         assertThat(catalogueCategoryKeys())
                 .as("search-suggestions catalogue includes the approved category")
                 .contains(NEW_CATEGORY);
+        assertPerMasterSentinelsKept(perMaster);
     }
 
     @Test
@@ -177,27 +192,27 @@ class CatalogueApprovalCacheEvictionIT extends AbstractIntegrationTest {
     // ── negative: public endpoints must not flush the caches ────────────────────────────────
 
     @Test
-    @DisplayName("garbage token on both approve POSTs — neutral 200, every catalogue cache keeps its exact cached value")
-    void should_keepCachesWarm_when_approvePostedWithGarbageToken() throws Exception {
+    @DisplayName("retired e-mail approve POSTs (B545) — 410, every catalogue cache keeps its exact cached value")
+    void should_keepCachesWarm_when_retiredApproveLinkPosted() throws Exception {
         Map<String, Map<Object, Object>> before = warmAllCatalogueCachesAndSnapshot();
 
-        ResponseEntity<String> typeDecision = postDecision(SUGGESTION_APPROVE, garbageToken());
-        ResponseEntity<String> categoryDecision = postDecision(CATEGORY_APPROVE, garbageToken());
+        ResponseEntity<String> typeDecision = postRetiredLink(RETIRED_SUGGESTION_APPROVE, garbageToken());
+        ResponseEntity<String> categoryDecision = postRetiredLink(RETIRED_CATEGORY_APPROVE, garbageToken());
 
-        assertThat(typeDecision.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(categoryDecision.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(typeDecision.getStatusCode()).isEqualTo(HttpStatus.GONE);
+        assertThat(categoryDecision.getStatusCode()).isEqualTo(HttpStatus.GONE);
         assertCachesUntouched(before);
     }
 
     @Test
-    @DisplayName("valid-token reject of a suggestion and a category request — persisted REJECTED, caches keep their exact cached value")
+    @DisplayName("portal reject of a suggestion and a category request — persisted REJECTED, caches keep their exact cached value")
     void should_keepCachesWarm_when_validRequestsRejected() throws Exception {
-        String suggestionToken = submitSuggestionAndCaptureToken();
-        String categoryToken = submitCategoryRequestAndCaptureToken();
+        String suggestionId = submitSuggestionAndFindId();
+        String categoryId = submitCategoryRequestAndFindId();
         Map<String, Map<Object, Object>> before = warmAllCatalogueCachesAndSnapshot();
 
-        ResponseEntity<String> typeDecision = postDecision(SUGGESTION_REJECT, suggestionToken);
-        ResponseEntity<String> categoryDecision = postDecision(CATEGORY_REJECT, categoryToken);
+        ResponseEntity<String> typeDecision = postDecision(SUGGESTION_REJECT, suggestionId);
+        ResponseEntity<String> categoryDecision = postDecision(CATEGORY_REJECT, categoryId);
 
         assertThat(typeDecision.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(categoryDecision.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -232,6 +247,23 @@ class CatalogueApprovalCacheEvictionIT extends AbstractIntegrationTest {
                         .isSameAs(value)));
     }
 
+    /** One sentinel entry per per-master cache; identity proves no evict/re-populate happened. */
+    private Map<String, Object> seedPerMasterSentinels() {
+        Map<String, Object> seeded = new HashMap<>();
+        for (String name : PER_MASTER_CACHES) {
+            Object value = new Object();
+            nativeCache(name).put(PER_MASTER_SENTINEL_KEY, value);
+            seeded.put(name, value);
+        }
+        return seeded;
+    }
+
+    private void assertPerMasterSentinelsKept(Map<String, Object> seeded) {
+        seeded.forEach((name, value) -> assertThat(nativeCache(name).asMap().get(PER_MASTER_SENTINEL_KEY))
+                .as("B545: portal approve evicts only the platform catalog, %s stays warm", name)
+                .isSameAs(value));
+    }
+
     @SuppressWarnings("unchecked")
     private Cache<Object, Object> nativeCache(String name) {
         return ((CaffeineCache) cacheManager.getCache(name)).getNativeCache();
@@ -241,7 +273,19 @@ class CatalogueApprovalCacheEvictionIT extends AbstractIntegrationTest {
         return nativeCache(name).asMap().size();
     }
 
-    private ResponseEntity<String> postDecision(String path, String token) {
+    /** The portal decision: {@code action} is {@code KIND/approve|reject}. */
+    private ResponseEntity<String> postDecision(String action, String id) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Internal-Key", CATALOG_KEY);
+        headers.set(AdminActor.HEADER, ACTOR);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        String[] kindAndVerb = action.split("/");
+        return restTemplate.postForEntity(DECISIONS + "/" + kindAndVerb[0] + "/" + id + "/" + kindAndVerb[1],
+                new HttpEntity<>(null, headers), String.class);
+    }
+
+    /** A form POST to a retired e-mail decision link, as a link in an old e-mail would send it. */
+    private ResponseEntity<String> postRetiredLink(String path, String token) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
         MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
@@ -281,21 +325,17 @@ class CatalogueApprovalCacheEvictionIT extends AbstractIntegrationTest {
                 "SELECT id FROM service_types WHERE name_uk = ?", UUID.class, SUGGESTED_TYPE);
     }
 
-    private String submitSuggestionAndCaptureToken() throws Exception {
+    private String submitSuggestionAndFindId() throws Exception {
         suggestionService.submitSuggestionInternal(SEEDED_CATEGORY, SUGGESTED_TYPE, "cache IT", newRequester());
-        ArgumentCaptor<String> url = ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendServiceTypeSuggestionNotification(
-                anyString(), anyString(), anyString(), anyString(), anyString(), url.capture());
-        return url.getValue().substring(url.getValue().indexOf("token=") + "token=".length());
+        return String.valueOf(jdbcTemplate.queryForObject(
+                "SELECT id FROM service_type_suggestion WHERE suggested_name = ?", UUID.class, SUGGESTED_TYPE));
     }
 
-    private String submitCategoryRequestAndCaptureToken() throws Exception {
+    private String submitCategoryRequestAndFindId() throws Exception {
         categoryRequestService.submitRequest(
                 new CreateCategoryRequestRequest(NEW_CATEGORY, "Кеш-евікшн тест", null), newRequester());
-        ArgumentCaptor<String> url = ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendCategoryRequestNotification(
-                anyString(), anyString(), anyString(), anyString(), url.capture());
-        return url.getValue().substring(url.getValue().lastIndexOf('/') + 1);
+        return String.valueOf(jdbcTemplate.queryForObject(
+                "SELECT id FROM platform_categories WHERE name = ?", Long.class, NEW_CATEGORY));
     }
 
     private static String garbageToken() {

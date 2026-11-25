@@ -33,8 +33,11 @@ import java.util.UUID;
  * <p>B503 (SVC-06) — approve / reject by id. The owning service runs the SAME decision as the emailed link
  * ({@code approveById} / {@code rejectById} → the shared {@code decide(…)}), joining this transaction; this class adds
  * the {@code APPROVE} / {@code REJECT} audit row in the same transaction; an approve also calls
- * {@link CatalogCacheEvictor#evictAll()}, which runs after commit (a rollback evicts nothing). A reject evicts nothing:
- * pending and rejected rows feed no cache.
+ * {@link CatalogCacheEvictor#evictPlatformCatalog()}, which runs after commit (a rollback evicts nothing). Narrowest
+ * evictor that covers approve (B545): it publishes a category (APPROVED + active, plus a PENDING initial suggestion) or
+ * promotes a type (catalog-only, no {@code ServiceDefinition}); no master service can reference a pending category or
+ * an unpromoted type and no existing label changes, so the per-master {@code masterServices} /
+ * {@code booking-slug-info} caches stay warm. A reject evicts nothing: pending and rejected rows feed no cache.
  */
 @Service
 @RequiredArgsConstructor
@@ -94,7 +97,7 @@ public class CatalogRequestAdminService {
     }
 
     /**
-     * B503 — approves a PENDING request: promotion, decision e-mail and token invalidation exactly as the email link.
+     * B503 — approves a PENDING request: promotion and decision e-mail (since B545 the only decision path).
      * 404 for an unknown id, 409 {@code REQUEST_NOT_PENDING} when already decided (the row lock makes the first
      * decision win), 400 for a malformed id.
      */
@@ -114,11 +117,11 @@ public class CatalogRequestAdminService {
         };
         auditService.record(actor, APPROVE_ACTION, targetType(kind), targetId,
                 Map.of(STATUS, CatalogRequestStatus.PENDING.name()), Map.of(STATUS, CatalogRequestStatus.APPROVED.name()));
-        cacheEvictor.evictAll();
+        cacheEvictor.evictPlatformCatalog();
     }
 
     /**
-     * B503 — rejects a PENDING request with an optional reason, cleaned by the email form's rules
+     * B503 — rejects a PENDING request with an optional reason, cleaned by the shared rules
      * ({@link DecisionReason#parse}); over {@value DecisionReason#MAX_LENGTH} code points is a 400 and nothing changes.
      * Errors as {@link #approve}. No eviction: a rejected row feeds no cache.
      */

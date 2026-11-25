@@ -1,72 +1,53 @@
 package com.beautica.service.service;
 
-import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.service.RequestKind;
-import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.dto.ApprovedCategoryResponse;
 import com.beautica.service.dto.CategoryRequestResponse;
 import com.beautica.service.dto.CreateCategoryRequestRequest;
 import com.beautica.service.entity.PlatformCategory;
 import com.beautica.service.entity.PlatformCategoryStatus;
 import com.beautica.service.repository.PlatformCategoryRepository;
+import com.beautica.user.AfterCommitHandOff;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
-import org.springframework.cache.annotation.Caching;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Clock;
-import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Locale;
-import java.util.Optional;
 import java.util.UUID;
 
 /**
- * Self-service service-category request + email-approval workflow.
+ * Self-service service-category request workflow.
  *
- * <p>One table ({@code platform_categories}) backs both the catalog and the
- * request record — no parallel table. A request is a PENDING, inactive row carrying
- * a hashed single-use token; a platform admin approves it via an emailed link, at
- * which point it becomes {@code APPROVED + active} and selectable platform-wide.
+ * <p>One table ({@code platform_categories}) backs both the catalog and the request record — no parallel table. A
+ * request is a PENDING, inactive row; the platform operator gets a notification-only email linking to the catalog
+ * portal and decides it there ({@link #approveById} / {@link #rejectById}, B503), at which point it becomes
+ * {@code APPROVED + active} and selectable platform-wide.
  *
- * <p>Security properties enforced here:
- * <ul>
- *   <li>Raw token never persisted — only {@code SHA-256(token)} hex is stored.</li>
- *   <li>Token matched in constant time ({@link MessageDigest#isEqual}).</li>
- *   <li>7-day expiry; single-use (token nulled on decision).</li>
- *   <li>Decisions only mutate state on the POST paths (approve/reject), never on
- *       the GET review load — defeats email-scanner link pre-fetch.</li>
- *   <li>Invalid/expired/already-decided tokens map to a neutral outcome so the
- *       caller cannot probe request existence.</li>
- * </ul>
+ * <p>B545 (SVC-61): email approve / reject is retired. No token is minted or stored; the former emailed links answer
+ * 410 ({@code RetiredCatalogRequestLinksController}) and never reach this service.
  */
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class CategoryRequestService {
 
-    private static final Duration TOKEN_TTL = Duration.ofDays(7);
     /** V64 {@code UNIQUE(name)} — blocks a second row with the same name in ANY status. */
     static final String NAME_UNIQUE_CONSTRAINT = "uq_platform_categories_name";
     static final String DUPLICATE_CATEGORY_MESSAGE_PREFIX = "Category already exists or is pending: ";
-    // Token is carried as the trailing PATH SEGMENT (not a query param) so it is not
-    // exposed in proxy access logs or leaked via the Referer header of assets loaded
-    // on the review page. The base64url token charset (A-Za-z0-9-_) is path-safe.
-    private static final String REVIEW_PATH = "/api/v1/service-categories/requests/review/";
     /** Named cache for the global APPROVED+active category list. */
     static final String APPROVED_CATEGORIES_CACHE = "approved-categories";
     /** Constant key — the approved list is platform-wide, not per-user. */
@@ -75,9 +56,8 @@ public class CategoryRequestService {
             List.of(PlatformCategoryStatus.APPROVED, PlatformCategoryStatus.PENDING);
 
     private final PlatformCategoryRepository platformCategoryRepository;
-    private final TokenGenerator tokenGenerator;
     private final EmailService emailService;
-    private final PublicBaseUrlProperties publicBaseUrlProperties;
+    private final AdminRequestsPortalLink adminRequestsPortalLink;
     private final ServiceTypeSuggestionService serviceTypeSuggestionService;
     private final Clock clock;
     private final InAppNotificationService inAppNotificationService;
@@ -86,30 +66,16 @@ public class CategoryRequestService {
     @Value("${app.admin-email}")
     private String adminEmail;
 
-    /** SpEL guard: evict only when the decision actually changed state. */
-    private static final String APPROVED_ONLY = "#result.name() == 'APPROVED'";
-
-    /**
-     * Outcome of a token-bearing review/decision operation. The controller maps it
-     * to a neutral HTML page; no variant leaks whether a request existed.
-     */
+    /** Outcome of a portal decision. */
     public enum DecisionOutcome {
         APPROVED,
-        REJECTED,
-        ALREADY_DECIDED,
-        INVALID_OR_EXPIRED
-    }
-
-    /** Loaded request details for the read-only review page (no state change). */
-    public record ReviewView(boolean valid, String categoryName, String displayName) {
-        static ReviewView invalid() {
-            return new ReviewView(false, null, null);
-        }
+        REJECTED
     }
 
     /**
-     * Submits a new category request: inserts a PENDING row and emails the admin a
-     * single-use approval link. Returns a minimal DTO; never the token.
+     * Submits a new category request: inserts a PENDING row and emails the operator a notification-only message that
+     * links to the portal's requests page (B545; direct send, NTF-D12), handed off only after the transaction commits.
+     * Returns a minimal DTO.
      *
      * @throws BusinessException 409 if the (normalized) name already exists as
      *                           APPROVED or PENDING
@@ -122,87 +88,20 @@ public class CategoryRequestService {
             throw duplicateCategory(name);
         }
 
-        String rawToken = tokenGenerator.generateToken();
-        String tokenHash = tokenGenerator.hash(rawToken);
-        OffsetDateTime now = OffsetDateTime.now(clock);
-
         PlatformCategory category = PlatformCategory.ofPendingRequest(
-                name, request.displayName(), requesterId, tokenHash, now, now.plus(TOKEN_TTL),
+                name, request.displayName(), requesterId, OffsetDateTime.now(clock),
                 trimToNull(request.initialServiceName()));
         PlatformCategory saved = insertPending(category);
 
-        String reviewUrl = publicBaseUrlProperties.getPublicBaseUrl() + REVIEW_PATH + rawToken;
-        emailService.sendCategoryRequestNotification(
-                adminEmail,
-                requesterId != null ? requesterId.toString() : "—",
-                saved.getName(),
-                saved.getDisplayName(),
-                reviewUrl);
+        String requester = requesterId != null ? requesterId.toString() : "—";
+        String portalUrl = adminRequestsPortalLink.requestsUrl();
+        // B545 — after commit only: a rolled-back insert (e.g. a lost UNIQUE race) never announces a request.
+        AfterCommitHandOff.submit(Runnable::run,
+                () -> emailService.sendCategoryRequestNotification(
+                        adminEmail, requester, saved.getName(), saved.getDisplayName(), portalUrl),
+                log, "Category request operator email");
 
         return CategoryRequestResponse.from(saved);
-    }
-
-    /**
-     * Read-only load for the review page. NO state change. Returns an invalid view
-     * for any token that does not match a live PENDING request, so the page is
-     * neutral and does not reveal request existence.
-     */
-    @Transactional(readOnly = true)
-    public ReviewView loadForReview(String rawToken) {
-        return findLivePending(rawToken)
-                .map(c -> new ReviewView(true, c.getName(), c.getDisplayName()))
-                .orElseGet(ReviewView::invalid);
-    }
-
-    /**
-     * Approves the PENDING request identified by the token: APPROVED + active,
-     * token cleared (single-use). Idempotent: a second call returns
-     * {@link DecisionOutcome#ALREADY_DECIDED} (or INVALID_OR_EXPIRED) — no 500.
-     *
-     * <p>Evicts only when the outcome is {@code APPROVED}: the endpoint is public, so a garbage or
-     * replayed token must not flush the caches.
-     *
-     * <p>The single eviction mechanism is the conditional {@code @CacheEvict} set below. It runs
-     * POST-commit: the caching advisor is outermost ({@code CacheConfig}, {@code @EnableCaching(order =
-     * HIGHEST_PRECEDENCE)}), so it wraps the {@code @Transactional} advisor and evicts only after the
-     * transaction has committed; a rollback (exception) evicts nothing. A reader that began loading
-     * before the commit can still repopulate a stale snapshot; that in-flight load is bounded only by
-     * the cache TTL.
-     */
-    @Transactional
-    @Caching(evict = {
-            @CacheEvict(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY,
-                    condition = APPROVED_ONLY),
-            @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY,
-                    condition = APPROVED_ONLY),
-            // B504 (D18): the label list now also backs the salon-catalogue group order + names.
-            @CacheEvict(value = PlatformCategoryOrderLookup.LABELS_CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY,
-                    condition = APPROVED_ONLY),
-            @CacheEvict(value = SearchSuggestionCatalogue.CACHE_NAME, allEntries = true,
-                    condition = APPROVED_ONLY)
-    })
-    public DecisionOutcome approve(String rawToken) {
-        return decide(rawToken, true, null);
-    }
-
-    /**
-     * Rejects the PENDING request identified by the token: REJECTED, token cleared.
-     * Idempotent (see {@link #approve}). Evicts nothing: a REJECTED request never appears in any
-     * cached list (they hold APPROVED + active categories only), and a PENDING one does not either.
-     */
-    @Transactional
-    public DecisionOutcome reject(String rawToken) {
-        return reject(rawToken, null);
-    }
-
-    /**
-     * Rejects with an optional admin reason (already trimmed/sanitised/length-validated by the
-     * controller; null when none). The reason is stored on the request and surfaced to the requester
-     * through the in-app feed; it is never logged.
-     */
-    @Transactional
-    public DecisionOutcome reject(String rawToken, String reason) {
-        return decide(rawToken, false, reason);
     }
 
     /** B502 — the editable fields before and after a portal edit (for the caller's audit row). */
@@ -211,11 +110,11 @@ public class CategoryRequestService {
 
     /**
      * B502 (SVC-55) — the platform operator corrects the requested display name (and optionally the carried initial
-     * service name) while the request is PENDING. The wire {@code name} never changes (track D4); the outstanding
-     * email token stays valid (track D2). The display name follows the service-name rules (SVC-07 allow-list, SVC-08
-     * 100 chars, {@code ServiceCatalogService.canonicalName}); the initial service name goes through the suggestion
-     * validator it eventually feeds ({@code canonicalSuggestedName}). {@code initialServiceName}: {@code null} keeps
-     * the current value, a blank string clears it. Pending rows are not cached, so nothing is evicted.
+     * service name) while the request is PENDING. The wire {@code name} never changes (track D4). The display name
+     * follows the service-name rules (SVC-07 allow-list, SVC-08 100 chars, {@code ServiceCatalogService.canonicalName});
+     * the initial service name goes through the suggestion validator it eventually feeds ({@code
+     * canonicalSuggestedName}). {@code initialServiceName}: {@code null} keeps the current value, a blank string clears
+     * it. Pending rows are not cached, so nothing is evicted.
      *
      * @throws NotFoundException               no category row with this id
      * @throws CatalogRequestConflictException {@code REQUEST_NOT_PENDING} when the row is not a PENDING request
@@ -266,20 +165,17 @@ public class CategoryRequestService {
      * Approved + active categories for the authenticated mobile picker.
      *
      * <p>Cached under a single global {@code 'all'} key — the list is platform-wide.
-     * Eviction is the {@code @CacheEvict} on {@link #approve} and on
-     * {@link InternalCategoryService#create} (the two paths that change
-     * APPROVED/active membership; reject changes no cached data). That eviction is
-     * post-commit (cache advisor outermost, CacheConfig); an in-flight load that started
-     * before the commit is bounded only by the 60-minute TTL, acceptable for a
-     * low-frequency admin click.
+     * Eviction: {@code CatalogCacheEvictor.evictPlatformCatalog()} after a portal approve commits (B503 D5; since B545 the only
+     * approve eviction) and the {@code @CacheEvict} on {@link InternalCategoryService#create}; reject changes no
+     * cached data. An in-flight load that started before the commit is bounded only by the 60-minute TTL, acceptable
+     * for a low-frequency admin click.
      * {@code submitRequest} only inserts PENDING rows (not in this list) so it needs
      * no eviction.
      *
-     * <p>The sibling {@link PlatformCategoryOrderLookup#CACHE_NAME} cache is evicted
-     * alongside this one on {@link #approve} and {@link InternalCategoryService#create}: it backs {@code
-     * ServiceCatalogService#buildCategoryOrderAndNames} with the same {@code findApprovedActive()}
-     * query result, kept as a separate cache/bean because it returns entities for internal
-     * ordering rather than the {@link ApprovedCategoryResponse} DTO this method exposes.
+     * <p>The sibling {@link PlatformCategoryOrderLookup#CACHE_NAME} cache is evicted alongside this one by the same
+     * paths: it backs {@code ServiceCatalogService#buildCategoryOrderAndNames} with the same
+     * {@code findApprovedActive()} query result, kept as a separate cache/bean because it returns entities for
+     * internal ordering rather than the {@link ApprovedCategoryResponse} DTO this method exposes.
      *
      * <p>{@code sync = true} (B503): one hot platform-wide key, so a TTL expiry or an approve's eviction loads it once
      * instead of once per concurrent picker.
@@ -292,34 +188,15 @@ public class CategoryRequestService {
                 .toList();
     }
 
-    private DecisionOutcome decide(String rawToken, boolean approve, String reason) {
-        Optional<PlatformCategory> match = findByTokenConstantTime(rawToken, true);
-        if (match.isEmpty()) {
-            // Token unknown. The row may already be decided (token nulled) — we
-            // cannot distinguish, so return a neutral already-decided outcome.
-            return DecisionOutcome.ALREADY_DECIDED;
-        }
-
-        PlatformCategory category = match.get();
-        if (!category.isPending()) {
-            return DecisionOutcome.ALREADY_DECIDED;
-        }
-        if (isExpired(category)) {
-            return DecisionOutcome.INVALID_OR_EXPIRED;
-        }
-        return decide(category, approve, reason);
-    }
-
     /**
-     * B503 (SVC-06) — the platform operator approves the category request from the catalog portal. Same outcome as
-     * the email link: it runs the SAME {@link #decide(PlatformCategory, boolean, String)} (APPROVED + active, the
-     * carried initial-service suggestion, in-app item, decision e-mail) and clears the email token, so a later link
-     * click shows «already decided». The row is locked ({@code FOR UPDATE}, the lock B502's edit and the token path
-     * take), so the first decision wins. Token expiry does not apply: it bounds the e-mailed link, not the request.
+     * B503 (SVC-06) — the platform operator approves the category request from the catalog portal; since B545 the
+     * only decision path. It runs {@link #decide(PlatformCategory, boolean, String)} (APPROVED + active, the carried
+     * initial-service suggestion, in-app item, decision e-mail). The row is locked ({@code FOR UPDATE}, the lock B502's
+     * edit takes), so the first decision wins.
      *
      * <p>No cache annotation here: the caller ({@code CatalogRequestAdminService}) runs this inside its own
-     * transaction and calls {@code CatalogCacheEvictor.evictAll()} after commit, a superset of {@link #approve}'s
-     * evict set; a nested {@code @CacheEvict} would fire before that outer commit (Anti-Bug §F-2).
+     * transaction and calls {@code CatalogCacheEvictor.evictPlatformCatalog()} after commit; a nested {@code @CacheEvict} would
+     * fire before that outer commit (Anti-Bug §F-2).
      *
      * @throws NotFoundException               no category row with this id
      * @throws CatalogRequestConflictException {@code REQUEST_NOT_PENDING} when the row is not a PENDING request
@@ -331,7 +208,7 @@ public class CategoryRequestService {
 
     /**
      * B503 — portal reject; see {@link #approveById}. {@code reason} is already cleaned and length-checked by the
-     * caller ({@code DecisionReason}, the email path's rules); {@code null} when none.
+     * caller ({@code DecisionReason}); {@code null} when none.
      */
     @Transactional
     public DecisionOutcome rejectById(Long categoryId, String reason) {
@@ -348,9 +225,8 @@ public class CategoryRequestService {
     }
 
     /**
-     * The ONE decision for a locked PENDING request, shared by the email-link path ({@link #approve} /
-     * {@link #reject}) and the portal path ({@link #approveById} / {@link #rejectById}) — B503 D1. B541 adds its
-     * approve-branch check here.
+     * The ONE decision for a locked PENDING request ({@link #approveById} / {@link #rejectById}) — B503 D1. B541 adds
+     * its approve-branch check here.
      */
     private DecisionOutcome decide(PlatformCategory category, boolean approve, String reason) {
         OffsetDateTime now = OffsetDateTime.now(clock);
@@ -358,7 +234,7 @@ public class CategoryRequestService {
             category.approve(now);
             createInitialServiceSuggestion(category);
             // Same transaction as the decision (MANDATORY): the feed item commits or rolls back with it.
-            // Only reached on the PENDING transition — ALREADY_DECIDED / INVALID_OR_EXPIRED returned above.
+            // Only reached on the PENDING transition — lockPendingById rejects any other status first.
             inAppNotificationService.notifyCategoryRequestDecided(category, true);
             enqueueDecisionEmail(category, true);
             return DecisionOutcome.APPROVED;
@@ -385,7 +261,7 @@ public class CategoryRequestService {
      * now-approved category (promotion now happens when the resulting suggestion is
      * itself approved; Phase 16.9). A 409 dedup conflict is swallowed: the suggestion
      * runs in its own REQUIRES_NEW transaction so its rollback cannot roll back the
-     * category approval.
+     * category approval (B545 D4: keep REQUIRES_NEW).
      */
     private void createInitialServiceSuggestion(PlatformCategory category) {
         String initialServiceName = category.getInitialServiceName();
@@ -450,37 +326,5 @@ public class CategoryRequestService {
         }
         String trimmed = value.strip();
         return trimmed.isEmpty() ? null : trimmed;
-    }
-
-    private Optional<PlatformCategory> findLivePending(String rawToken) {
-        return findByTokenConstantTime(rawToken, false)
-                .filter(PlatformCategory::isPending)
-                .filter(c -> !isExpired(c));
-    }
-
-    /**
-     * Looks up the request by hashed token, then re-verifies the stored hash against
-     * the recomputed hash in constant time ({@link MessageDigest#isEqual}). The DB
-     * lookup is an equality match; the constant-time re-check is defense-in-depth so
-     * the decision branch never depends on a non-constant-time String compare.
-     */
-    private Optional<PlatformCategory> findByTokenConstantTime(String rawToken, boolean forUpdate) {
-        if (rawToken == null || rawToken.isBlank()) {
-            return Optional.empty();
-        }
-        String candidateHash = tokenGenerator.hash(rawToken);
-        Optional<PlatformCategory> found = forUpdate
-                ? platformCategoryRepository.findByTokenHashForUpdate(candidateHash)
-                : platformCategoryRepository.findByTokenHash(candidateHash);
-        return found
-                .filter(c -> c.getTokenHash() != null
-                        && MessageDigest.isEqual(
-                                c.getTokenHash().getBytes(StandardCharsets.UTF_8),
-                                candidateHash.getBytes(StandardCharsets.UTF_8)));
-    }
-
-    private boolean isExpired(PlatformCategory category) {
-        OffsetDateTime expiresAt = category.getTokenExpiresAt();
-        return expiresAt == null || expiresAt.isBefore(OffsetDateTime.now(clock));
     }
 }

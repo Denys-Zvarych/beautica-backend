@@ -274,21 +274,12 @@ class InAppPushEndToEndIT extends AbstractInAppPushFlowIT {
                 requester, tokenOf(requester));
         categoryRequestService.submitRequest(new com.beautica.service.dto.CreateCategoryRequestRequest(
                 "PUSH372_CAT", "Пуш-категорія", null), requester);
-        org.mockito.ArgumentCaptor<String> url = org.mockito.ArgumentCaptor.forClass(String.class);
-        org.mockito.Mockito.verify(emailService).sendCategoryRequestNotification(
-                org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(),
-                org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), url.capture());
-        String token = url.getValue().substring(url.getValue().lastIndexOf('/') + 1);
-        org.springframework.util.MultiValueMap<String, String> form = new org.springframework.util.LinkedMultiValueMap<>();
-        form.add("token", token);
-        form.add("reason", "PRIVATE-REASON-372");
-        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
-        headers.setContentType(org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED);
+        long requestId = jdbcTemplate.queryForObject(
+                "SELECT id FROM platform_categories WHERE name = 'PUSH372_CAT'", Long.class);
 
         try {
-            ResponseEntity<String> decision = restTemplate.postForEntity(
-                    "/api/v1/service-categories/requests/reject", new HttpEntity<>(form, headers), String.class);
-            assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
+            // B545: the portal decision (the emailed reject link is retired).
+            categoryRequestService.rejectById(requestId, "PRIVATE-REASON-372");
             assertThat(countOutbox("INAPP_PUSH")).isEqualTo(1);
             assertThat(jdbcTemplate.queryForObject(
                     "SELECT aggregate_id FROM notification_outbox WHERE event_type = 'INAPP_PUSH'", UUID.class))

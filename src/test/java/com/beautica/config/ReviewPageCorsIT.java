@@ -21,17 +21,19 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 
 /**
- * Behind Railway's TLS proxy the app sees plain http while the review pages' relative-path form posts
- * carry {@code Origin: https://<api host>}, so they look cross-origin. A scoped CORS entry for exactly the
- * four review POSTs must admit the public base URL and nothing else. MockMvc is built from the shared
- * (cached) context so no extra Spring context is created.
+ * Behind Railway's TLS proxy the app sees plain http while a server-rendered page's relative-path form post carries
+ * {@code Origin: https://<api host>}, so it looks cross-origin. Only the moderation-action confirm page still posts
+ * like that and keeps a scoped CORS entry for the public base URL. B545 retired the admin review pages and removed
+ * their scoped entry: the four retired review POSTs (410 «use the portal» page) fall under the default {@code /**}
+ * policy (website origin only). MockMvc is built from the shared (cached) context so no extra Spring context is created.
  */
-@DisplayName("Admin review-page POSTs pass CORS for the public base URL only")
+@DisplayName("Server-rendered page POSTs: CORS scoped to the public base URL only where a page still posts")
 class ReviewPageCorsIT extends AbstractIntegrationTest {
 
     private static final String PUBLIC_BASE = "https://api.beautica.test";
     private static final String FRONTEND_BASE = "http://localhost:3000";
     private static final String TOKEN = "A".repeat(43);
+    private static final String MODERATION_CONFIRM = "/api/v1/moderation/actions/confirm";
 
     @Autowired private WebApplicationContext wac;
 
@@ -46,8 +48,6 @@ class ReviewPageCorsIT extends AbstractIntegrationTest {
         return post(path).contentType(MediaType.APPLICATION_FORM_URLENCODED).param("token", TOKEN);
     }
 
-    private static final String APPROVE_CAT = "/api/v1/service-categories/requests/approve";
-
     private MvcResult postWithOrigin(String path, String origin) throws Exception {
         return mockMvc.perform(form(path).header("Origin", origin)).andReturn();
     }
@@ -58,12 +58,12 @@ class ReviewPageCorsIT extends AbstractIntegrationTest {
             "/api/v1/service-categories/requests/reject",
             "/api/v1/service-types/suggestions/approve",
             "/api/v1/service-types/suggestions/reject"})
-    @DisplayName("public base URL origin is admitted and echoed back")
-    void should_allowOrigin_when_originIsPublicBaseUrl(String path) throws Exception {
+    @DisplayName("B545: the retired review POSTs lost their scoped entry — the public base URL origin is rejected")
+    void should_return403_when_retiredReviewPostHasPublicBaseUrlOrigin(String path) throws Exception {
         MockHttpServletResponse response = postWithOrigin(path, PUBLIC_BASE).getResponse();
 
-        assertThat(response.getStatus()).as("unknown token renders the neutral 200 result page").isEqualTo(200);
-        assertThat(response.getHeader("Access-Control-Allow-Origin")).isEqualTo(PUBLIC_BASE);
+        assertThat(response.getStatus()).isEqualTo(403);
+        assertThat(response.getHeader("Access-Control-Allow-Origin")).isNull();
     }
 
     @ParameterizedTest
@@ -72,11 +72,11 @@ class ReviewPageCorsIT extends AbstractIntegrationTest {
             "/api/v1/service-categories/requests/reject",
             "/api/v1/service-types/suggestions/approve",
             "/api/v1/service-types/suggestions/reject"})
-    @DisplayName("frontend origin is admitted and echoed back")
+    @DisplayName("frontend origin is admitted by the default policy and gets the 410 portal page")
     void should_allowOrigin_when_originIsFrontendBaseUrl(String path) throws Exception {
         MockHttpServletResponse response = postWithOrigin(path, FRONTEND_BASE).getResponse();
 
-        assertThat(response.getStatus()).as("unknown token renders the neutral 200 result page").isEqualTo(200);
+        assertThat(response.getStatus()).as("retired link renders the 410 portal page (B545)").isEqualTo(410);
         assertThat(response.getHeader("Access-Control-Allow-Origin")).isEqualTo(FRONTEND_BASE);
     }
 
@@ -100,7 +100,7 @@ class ReviewPageCorsIT extends AbstractIntegrationTest {
             "/api/v1/service-categories/requests/reject",
             "/api/v1/service-types/suggestions/approve",
             "/api/v1/service-types/suggestions/reject"})
-    @DisplayName("Origin: null (what a no-referrer page's form POST sends) is rejected - why the pages use same-origin")
+    @DisplayName("Origin: null (what a no-referrer page's form POST sends) is rejected")
     void should_return403_when_originIsNull(String path) throws Exception {
         MockHttpServletResponse response = postWithOrigin(path, "null").getResponse();
 
@@ -109,17 +109,9 @@ class ReviewPageCorsIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("public host over the wrong scheme (http) is rejected")
-    void should_return403_when_originHasWrongScheme() throws Exception {
-        MockHttpServletResponse response = postWithOrigin(APPROVE_CAT, "http://api.beautica.test").getResponse();
-
-        assertThat(response.getStatus()).isEqualTo(403);
-    }
-
-    @Test
     @DisplayName("phase 414: the moderation-action confirm POST admits the public origin only; null / foreign rejected")
     void should_scopeCors_when_moderationActionConfirm() throws Exception {
-        String confirm = "/api/v1/moderation/actions/confirm";
+        String confirm = MODERATION_CONFIRM;
 
         MockHttpServletResponse publicOrigin = postWithOrigin(confirm, PUBLIC_BASE).getResponse();
         MockHttpServletResponse nullOrigin = postWithOrigin(confirm, "null").getResponse();
@@ -134,28 +126,8 @@ class ReviewPageCorsIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("audit-fix: the moderation-action confirm POST has its own CORS entry — the website origin is rejected")
     void should_rejectFrontendOrigin_when_moderationActionConfirm() throws Exception {
-        MockHttpServletResponse response = postWithOrigin("/api/v1/moderation/actions/confirm", FRONTEND_BASE)
+        MockHttpServletResponse response = postWithOrigin(MODERATION_CONFIRM, FRONTEND_BASE)
                 .getResponse();
-
-        assertThat(response.getStatus()).isEqualTo(403);
-        assertThat(response.getHeader("Access-Control-Allow-Origin")).isNull();
-    }
-
-    @Test
-    @DisplayName("trailing-slash path does not inherit the scoped entry: public origin is not served 2xx")
-    void should_notSucceed_when_pathHasTrailingSlash() throws Exception {
-        MockHttpServletResponse response = postWithOrigin(APPROVE_CAT + "/", PUBLIC_BASE).getResponse();
-
-        assertThat(response.getStatus() / 100).isNotEqualTo(2);
-        assertThat(response.getHeader("Access-Control-Allow-Origin")).isNull();
-    }
-
-    @Test
-    @DisplayName("PUT preflight on a review POST path is rejected (only POST is allowed)")
-    void should_rejectPreflight_when_requestedMethodIsPut() throws Exception {
-        MockHttpServletResponse response = mockMvc.perform(options(APPROVE_CAT)
-                        .header("Origin", PUBLIC_BASE).header("Access-Control-Request-Method", "PUT"))
-                .andReturn().getResponse();
 
         assertThat(response.getStatus()).isEqualTo(403);
         assertThat(response.getHeader("Access-Control-Allow-Origin")).isNull();
@@ -171,7 +143,26 @@ class ReviewPageCorsIT extends AbstractIntegrationTest {
     void should_notReturn403_when_noOrigin(String path) throws Exception {
         int status = mockMvc.perform(form(path)).andReturn().getResponse().getStatus();
 
-        assertThat(status).as("unknown token renders the neutral 200 result page").isEqualTo(200);
+        assertThat(status).as("retired link renders the 410 portal page (B545)").isEqualTo(410);
+    }
+
+    @Test
+    @DisplayName("public host over the wrong scheme (http) is rejected on the moderation confirm POST")
+    void should_return403_when_originHasWrongScheme() throws Exception {
+        MockHttpServletResponse response = postWithOrigin(MODERATION_CONFIRM, "http://api.beautica.test").getResponse();
+
+        assertThat(response.getStatus()).isEqualTo(403);
+    }
+
+    @Test
+    @DisplayName("PUT preflight on the moderation confirm POST is rejected (only POST is allowed)")
+    void should_rejectPreflight_when_requestedMethodIsPut() throws Exception {
+        MockHttpServletResponse response = mockMvc.perform(options(MODERATION_CONFIRM)
+                        .header("Origin", PUBLIC_BASE).header("Access-Control-Request-Method", "PUT"))
+                .andReturn().getResponse();
+
+        assertThat(response.getStatus()).isEqualTo(403);
+        assertThat(response.getHeader("Access-Control-Allow-Origin")).isNull();
     }
 
     @Test

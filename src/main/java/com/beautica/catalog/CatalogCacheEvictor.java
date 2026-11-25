@@ -88,8 +88,10 @@ public class CatalogCacheEvictor {
     /**
      * B505 — empties only {@link #PLATFORM_CATALOG_CACHES}, leaving the hot per-master {@link #LABEL_HOLDING_CACHES}
      * warm. For a delete of an UNUSED category / type: no service definition references the row, so no
-     * {@code masterServices} / {@code booking-slug-info} entry can hold its label. Same after-commit ordering as
-     * {@link #evictAll}.
+     * {@code masterServices} / {@code booking-slug-info} entry can hold its label. Since B545 also the portal approve
+     * of a category request / type suggestion: approve only adds a category or a type (no label of an existing row
+     * changes, no {@code ServiceDefinition} is created), so no per-master entry can be stale. Same after-commit
+     * ordering as {@link #evictAll}.
      */
     public void evictPlatformCatalog() {
         evictAfterCommit(PLATFORM_CATALOG_CACHES);

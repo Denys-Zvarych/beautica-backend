@@ -1,7 +1,6 @@
 package com.beautica.service;
 
 import com.beautica.AbstractIntegrationTest;
-import com.beautica.auth.TokenGenerator;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
@@ -11,7 +10,6 @@ import com.beautica.service.service.ServiceTypeSuggestionService.DecisionOutcome
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
 
@@ -19,6 +17,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
@@ -38,8 +37,8 @@ import static org.mockito.Mockito.verify;
  * type. This IT pins the dropdown contract end-to-end against PostgreSQL.
  *
  * <p>HAIRDRESSING is seeded APPROVED+active (V74) and maps to the Hair System-A bucket
- * (V78). {@link com.beautica.notification.EmailService} is a {@code @MockBean} (inherited) —
- * the raw token is captured to drive the approve step.
+ * (V78). {@link com.beautica.notification.EmailService} is a {@code @MockBean} (inherited); the suggestion is
+ * approved by id (the portal decision, the only one since B545).
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("Service-type promotion — catalog-only (Option A) integration")
@@ -48,7 +47,6 @@ class ServiceTypePromotionIntegrationTest extends AbstractIntegrationTest {
     private static final String CATEGORY = "HAIRDRESSING";
     private static final String SUGGESTED = "ITPromote Hot Oil Treatment";
     private static final String DESCRIPTION = "Promotion IT suggestion";
-    private static final String TOKEN_QUERY_PARAM = "token=";
 
     // ── novel-category (null System-A bucket) regression fixtures ──────────────────
     // A brand-new self-service category created via the category-request workflow that
@@ -62,7 +60,6 @@ class ServiceTypePromotionIntegrationTest extends AbstractIntegrationTest {
 
     @Autowired private ServiceCatalogService serviceCatalogService;
     @Autowired private ServiceTypeSuggestionService suggestionService;
-    @Autowired private TokenGenerator tokenGenerator;
     // jdbcTemplate + emailService inherited (protected) from AbstractIntegrationTest.
 
     @AfterEach
@@ -103,15 +100,13 @@ class ServiceTypePromotionIntegrationTest extends AbstractIntegrationTest {
                 .isNull();
     }
 
-    private String submitAndCaptureRawToken(String categoryName, String suggestedName, UUID requesterUserId) {
+    private UUID submitAndFindId(String categoryName, String suggestedName, UUID requesterUserId) {
         serviceCatalogService.suggestServiceType(
                 new SuggestServiceTypeRequest(suggestedName, categoryName, DESCRIPTION), requesterUserId);
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
         verify(emailService).sendServiceTypeSuggestionNotification(
-                anyString(), anyString(), eq(categoryName), eq(suggestedName), eq(DESCRIPTION),
-                urlCaptor.capture());
-        String url = urlCaptor.getValue();
-        return url.substring(url.indexOf(TOKEN_QUERY_PARAM) + TOKEN_QUERY_PARAM.length());
+                anyString(), anyString(), eq(categoryName), eq(suggestedName), eq(DESCRIPTION), anyString());
+        return jdbcTemplate.queryForObject("SELECT id FROM service_type_suggestion WHERE category_name = ? "
+                + "AND suggested_name = ? AND status = 'PENDING'", UUID.class, categoryName, suggestedName);
     }
 
     private UUID seedIndependentMaster() {
@@ -139,10 +134,10 @@ class ServiceTypePromotionIntegrationTest extends AbstractIntegrationTest {
     void should_createOnlyCatalogTypeVisibleInDropdown_when_masterSuggestionApproved() {
         UUID userId = seedIndependentMaster();
         UUID masterId = masterIdFor(userId);
-        String rawToken = submitAndCaptureRawToken(CATEGORY, SUGGESTED, userId);
+        UUID suggestionId = submitAndFindId(CATEGORY, SUGGESTED, userId);
 
         // Act — approve runs promote() in the same @Transactional boundary.
-        DecisionOutcome outcome = suggestionService.approve(rawToken);
+        DecisionOutcome outcome = suggestionService.approveById(suggestionId);
         assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
 
         // ── Assert 1: the dropdown contract — GET /service-types?categoryName= now lists it. ──
@@ -182,7 +177,8 @@ class ServiceTypePromotionIntegrationTest extends AbstractIntegrationTest {
         long typesBefore = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM service_types WHERE name_uk = ?", Long.class, SUGGESTED);
 
-        assertThat(suggestionService.approve(rawToken)).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
+        assertThatThrownBy(() -> suggestionService.approveById(suggestionId))
+                .isInstanceOf(com.beautica.common.exception.CatalogRequestConflictException.class);
 
         long typesAfter = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM service_types WHERE name_uk = ?", Long.class, SUGGESTED);
@@ -209,10 +205,10 @@ class ServiceTypePromotionIntegrationTest extends AbstractIntegrationTest {
         seedNovelUnmappedCategory();
         UUID userId = seedIndependentMaster();
         UUID masterId = masterIdFor(userId);
-        String rawToken = submitAndCaptureRawToken(NOVEL_CATEGORY, NOVEL_SUGGESTED, userId);
+        UUID suggestionId = submitAndFindId(NOVEL_CATEGORY, NOVEL_SUGGESTED, userId);
 
         // Act — approve must NOT 500 despite the null bucket (the original break point).
-        DecisionOutcome outcome = suggestionService.approve(rawToken);
+        DecisionOutcome outcome = suggestionService.approveById(suggestionId);
         assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
 
         // ── positive: the suggested name surfaces in the dropdown for the novel category. ──

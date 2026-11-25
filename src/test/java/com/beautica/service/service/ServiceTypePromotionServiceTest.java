@@ -81,7 +81,7 @@ class ServiceTypePromotionServiceTest {
     // ── fixtures ───────────────────────────────────────────────────────────────
 
     private ServiceTypeSuggestion approvedSuggestion(UUID requesterId) {
-        return ServiceTypeSuggestion.ofPending(CATEGORY, SUGGESTED, "desc", requesterId, "hash", null);
+        return ServiceTypeSuggestion.ofPending(CATEGORY, SUGGESTED, "desc", requesterId);
     }
 
     private CatalogCategory bucket(UUID id, String uk, String en) {

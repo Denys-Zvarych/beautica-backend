@@ -1,11 +1,9 @@
 package com.beautica.service.service;
 
 import static org.mockito.Mockito.verifyNoMoreInteractions;
-import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
@@ -28,6 +26,8 @@ import org.hibernate.exception.ConstraintViolationException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.sql.SQLException;
 import java.time.Clock;
@@ -55,14 +55,12 @@ import static org.mockito.Mockito.when;
 class CategoryRequestServiceTest {
 
     private static final Instant NOW = Instant.parse("2026-06-01T10:00:00Z");
-    private static final String RAW_TOKEN = "raw-token-value";
-    private static final String TOKEN_HASH = "deadbeefcafebabe";
+    private static final Long ID = 41L;
+    private static final String PORTAL_URL = "https://beautica.app/admin/requests";
     private static final String ADMIN_EMAIL = "admin@beautica.test";
 
     @Mock private PlatformCategoryRepository platformCategoryRepository;
-    @Mock private TokenGenerator tokenGenerator;
     @Mock private EmailService emailService;
-    @Mock private PublicBaseUrlProperties publicBaseUrlProperties;
     @Mock private ServiceTypeSuggestionService serviceTypeSuggestionService;
     @Mock private InAppNotificationService inAppNotificationService;
     @Mock private NotificationOutboxService notificationOutboxService;
@@ -73,30 +71,26 @@ class CategoryRequestServiceTest {
     void setUp() {
         Clock fixedClock = Clock.fixed(NOW, ZoneOffset.UTC);
         service = new CategoryRequestService(
-                platformCategoryRepository, tokenGenerator, emailService,
-                publicBaseUrlProperties, serviceTypeSuggestionService, fixedClock, inAppNotificationService,
-                notificationOutboxService);
+                platformCategoryRepository, emailService, new AdminRequestsPortalLink("https://beautica.app"),
+                serviceTypeSuggestionService, fixedClock, inAppNotificationService, notificationOutboxService);
         ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
     }
 
     private PlatformCategory pendingCategory(OffsetDateTime expiresAt) {
         return PlatformCategory.ofPendingRequest(
-                "NAIL_ART", "Нейл-арт", UUID.randomUUID(), TOKEN_HASH,
-                OffsetDateTime.now(Clock.fixed(NOW, ZoneOffset.UTC)), expiresAt, null);
+                "NAIL_ART", "Нейл-арт", UUID.randomUUID(),
+                OffsetDateTime.now(Clock.fixed(NOW, ZoneOffset.UTC)), null);
     }
 
     private PlatformCategory pendingCategory(OffsetDateTime expiresAt, UUID requester, String initialServiceName) {
         return PlatformCategory.ofPendingRequest(
-                "NAIL_ART", "Нейл-арт", requester, TOKEN_HASH,
-                OffsetDateTime.now(Clock.fixed(NOW, ZoneOffset.UTC)), expiresAt, initialServiceName);
+                "NAIL_ART", "Нейл-арт", requester,
+                OffsetDateTime.now(Clock.fixed(NOW, ZoneOffset.UTC)), initialServiceName);
     }
 
     private void stubSubmitHappyPath() {
         when(platformCategoryRepository.existsByNameIgnoreCaseAndStatusIn(eq("NAIL_ART"), any()))
                 .thenReturn(false);
-        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(publicBaseUrlProperties.getPublicBaseUrl()).thenReturn("https://x");
         when(platformCategoryRepository.save(any(PlatformCategory.class)))
                 .thenAnswer(inv -> inv.getArgument(0));
     }
@@ -104,14 +98,11 @@ class CategoryRequestServiceTest {
     // ── submitRequest ─────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_persistPendingAndEmailAdmin_when_nameIsNew")
+    @DisplayName("a new category name is saved as PENDING and the admin is e-mailed")
     void should_persistPendingAndEmailAdmin_when_nameIsNew() {
         UUID requester = UUID.randomUUID();
         when(platformCategoryRepository.existsByNameIgnoreCaseAndStatusIn(eq("NAIL_ART"), any()))
                 .thenReturn(false);
-        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(publicBaseUrlProperties.getPublicBaseUrl()).thenReturn("https://api.beautica.app");
         when(platformCategoryRepository.save(any(PlatformCategory.class)))
                 .thenAnswer(inv -> inv.getArgument(0));
 
@@ -124,11 +115,46 @@ class CategoryRequestServiceTest {
 
         assertThat(saved.getStatus()).isEqualTo(PlatformCategoryStatus.PENDING);
         assertThat(saved.isActive()).isFalse();
-        assertThat(saved.getTokenHash()).isEqualTo(TOKEN_HASH);
         assertThat(response.status()).isEqualTo("PENDING");
         verify(emailService).sendCategoryRequestNotification(
                 eq(ADMIN_EMAIL), eq(requester.toString()), eq("NAIL_ART"), eq("Нейл-арт"),
-                eq("https://api.beautica.app/api/v1/service-categories/requests/review/" + RAW_TOKEN));
+                eq(PORTAL_URL));
+    }
+
+    @Test
+    @DisplayName("B545 — inside a transaction the operator email waits for commit; a rollback sends none")
+    void should_sendNoEmail_when_transactionRollsBackAfterInsert() {
+        stubSubmitHappyPath();
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            service.submitRequest(new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", null), UUID.randomUUID());
+            verifyNoInteractions(emailService);
+
+            TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(sync -> sync.afterCompletion(TransactionSynchronization.STATUS_ROLLED_BACK));
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("B545 — inside a transaction the operator email is sent once the transaction commits")
+    void should_sendEmailAfterCommit_when_transactionCommits() {
+        stubSubmitHappyPath();
+        UUID requester = UUID.randomUUID();
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            service.submitRequest(new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", null), requester);
+
+            TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+
+        verify(emailService).sendCategoryRequestNotification(
+                ADMIN_EMAIL, requester.toString(), "NAIL_ART", "Нейл-арт", PORTAL_URL);
     }
 
     @Test
@@ -136,9 +162,6 @@ class CategoryRequestServiceTest {
     void should_normalizeNameToUpperCase_when_submitted() {
         when(platformCategoryRepository.existsByNameIgnoreCaseAndStatusIn(eq("NAIL_ART"), any()))
                 .thenReturn(false);
-        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(publicBaseUrlProperties.getPublicBaseUrl()).thenReturn("https://x");
         when(platformCategoryRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
         service.submitRequest(new CreateCategoryRequestRequest("nail_art", "Нейл-арт", null), UUID.randomUUID());
@@ -167,8 +190,6 @@ class CategoryRequestServiceTest {
         CreateCategoryRequestRequest request = new CreateCategoryRequestRequest("nail_art", "Нейл-арт", null);
         when(platformCategoryRepository.existsByNameIgnoreCaseAndStatusIn(eq("NAIL_ART"), any()))
                 .thenReturn(true, false);
-        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
         when(platformCategoryRepository.save(any()))
                 .thenThrow(integrityViolation(CategoryRequestService.NAME_UNIQUE_CONSTRAINT));
         BusinessException fromCheck = catchBusiness(request);
@@ -187,8 +208,6 @@ class CategoryRequestServiceTest {
     void should_rethrowUnchanged_when_insertViolatesAnotherConstraint() {
         when(platformCategoryRepository.existsByNameIgnoreCaseAndStatusIn(eq("NAIL_ART"), any()))
                 .thenReturn(false);
-        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
         DataIntegrityViolationException other = integrityViolation("fk_platform_categories_requested_by");
         when(platformCategoryRepository.save(any())).thenThrow(other);
 
@@ -240,9 +259,6 @@ class CategoryRequestServiceTest {
         // so the derived query returns false and resubmission proceeds to save.
         when(platformCategoryRepository.existsByNameIgnoreCaseAndStatusIn(eq("NAIL_ART"), any()))
                 .thenReturn(false);
-        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(publicBaseUrlProperties.getPublicBaseUrl()).thenReturn("https://x");
         when(platformCategoryRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
         var response = service.submitRequest(
@@ -300,21 +316,19 @@ class CategoryRequestServiceTest {
                 .isNull();
     }
 
-    // ── approve / reject ──────────────────────────────────────────────────────
+    // ── approveById / rejectById (B545: the only decision path) ─────────────────
 
     @Test
-    @DisplayName("should_approveAndClearToken_when_pendingAndTokenValid")
-    void should_approveAndClearToken_when_pendingAndTokenValid() {
+    @DisplayName("should_approve_when_pending")
+    void should_approve_when_pending() {
         PlatformCategory pending = pendingCategory(OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(pending));
 
-        DecisionOutcome outcome = service.approve(RAW_TOKEN);
+        DecisionOutcome outcome = service.approveById(ID);
 
         assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
         assertThat(pending.getStatus()).isEqualTo(PlatformCategoryStatus.APPROVED);
         assertThat(pending.isActive()).isTrue();
-        assertThat(pending.getTokenHash()).isNull();
         assertThat(pending.getDecidedAt()).isNotNull();
     }
 
@@ -326,10 +340,9 @@ class CategoryRequestServiceTest {
         UUID requester = UUID.randomUUID();
         PlatformCategory pending = pendingCategory(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC), requester, "Класичний манікюр");
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(pending));
 
-        DecisionOutcome outcome = service.approve(RAW_TOKEN);
+        DecisionOutcome outcome = service.approveById(ID);
 
         assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
         // suggestion submitted for the approved slug (category.getName()), requester carried, description null
@@ -342,10 +355,9 @@ class CategoryRequestServiceTest {
     void should_notCreateSuggestion_when_approvedCategoryHasNoInitialServiceName() {
         PlatformCategory pending = pendingCategory(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC), UUID.randomUUID(), null);
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(pending));
 
-        DecisionOutcome outcome = service.approve(RAW_TOKEN);
+        DecisionOutcome outcome = service.approveById(ID);
 
         assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
         verifyNoInteractions(serviceTypeSuggestionService);
@@ -359,13 +371,12 @@ class CategoryRequestServiceTest {
         UUID requester = UUID.randomUUID();
         PlatformCategory pending = pendingCategory(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC), requester, "Дубль");
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(pending));
         doThrow(new BusinessException(HttpStatus.CONFLICT, "A matching suggestion is already pending review"))
                 .when(serviceTypeSuggestionService)
                 .submitSuggestionInternal(eq("NAIL_ART"), eq("Дубль"), isNull(), eq(requester));
 
-        DecisionOutcome outcome = service.approve(RAW_TOKEN);
+        DecisionOutcome outcome = service.approveById(ID);
 
         assertThat(outcome)
                 .as("a swallowed 409 must not propagate; approval outcome stands")
@@ -384,109 +395,27 @@ class CategoryRequestServiceTest {
         UUID requester = UUID.randomUUID();
         PlatformCategory pending = pendingCategory(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC), requester, "Помилка");
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(pending));
         doThrow(new BusinessException(HttpStatus.BAD_REQUEST, "boom"))
                 .when(serviceTypeSuggestionService)
                 .submitSuggestionInternal(eq("NAIL_ART"), eq("Помилка"), isNull(), eq(requester));
 
-        assertThatThrownBy(() -> service.approve(RAW_TOKEN))
+        assertThatThrownBy(() -> service.approveById(ID))
                 .isInstanceOf(BusinessException.class)
                 .extracting("status").hasToString("400 BAD_REQUEST");
     }
 
     @Test
-    @DisplayName("should_rejectAndClearToken_when_pendingAndTokenValid")
-    void should_rejectAndClearToken_when_pendingAndTokenValid() {
+    @DisplayName("should_reject_when_pending")
+    void should_reject_when_pending() {
         PlatformCategory pending = pendingCategory(OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(pending));
 
-        DecisionOutcome outcome = service.reject(RAW_TOKEN);
+        DecisionOutcome outcome = service.rejectById(ID, null);
 
         assertThat(outcome).isEqualTo(DecisionOutcome.REJECTED);
         assertThat(pending.getStatus()).isEqualTo(PlatformCategoryStatus.REJECTED);
         assertThat(pending.isActive()).isFalse();
-        assertThat(pending.getTokenHash()).isNull();
-    }
-
-    @Test
-    @DisplayName("should_returnInvalidOrExpired_when_tokenExpired")
-    void should_returnInvalidOrExpired_when_tokenExpired() {
-        PlatformCategory expired = pendingCategory(OffsetDateTime.ofInstant(NOW.minusSeconds(1), ZoneOffset.UTC));
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(expired));
-
-        DecisionOutcome outcome = service.approve(RAW_TOKEN);
-
-        assertThat(outcome).isEqualTo(DecisionOutcome.INVALID_OR_EXPIRED);
-        assertThat(expired.getStatus()).isEqualTo(PlatformCategoryStatus.PENDING);
-    }
-
-    @Test
-    @DisplayName("should_returnAlreadyDecided_when_tokenUnknown")
-    void should_returnAlreadyDecided_when_tokenUnknown() {
-        when(tokenGenerator.hash(anyString())).thenReturn("nomatch");
-        when(platformCategoryRepository.findByTokenHashForUpdate("nomatch")).thenReturn(Optional.empty());
-
-        DecisionOutcome outcome = service.approve("some-wrong-token");
-
-        assertThat(outcome).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
-    }
-
-    @Test
-    @DisplayName("should_returnAlreadyDecided_when_secondDecisionAfterApproval")
-    void should_returnAlreadyDecided_when_secondDecisionAfterApproval() {
-        PlatformCategory pending = pendingCategory(OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
-
-        service.approve(RAW_TOKEN);
-        // Token is now cleared on the entity; the second lookup by the stale hash
-        // still resolves the row (test stub), but status is no longer PENDING.
-        DecisionOutcome second = service.approve(RAW_TOKEN);
-
-        assertThat(second).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
-    }
-
-    @Test
-    @DisplayName("should_returnAlreadyDecided_when_storedHashMismatchesAfterConstantTimeCheck")
-    void should_returnAlreadyDecided_when_storedHashMismatches() {
-        PlatformCategory pending = pendingCategory(OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
-        // Lookup returns a row whose stored hash differs from the recomputed hash:
-        // the constant-time filter must drop it.
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn("different-hash");
-        when(platformCategoryRepository.findByTokenHashForUpdate("different-hash")).thenReturn(Optional.of(pending));
-
-        DecisionOutcome outcome = service.approve(RAW_TOKEN);
-
-        assertThat(outcome).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
-        assertThat(pending.getStatus()).isEqualTo(PlatformCategoryStatus.PENDING);
-    }
-
-    // ── loadForReview ─────────────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("should_returnValidView_when_pendingTokenLoadedForReview")
-    void should_returnValidView_when_pendingTokenLoadedForReview() {
-        PlatformCategory pending = pendingCategory(OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
-
-        var view = service.loadForReview(RAW_TOKEN);
-
-        assertThat(view.valid()).isTrue();
-        assertThat(view.categoryName()).isEqualTo("NAIL_ART");
-        assertThat(view.displayName()).isEqualTo("Нейл-арт");
-    }
-
-    @Test
-    @DisplayName("should_returnInvalidView_when_reviewTokenBlank")
-    void should_returnInvalidView_when_reviewTokenBlank() {
-        var view = service.loadForReview("  ");
-
-        assertThat(view.valid()).isFalse();
-        verifyNoInteractions(platformCategoryRepository);
     }
 
     // ── listApproved ──────────────────────────────────────────────────────────
@@ -512,10 +441,9 @@ class CategoryRequestServiceTest {
     @DisplayName("approve on a PENDING request notifies the requester exactly once (approved)")
     void should_notifyOnceApproved_when_pendingApproved() {
         PlatformCategory pending = pendingCategory(OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(pending));
 
-        service.approve(RAW_TOKEN);
+        service.approveById(ID);
 
         verify(inAppNotificationService).notifyCategoryRequestDecided(pending, true);
         verifyNoMoreInteractions(inAppNotificationService);
@@ -525,10 +453,9 @@ class CategoryRequestServiceTest {
     @DisplayName("reject with a reason on a PENDING request stores the reason and notifies exactly once (rejected)")
     void should_notifyOnceRejectedAndStoreReason_when_pendingRejectedWithReason() {
         PlatformCategory pending = pendingCategory(OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(pending));
 
-        service.reject(RAW_TOKEN, "дублікат");
+        service.rejectById(ID, "дублікат");
 
         assertThat(pending.getDecisionReason()).isEqualTo("дублікат");
         verify(inAppNotificationService).notifyCategoryRequestDecided(pending, false);
@@ -536,36 +463,12 @@ class CategoryRequestServiceTest {
     }
 
     @Test
-    @DisplayName("ALREADY_DECIDED, expired and unknown tokens never notify")
-    void should_notNotify_when_alreadyDecidedExpiredOrUnknownToken() {
-        PlatformCategory decided = pendingCategory(OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
-        decided.approve(OffsetDateTime.ofInstant(NOW, ZoneOffset.UTC));
-        PlatformCategory expired = pendingCategory(OffsetDateTime.ofInstant(NOW.minusSeconds(1), ZoneOffset.UTC));
-        when(tokenGenerator.hash("decided")).thenReturn("h-decided");
-        when(tokenGenerator.hash("expired")).thenReturn("h-expired");
-        when(tokenGenerator.hash("unknown")).thenReturn("h-unknown");
-        // Stored hash must equal the recomputed hash for the constant-time re-check to pass.
-        ReflectionTestUtils.setField(decided, "tokenHash", "h-decided");
-        ReflectionTestUtils.setField(expired, "tokenHash", "h-expired");
-        when(platformCategoryRepository.findByTokenHashForUpdate("h-decided")).thenReturn(Optional.of(decided));
-        when(platformCategoryRepository.findByTokenHashForUpdate("h-expired")).thenReturn(Optional.of(expired));
-        when(platformCategoryRepository.findByTokenHashForUpdate("h-unknown")).thenReturn(Optional.empty());
-
-        assertThat(service.approve("decided")).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
-        assertThat(service.reject("expired", "r")).isEqualTo(DecisionOutcome.INVALID_OR_EXPIRED);
-        assertThat(service.reject("unknown", "r")).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
-
-        verifyNoInteractions(inAppNotificationService);
-    }
-
-    @Test
-    @DisplayName("the token-only reject overload stores no reason")
-    void should_storeNoReason_when_rejectedViaTokenOnlyOverload() {
+    @DisplayName("reject without a reason stores no reason")
+    void should_storeNoReason_when_rejectedWithoutReason() {
         PlatformCategory pending = pendingCategory(OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(pending));
 
-        service.reject(RAW_TOKEN);
+        service.rejectById(ID, null);
 
         assertThat(pending.getDecisionReason()).isNull();
         verify(inAppNotificationService).notifyCategoryRequestDecided(pending, false);
@@ -577,8 +480,7 @@ class CategoryRequestServiceTest {
         PlatformCategory pending = pendingCategory(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC), requester, null);
         ReflectionTestUtils.setField(pending, "id", id);
-        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(pending));
         return pending;
     }
 
@@ -588,7 +490,7 @@ class CategoryRequestServiceTest {
         UUID requester = UUID.randomUUID();
         pendingWithId(requester, 42L);
 
-        service.approve(RAW_TOKEN);
+        service.approveById(ID);
 
         verify(notificationOutboxService).enqueueRequestDecided(RequestKind.CATEGORY_REQUEST, "42", true, requester);
         verifyNoMoreInteractions(notificationOutboxService);
@@ -600,7 +502,7 @@ class CategoryRequestServiceTest {
         UUID requester = UUID.randomUUID();
         pendingWithId(requester, 43L);
 
-        service.reject(RAW_TOKEN, "дублікат");
+        service.rejectById(ID, "дублікат");
 
         verify(notificationOutboxService).enqueueRequestDecided(RequestKind.CATEGORY_REQUEST, "43", false, requester);
         verifyNoMoreInteractions(notificationOutboxService);
@@ -611,21 +513,9 @@ class CategoryRequestServiceTest {
     void should_passNullRecipient_when_requesterIsNull() {
         pendingWithId(null, 44L);
 
-        service.reject(RAW_TOKEN, "r");
+        service.rejectById(ID, "r");
 
         verify(notificationOutboxService).enqueueRequestDecided(RequestKind.CATEGORY_REQUEST, "44", false, null);
-    }
-
-    @Test
-    @DisplayName("ALREADY_DECIDED / expired tokens never enqueue a decision e-mail")
-    void should_notEnqueueDecisionEmail_when_alreadyDecided() {
-        PlatformCategory decided = pendingWithId(UUID.randomUUID(), 45L);
-        decided.approve(OffsetDateTime.ofInstant(NOW, ZoneOffset.UTC));
-        ReflectionTestUtils.setField(decided, "tokenHash", TOKEN_HASH);
-
-        assertThat(service.approve(RAW_TOKEN)).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
-
-        verifyNoInteractions(notificationOutboxService);
     }
 
     // ── editPendingName (B502) ─────────────────────────────────────────────────
@@ -648,7 +538,6 @@ class CategoryRequestServiceTest {
         assertThat(category.getDisplayName()).isEqualTo("Нейл арт");
         assertThat(category.getName()).as("wire name immutable (D4)").isEqualTo("NAIL_ART");
         assertThat(category.getInitialServiceName()).isEqualTo("Френч");
-        assertThat(category.getTokenHash()).as("email link stays valid (D2)").isEqualTo(TOKEN_HASH);
         verify(platformCategoryRepository).saveAndFlush(category);
         verifyNoInteractions(emailService, inAppNotificationService, notificationOutboxService);
     }

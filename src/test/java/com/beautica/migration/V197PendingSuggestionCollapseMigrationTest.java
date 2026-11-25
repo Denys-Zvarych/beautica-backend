@@ -159,14 +159,14 @@ class V197PendingSuggestionCollapseMigrationTest {
     }
 
     @Test
-    @DisplayName("an auto-rejected duplicate's old token no longer resolves to any row (decide → ALREADY_DECIDED)")
+    @DisplayName("an auto-rejected duplicate's old token hash is cleared — no row carries it any more")
     void should_resolveNoRow_when_autoRejectedDuplicateTokenLookedUp() {
         Integer matches = jdbc.queryForObject(
                 "SELECT count(*) FROM service_type_suggestion WHERE token_hash IN ('hash-a-newer','hash-a-newest','hash-b-high')",
                 Integer.class);
 
         assertThat(matches)
-                .as("findByTokenHashForUpdate finds nothing → ServiceTypeSuggestionService.decide returns ALREADY_DECIDED")
+                .as("V197 nulls the token on every auto-rejected duplicate, so none of their old hashes is stored")
                 .isZero();
     }
 

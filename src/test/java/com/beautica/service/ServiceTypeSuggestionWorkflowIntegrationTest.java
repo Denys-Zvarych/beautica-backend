@@ -1,8 +1,8 @@
 package com.beautica.service;
 
 import com.beautica.AbstractIntegrationTest;
-import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.entity.ServiceTypeSuggestion;
@@ -14,7 +14,6 @@ import com.beautica.service.service.ServiceTypeSuggestionService.DecisionOutcome
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
 
@@ -28,20 +27,17 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 
 /**
- * Cross-layer round trip for the Phase 16.8 service-type suggestion + email-approval
- * workflow against a real PostgreSQL (Testcontainers, {@code @ActiveProfiles("test")}).
+ * Cross-layer round trip for the Phase 16.8 service-type suggestion workflow (decided in the portal since B545)
+ * against a real PostgreSQL (Testcontainers, {@code @ActiveProfiles("test")}).
  * Mirrors {@code CategoryRequestWorkflowIntegrationTest}.
  *
  * <p>Proves the contract that unit mocks cannot:
  * <ol>
- *   <li>The V76 migration created {@code service_type_suggestion} with its CHECK
- *       constraints (the token-pending cross-field CHECK is exercised implicitly by
- *       the persist + clear-on-decision path) and indexes.</li>
+ *   <li>The V76 migration created {@code service_type_suggestion} with its indexes (the token columns and index stay
+ *       until phase 555; V266 only dropped the token CHECK, B545).</li>
  *   <li>{@code suggestServiceType} (delegating to {@code submitSuggestion}) persists a
- *       PENDING row whose stored {@code token_hash} is the HASH, never the raw token
- *       captured from the notification.</li>
- *   <li>{@code loadForReview} does NOT mutate the row (defeats email-scanner pre-fetch).</li>
- *   <li>{@code approve} flips it to APPROVED, stamps {@code decided_at}, clears the token,
+ *       PENDING row and emails the operator the portal link (no token).</li>
+ *   <li>{@code approveById} flips it to APPROVED, stamps {@code decided_at},
  *       and — for a category with a mapped System-A bucket — writes a {@code service_types}
  *       row (Phase 16.9, Option A catalog-only; supersedes the 16.8 "no auto-promotion"
  *       decision). Under Option A approval creates ONLY the catalog ServiceType and NEVER a
@@ -51,8 +47,7 @@ import static org.mockito.Mockito.verify;
  * </ol>
  *
  * <p>{@link com.beautica.notification.EmailService} is a {@code @MockBean} (inherited
- * from {@link AbstractIntegrationTest}) so no real SMTP fires; the raw token is captured
- * from the {@code sendServiceTypeSuggestionNotification} call to drive the approve step.
+ * from {@link AbstractIntegrationTest}) so no real SMTP fires.
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("Service-type suggestion workflow — full-flow integration")
@@ -62,12 +57,12 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
     private static final String CATEGORY = "HAIRDRESSING";
     private static final String SUGGESTED = "ITWorkflow Hot Towel Shave";
     private static final String DESCRIPTION = "Workflow IT suggestion";
-    private static final String TOKEN_QUERY_PARAM = "token=";
+    /** test profile {@code app.frontend.base-url} + the portal requests page. */
+    private static final String PORTAL_URL = "http://localhost:3000/admin/requests";
 
     @Autowired private ServiceCatalogService serviceCatalogService;
     @Autowired private ServiceTypeSuggestionService suggestionService;
     @Autowired private ServiceTypeSuggestionRepository suggestionRepository;
-    @Autowired private TokenGenerator tokenGenerator;
     // jdbcTemplate + emailService are inherited (protected) from AbstractIntegrationTest.
 
     @AfterEach
@@ -87,7 +82,7 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
     }
 
     @Test
-    @DisplayName("submit → review (no mutation) → approve persists state transitions + promotes a service_types row (catalog-only, null requester)")
+    @DisplayName("submit (portal-link email) → approve by id persists state transitions + promotes a service_types row (catalog-only, null requester)")
     void should_completeSuggestionApprovalRoundTrip_when_adminApproves() {
         // requested_by_user_id is nullable (FK ON DELETE SET NULL); a null requester is a
         // supported anonymous-suggestion path and avoids needing a users fixture here.
@@ -98,23 +93,15 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
         // Act 1 — submit via the catalog facade (validates category + delegates).
         serviceCatalogService.suggestServiceType(request(SUGGESTED), requester);
 
-        // Assert 1 — PENDING row persisted with a HASHED token (stored != raw token).
-        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
+        // Assert 1 — PENDING row persisted; the operator email carries only the portal link.
         verify(emailService).sendServiceTypeSuggestionNotification(
-                anyString(), anyString(), eq(CATEGORY), eq(SUGGESTED), eq(DESCRIPTION),
-                urlCaptor.capture());
-        String rawToken = urlCaptor.getValue()
-                .substring(urlCaptor.getValue().indexOf(TOKEN_QUERY_PARAM) + TOKEN_QUERY_PARAM.length());
+                anyString(), anyString(), eq(CATEGORY), eq(SUGGESTED), eq(DESCRIPTION), eq(PORTAL_URL));
 
-        ServiceTypeSuggestion persisted = suggestionRepository
-                .findByTokenHash(tokenGenerator.hash(rawToken))
-                .orElseThrow(() -> new AssertionError("PENDING row not found by token hash"));
+        ServiceTypeSuggestion persisted = suggestionRepository.findAll().stream()
+                .filter(s -> CATEGORY.equals(s.getCategoryName()) && SUGGESTED.equals(s.getSuggestedName()))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("PENDING row not found"));
         assertThat(persisted.getStatus()).isEqualTo(ServiceTypeSuggestionStatus.PENDING);
-        assertThat(persisted.getTokenHash())
-                .as("stored token must be the hash, never the raw token")
-                .isNotNull()
-                .isNotEqualTo(rawToken)
-                .isEqualTo(tokenGenerator.hash(rawToken));
         assertThat(persisted.getCreatedAt())
                 .as("@DynamicInsert lets the DB DEFAULT NOW() populate created_at")
                 .isNotNull();
@@ -126,28 +113,14 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
                 .isInstanceOf(BusinessException.class)
                 .extracting("status").hasToString("409 CONFLICT");
 
-        // Act 3 — load for review: MUST NOT mutate the row.
-        var review = suggestionService.loadForReview(rawToken);
-        assertThat(review.valid()).isTrue();
-        assertThat(review.suggestedName()).isEqualTo(SUGGESTED);
-        ServiceTypeSuggestion afterReview = suggestionRepository.findById(persisted.getId()).orElseThrow();
-        assertThat(afterReview.getStatus())
-                .as("GET review must not change state").isEqualTo(ServiceTypeSuggestionStatus.PENDING);
-        assertThat(afterReview.getTokenHash())
-                .as("GET review must not clear the token").isNotNull();
+        // Act 3 — approve by id (the portal decision).
+        DecisionOutcome outcome = suggestionService.approveById(persisted.getId());
 
-        // Act 4 — approve.
-        DecisionOutcome outcome = suggestionService.approve(rawToken);
-
-        // Assert 4 — APPROVED, decided_at stamped, token cleared (single-use), and the
-        // cross-field CHECK (token null on a non-PENDING row) was satisfied at commit.
+        // Assert 4 — APPROVED, decided_at stamped.
         assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
         ServiceTypeSuggestion approved = suggestionRepository.findById(persisted.getId()).orElseThrow();
         assertThat(approved.getStatus()).isEqualTo(ServiceTypeSuggestionStatus.APPROVED);
         assertThat(approved.getDecidedAt()).as("decided_at stamped on approval").isNotNull();
-        assertThat(approved.getTokenHash())
-                .as("token_hash cleared after the decision (single-use)").isNull();
-        assertThat(approved.getTokenExpiresAt()).isNull();
 
         // Assert 5 — Phase 16.9 (Option A, catalog-only): approve promotes the suggestion
         // into a single new service_types row (+1). HAIRDRESSING maps to a System-A bucket
@@ -172,9 +145,9 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
                         + "surface was removed in V80)")
                 .isEqualTo(0L);
 
-        // Act 6 — second approve is idempotent (token nulled) → neutral already-decided,
-        // and creates NO second service_types row.
-        assertThat(suggestionService.approve(rawToken)).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
+        // Act 6 — a second approve is refused (REQUEST_NOT_PENDING) and creates NO second service_types row.
+        assertThatThrownBy(() -> suggestionService.approveById(persisted.getId()))
+                .isInstanceOf(CatalogRequestConflictException.class);
         long serviceTypesAfterReplay = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM service_types", Long.class);
         assertThat(serviceTypesAfterReplay)
@@ -183,16 +156,15 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
     }
 
     @Test
-    @DisplayName("V76/V197/V198: token-hash index + unique pending dedup present, V76 non-unique dedup dropped")
+    @DisplayName("V197/V198: unique pending dedup present, V76 non-unique dedup dropped; token-hash index kept until phase 555")
     void should_haveCreatedTableWithIndexes_when_migrationApplied() {
         List<String> indexes = jdbcTemplate.queryForList(
                 "SELECT indexname FROM pg_indexes WHERE tablename = 'service_type_suggestion'",
                 String.class);
 
         assertThat(indexes)
-                .as("V76 token-lookup index + V197 partial UNIQUE dedup index; V198 dropped V76's non-unique one")
-                .contains("idx_service_type_suggestion_token_hash",
-                        "ux_service_type_suggestion_pending_dedup")
+                .as("V197 partial UNIQUE dedup index; V198 dropped V76's non-unique one; V266 kept the token index")
+                .contains("ux_service_type_suggestion_pending_dedup", "idx_service_type_suggestion_token_hash")
                 .doesNotContain("idx_service_type_suggestion_dedup");
     }
 
