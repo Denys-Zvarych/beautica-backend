@@ -67,11 +67,16 @@ public class CatalogRequestConflictException extends BusinessException {
 
     /**
      * B505 — a typed 409 for a path that already had an UNTYPED one: {@code message} keeps the exception's existing
-     * {@link #getMessage()} and {@code wireMessage} (a fixed constant, never caller input) keeps the response
-     * {@code message} byte-identical; only {@code data} gains the code.
+     * {@link #getMessage()} and {@code wireMessage} keeps the response {@code message} byte-identical; only
+     * {@code data} gains the code.
+     *
+     * <p>Both must be fixed constants, never caller input: {@code message} is logged at WARN by the 409 handler.
+     * {@code message} is the LAST parameter on purpose so {@code BusinessExceptionMessageGuardTest}'s
+     * {@code PASS_THROUGH_HELPERS} entry checks every caller passes a constant there. Caller text belongs in
+     * {@link BusinessException#withUserInput}, not here.
      */
-    public CatalogRequestConflictException(Code code, String message, String wireMessage) {
-        this(code, null, message, wireMessage);
+    public static CatalogRequestConflictException withFixedMessages(Code code, String wireMessage, String message) {
+        return new CatalogRequestConflictException(code, null, message, wireMessage);
     }
 
     private CatalogRequestConflictException(Code code, @Nullable CatalogUsage usage, String message,

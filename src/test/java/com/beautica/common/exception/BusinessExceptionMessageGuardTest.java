@@ -34,6 +34,7 @@ class BusinessExceptionMessageGuardTest {
 
     private static final Path MAIN_SOURCES = Path.of("src/main/java");
     private static final String PASS_THROUGH = "param pass-through; callers checked in PASS_THROUGH_HELPERS";
+    private static final String CATALOG_CONFLICT_FACTORY = "withFixedMessages";
 
     record Reviewed(String file, String message, int sites, String reason) {
 
@@ -66,9 +67,8 @@ class BusinessExceptionMessageGuardTest {
             new Reviewed("com/beautica/common/exception/ConflictException.java",
                     "message", 1, "super pass-through; every new ConflictException(...) is a scanned throw site"),
             new Reviewed("com/beautica/common/exception/CatalogRequestConflictException.java",
-                    "message", 1, "enum name, or the caller's fixed constant (ServiceTypeSuggestionService "
-                            + "DUPLICATE_PENDING_MESSAGE); not a PassThroughHelper: the (code, usage) overload "
-                            + "puts a CatalogUsage at the message position"),
+                    "message", 1, "private ctor: enum name, or withFixedMessages' message, whose callers are "
+                            + "checked in PASS_THROUGH_HELPERS"),
             new Reviewed("com/beautica/catalog/admin/CatalogAdminAuditService.java",
                     "\"Invalid catalog audit entry: \" + detail", 1, PASS_THROUGH),
             new Reviewed("com/beautica/common/exception/IdentityException.java",
@@ -135,7 +135,9 @@ class BusinessExceptionMessageGuardTest {
             new PassThroughHelper("com/beautica/common/exception/InviteTokenException.java",
                     "com/beautica/", Set.of("InviteTokenException"), "message"),
             new PassThroughHelper("com/beautica/catalog/admin/CatalogAdminAuditService.java",
-                    "com/beautica/catalog/admin/CatalogAdminAuditService.java", Set.of("invalid"), "detail"));
+                    "com/beautica/catalog/admin/CatalogAdminAuditService.java", Set.of("invalid"), "detail"),
+            new PassThroughHelper("com/beautica/common/exception/CatalogRequestConflictException.java",
+                    "com/beautica/", Set.of(CATALOG_CONFLICT_FACTORY), "message"));
 
     @Test
     @DisplayName("every interpolated business message is withUserInput or reviewed, with the pinned site count")
@@ -301,6 +303,47 @@ class BusinessExceptionMessageGuardTest {
                         tuple(5, "label"),
                         tuple(6, "label"),
                         tuple(18, "field"));
+    }
+
+    @Test
+    @DisplayName("a CatalogRequestConflictException.withFixedMessages caller building its message from a variable is flagged")
+    void should_flagFactoryCall_when_catalogConflictMessageIsVariableBuilt() {
+        // Arrange
+        String planted = """
+                class S {
+                    RuntimeException ok() {
+                        return CatalogRequestConflictException.withFixedMessages(Code.DUPLICATE_PENDING,
+                                GlobalExceptionHandler.GENERIC_CONFLICT_MESSAGE, DUPLICATE_PENDING_MESSAGE);
+                    }
+                    RuntimeException leaky(String categoryName) {
+                        return CatalogRequestConflictException.withFixedMessages(Code.DUPLICATE_PENDING,
+                                GlobalExceptionHandler.GENERIC_CONFLICT_MESSAGE, "Pending in " + categoryName);
+                    }
+                }""";
+
+        // Act
+        HelperCalls result = ExceptionMessageInputScanner.scanHelperCalls(
+                "S.java", planted, Set.of(CATALOG_CONFLICT_FACTORY), "message");
+
+        // Assert
+        assertThat(result.calls()).isEqualTo(2);
+        assertThat(result.flagged()).extracting(Site::line, Site::message)
+                .containsExactly(tuple(7, "\"Pending in \" + categoryName"));
+    }
+
+    @Test
+    @DisplayName("CatalogRequestConflictException exposes no public constructor taking a String message")
+    void should_keepStringConstructorsPrivate_when_catalogConflictIsBuilt() {
+        // Arrange
+        var constructors = CatalogRequestConflictException.class.getConstructors();
+
+        // Act
+        var stringTaking = Stream.of(constructors)
+                .filter(ctor -> Stream.of(ctor.getParameterTypes()).anyMatch(String.class::equals))
+                .toList();
+
+        // Assert
+        assertThat(stringTaking).as("route fixed messages through withFixedMessages (guarded)").isEmpty();
     }
 
     @Test

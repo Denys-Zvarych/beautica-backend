@@ -1330,8 +1330,9 @@ class GlobalExceptionHandlerTest {
     @Test
     @DisplayName("handleCatalogRequestConflict — a fixed wireMessage override replaces the per-code text; data.code kept")
     void should_useWireMessage_when_catalogConflictCarriesOverride() {
-        var ex = new CatalogRequestConflictException(CatalogRequestConflictException.Code.DUPLICATE_PENDING,
-                "internal text", GlobalExceptionHandler.GENERIC_CONFLICT_MESSAGE);
+        var ex = CatalogRequestConflictException.withFixedMessages(
+                CatalogRequestConflictException.Code.DUPLICATE_PENDING,
+                GlobalExceptionHandler.GENERIC_CONFLICT_MESSAGE, "internal text");
 
         ResponseEntity<ApiResponse<CatalogRequestConflictResponse>> response = handler.handleCatalogRequestConflict(ex);
 

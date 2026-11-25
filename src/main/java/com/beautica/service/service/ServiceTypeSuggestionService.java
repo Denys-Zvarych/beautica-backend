@@ -246,8 +246,9 @@ public class ServiceTypeSuggestionService {
      * {@code BusinessException} with status 409, so {@code CategoryRequestService}'s 409 swallow is unchanged.
      */
     private static BusinessException duplicatePending() {
-        return new CatalogRequestConflictException(CatalogRequestConflictException.Code.DUPLICATE_PENDING,
-                DUPLICATE_PENDING_MESSAGE, GlobalExceptionHandler.GENERIC_CONFLICT_MESSAGE);
+        return CatalogRequestConflictException.withFixedMessages(
+                CatalogRequestConflictException.Code.DUPLICATE_PENDING,
+                GlobalExceptionHandler.GENERIC_CONFLICT_MESSAGE, DUPLICATE_PENDING_MESSAGE);
     }
 
     private static CatalogRequestConflictException categoryBusy() {
