@@ -42,6 +42,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.timeout;
 
 /**
  * B514 (AUTH-54) — App Check in ENFORCE on {@code POST /auth/register/phone/otp/send}, against a WireMock JWKS
@@ -261,7 +262,7 @@ class AppCheckGuardIT extends AbstractPhoneIdentityIT {
         ResponseEntity<String> response = post(FORGOT_URL, Map.of("email", email));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-        verify(emailNotificationService).sendPasswordResetOtpEmail(any(), anyString());
+        verify(emailNotificationService, timeout(MAIL_WAIT_MS)).sendPasswordResetOtpEmail(any(), anyString());
     }
 
     @Test

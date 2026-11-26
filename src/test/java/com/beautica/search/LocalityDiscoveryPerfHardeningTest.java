@@ -179,6 +179,12 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
      * {@link #STRICT_RESOLVE_SAMPLES} cold resolves is asserted, which rejects a single GC / container
      * scheduling outlier. The asserted gate is {@link #STRICT_RESOLVE_GATE_MS} — this budget scaled
      * by {@link #CI_RUNNER_FACTOR} for the slower shared GitHub Actions runner.
+     *
+     * <p>CI hardening (PR #234, after flakes on #233/#234 at 880 / 984 ms vs 875 ms): BOTH paths
+     * (common and worst case) now get their own discarded warm-up resolve — the worst case runs
+     * code (custom-hours overrides, the full 181-day walk) the common-case warm-up never JITs — and
+     * the median is taken over {@link #STRICT_RESOLVE_SAMPLES} = 5 cold resolves (cache cleared before
+     * each), so up to two GC / noisy-neighbour outliers per case are rejected. Budget unchanged.
      */
     private static final long STRICT_RESOLVE_COLD_BUDGET_MS = 500L;
 
@@ -194,7 +200,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     private static final long STRICT_RESOLVE_GATE_MS = Math.round(STRICT_RESOLVE_COLD_BUDGET_MS * CI_RUNNER_FACTOR);
 
     /** Cold resolves per case whose median is asserted against the budget. */
-    private static final int STRICT_RESOLVE_SAMPLES = 3;
+    private static final int STRICT_RESOLVE_SAMPLES = 5;
 
     /**
      * Statements ONE cold resolve issues, whatever the candidate count (phase-523 § Perf gate:
@@ -467,7 +473,8 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
         int cap = StrictBookableResolver.CANDIDATE_CAP;
         List<UUID> bookable = seedBulkIndependentMasters(cap, COMMON_DURATIONS, false);
         List<UUID> unfittable = seedBulkIndependentMasters(cap, UNFITTABLE_DURATIONS, true);
-        coldResolve(bookable); // JIT + Hibernate plan warm-up, discarded (see the budget javadoc)
+        coldResolve(bookable); // JIT + Hibernate plan warm-up per path, discarded (see the budget javadoc)
+        coldResolve(unfittable);
 
         long commonMs = medianColdResolveMs(bookable);
         long worstMs = medianColdResolveMs(unfittable);
