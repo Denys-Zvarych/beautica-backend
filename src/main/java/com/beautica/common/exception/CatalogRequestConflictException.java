@@ -47,7 +47,14 @@ public class CatalogRequestConflictException extends BusinessException {
          * category's row (held by a portal rename / hide / decision / delete on the same category). Nothing was
          * written; retrying shortly succeeds.
          */
-        CATEGORY_BUSY
+        CATEGORY_BUSY,
+        /** B539 — an icon PUT on a REJECTED category request; only PENDING and APPROVED categories take an icon. */
+        CATEGORY_REJECTED,
+        /**
+         * B541 (SVC-60) — approve, unhide or internal create of a category that has no icon, while
+         * {@code app.catalog.icon-required} is on. Upload one ({@code PUT …/categories/{name}/icon}) and retry.
+         */
+        CATEGORY_ICON_REQUIRED
     }
 
     private final Code code;

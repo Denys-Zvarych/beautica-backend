@@ -26,6 +26,18 @@ public record CreatePlatformCategoryRequest(
                 regexp = "^[A-Z][A-Z0-9_]*$",
                 message = "Category name must contain only uppercase letters, digits, or underscores, and start with a letter"
         )
-        String name
+        String name,
+
+        /**
+         * B541 (SVC-60) — OPTIONAL icon SVG text, set in the same transaction (needs {@code X-Admin-Actor}); validated
+         * by {@code CategoryIconSanitizer} (400 {@code ICON_INVALID}). Required while {@code app.catalog.icon-required}
+         * is on (409 {@code CATEGORY_ICON_REQUIRED} without it). Same 24 KiB body cap as the icon PUT.
+         */
+        @Size(max = 24 * 1024, message = "Icon SVG is too large")
+        String svg
 ) {
+    /** A create without an icon (every caller before B541). */
+    public CreatePlatformCategoryRequest(String name) {
+        this(name, null);
+    }
 }

@@ -2756,4 +2756,38 @@ class AuthRateLimitFilterTest {
             assertThat(ipv4.getStatus()).isNotEqualTo(429);
         }
     }
+
+    // ==========================================================================
+    @Nested
+    @DisplayName("GET /api/v1/service-categories/approved (B539 / W050: public, catalogue-browse bucket)")
+    class ApprovedCategoriesEndpoint {
+
+        @Test
+        @DisplayName("anonymous GET is charged on catalogueBrowseBuckets; 429 when exhausted")
+        void should_return429_when_anonymousApprovedListBucketExhausted() throws Exception {
+            when(catalogueBrowseBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+
+            doFilter(getRequest("/api/v1/service-categories/approved"), response, chain);
+
+            assertThat(response.getStatus()).isEqualTo(429);
+            assertThat(chain.getRequest()).isNull();
+        }
+
+        @Test
+        @DisplayName("a Bearer-carrying GET is deferred (not charged here), like the other catalogue-browse reads")
+        void should_deferCharge_when_bearerPresent() throws Exception {
+            var request = getRequest("/api/v1/service-categories/approved");
+            request.addHeader("Authorization", "Bearer some.jwt.token");
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+
+            doFilter(request, response, chain);
+
+            verifyNoInteractions(catalogueBrowseBuckets);
+            assertThat(chain.getRequest()).isNotNull();
+        }
+    }
 }

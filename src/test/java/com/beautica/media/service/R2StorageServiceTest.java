@@ -239,6 +239,20 @@ class R2StorageServiceTest {
     }
 
     @Test
+    @DisplayName("B539: uploadFile with an explicit Cache-Control (category icons: 1 year, immutable) sends exactly it")
+    void should_sendExplicitCacheControl_when_uploadFileCalledWithCacheControl() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
+        InputStream content = new ByteArrayInputStream(PAYLOAD);
+        ArgumentCaptor<PutObjectRequest> requestCaptor = ArgumentCaptor.forClass(PutObjectRequest.class);
+
+        service.uploadFile(KEY, content, PAYLOAD.length, "image/svg+xml", "public, max-age=31536000, immutable");
+
+        verify(s3Client).putObject(requestCaptor.capture(), any(RequestBody.class));
+        assertThat(requestCaptor.getValue().cacheControl()).isEqualTo("public, max-age=31536000, immutable");
+        assertThat(requestCaptor.getValue().contentType()).isEqualTo("image/svg+xml");
+    }
+
+    @Test
     @DisplayName("uploadFile calls putObject with correct bucket/key/contentType/contentLength when enabled")
     void should_callPutObject_when_uploadFileCalledWithR2Enabled() {
         R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);

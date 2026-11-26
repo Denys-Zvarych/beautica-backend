@@ -283,4 +283,154 @@ class AfterCommitBlobPurgerTest {
             sync.afterCommit();
         }
     }
+
+    /** Records the order of guard calls and the R2 delete, and whether each ran inside {@code exclusively}. */
+    private final class RecordingGuard implements BlobReferenceGuard {
+        private final List<String> events = new ArrayList<>();
+        private boolean inside;
+
+        @Override
+        public boolean appliesTo(String key) {
+            return key.startsWith("guarded/");
+        }
+
+        @Override
+        public boolean isReferenced(String key) {
+            events.add("check:" + inside);
+            return false;
+        }
+
+        @Override
+        public void exclusively(Runnable checkAndDelete) {
+            inside = true;
+            try {
+                checkAndDelete.run();
+            } finally {
+                inside = false;
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("guarded key: the reference check AND the R2 delete both run inside the guard's exclusive section, "
+            + "so a writer claiming the key cannot slip between them")
+    void should_checkAndDeleteInsideExclusiveSection_when_keyGuarded() {
+        RecordingGuard guard = new RecordingGuard();
+        when(r2.deleteFiles(anyCollection())).thenAnswer(inv -> {
+            guard.events.add("delete:" + guard.inside);
+            return Set.of();
+        });
+        AfterCommitBlobPurger purger =
+                new AfterCommitBlobPurger(r2, new SyncTaskExecutor(), meters, List.of(guard));
+
+        purger.dispatch(List.of("guarded/a.svg"), "test");
+
+        assertThat(guard.events).containsExactly("check:true", "delete:true");
+    }
+
+    @Test
+    @DisplayName("unguarded keys: no exclusive section is entered (other purges never wait on a guard's lock)")
+    void should_notEnterExclusiveSection_when_noKeyGuarded() {
+        RecordingGuard guard = new RecordingGuard();
+        when(r2.deleteFiles(anyCollection())).thenAnswer(inv -> {
+            guard.events.add("delete:" + guard.inside);
+            return Set.of();
+        });
+        AfterCommitBlobPurger purger =
+                new AfterCommitBlobPurger(r2, new SyncTaskExecutor(), meters, List.of(guard));
+
+        purger.dispatch(List.of("media/x.jpg"), "test");
+
+        assertThat(guard.events).containsExactly("delete:false");
+    }
+
+    /** A guard that claims EVERY key it is asked about is still referenced (or throws), but owns only {@code guarded/}. */
+    private static final class AlwaysReferencedGuard implements BlobReferenceGuard {
+        private final List<String> checked = new ArrayList<>();
+        private final boolean fail;
+
+        AlwaysReferencedGuard(boolean fail) {
+            this.fail = fail;
+        }
+
+        @Override
+        public boolean appliesTo(String key) {
+            return key.startsWith("guarded/");
+        }
+
+        @Override
+        public boolean isReferenced(String key) {
+            checked.add(key);
+            if (fail) {
+                throw new IllegalStateException("db down");
+            }
+            return true;
+        }
+
+        @Override
+        public void exclusively(Runnable checkAndDelete) {
+            checkAndDelete.run();
+        }
+    }
+
+    @Test
+    @DisplayName("B539: photo / avatar keys purge exactly as before — never reference-checked, deleted even when a "
+            + "guard would call every key referenced; only the guarded icon key is kept")
+    void should_deleteUnguardedKeysUnchecked_when_batchMixesPhotosAndGuardedKey() {
+        AlwaysReferencedGuard guard = new AlwaysReferencedGuard(false);
+        when(r2.deleteFiles(anyCollection())).thenReturn(Set.of());
+        AfterCommitBlobPurger purger = new AfterCommitBlobPurger(r2, new SyncTaskExecutor(), meters, List.of(guard));
+        TransactionSynchronizationManager.initSynchronization();
+
+        purger.purgeAfterCommit(List.of("avatars/u/a.jpg", "salon-photos/s/p.jpg", "guarded/icon.svg"), "test");
+        fireAfterCommit();
+
+        verify(r2).deleteFiles(List.of("avatars/u/a.jpg", "salon-photos/s/p.jpg"));
+        assertThat(guard.checked).as("reference checks run").containsExactly("guarded/icon.svg");
+        assertThat(counter(AfterCommitBlobPurger.FAILED_KEYS_METRIC)).isZero();
+    }
+
+    @Test
+    @DisplayName("B539: a guard that throws keeps its key (orphan, counted on failed.keys) — never a delete it could "
+            + "not clear; unguarded keys in the batch are still deleted")
+    void should_keepKeyAndCountFailure_when_guardThrows() {
+        AlwaysReferencedGuard guard = new AlwaysReferencedGuard(true);
+        when(r2.deleteFiles(anyCollection())).thenReturn(Set.of());
+        AfterCommitBlobPurger purger = new AfterCommitBlobPurger(r2, new SyncTaskExecutor(), meters, List.of(guard));
+
+        assertThatCode(() -> purger.dispatch(List.of("guarded/icon.svg", "avatars/u/a.jpg"), "test"))
+                .doesNotThrowAnyException();
+
+        verify(r2).deleteFiles(List.of("avatars/u/a.jpg"));
+        assertThat(counter(AfterCommitBlobPurger.FAILED_KEYS_METRIC)).isEqualTo(1.0);
+    }
+
+    @Test
+    @DisplayName("B539 purgeAfterCompletion: dispatched after a ROLLBACK too (an uploaded icon is released whatever "
+            + "the outcome), and nothing runs before completion")
+    void should_dispatchOnRollback_when_purgeAfterCompletion() {
+        when(r2.deleteFiles(anyCollection())).thenReturn(Set.of());
+        AfterCommitBlobPurger purger = new AfterCommitBlobPurger(r2, new SyncTaskExecutor(), meters);
+        TransactionSynchronizationManager.initSynchronization();
+
+        purger.purgeAfterCompletion(List.of("guarded/icon.svg"), "test");
+        verify(r2, never()).deleteFiles(anyCollection());
+        for (TransactionSynchronization sync : TransactionSynchronizationManager.getSynchronizations()) {
+            sync.afterCompletion(TransactionSynchronization.STATUS_ROLLED_BACK);
+        }
+
+        verify(r2).deleteFiles(List.of("guarded/icon.svg"));
+    }
+
+    @Test
+    @DisplayName("B539 purgeAfterCompletion with no transaction synchronization dispatches now (not skipped like "
+            + "purgeAfterCommit)")
+    void should_dispatchNow_when_purgeAfterCompletionWithoutSynchronization() {
+        when(r2.deleteFiles(anyCollection())).thenReturn(Set.of());
+        AfterCommitBlobPurger purger = new AfterCommitBlobPurger(r2, new SyncTaskExecutor(), meters);
+
+        purger.purgeAfterCompletion(List.of("guarded/icon.svg"), "test");
+
+        verify(r2).deleteFiles(List.of("guarded/icon.svg"));
+    }
 }

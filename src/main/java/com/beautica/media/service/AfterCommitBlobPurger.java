@@ -4,6 +4,7 @@ import com.beautica.config.AsyncConfig;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.core.task.TaskRejectedException;
@@ -36,7 +37,11 @@ import java.util.Set;
  * is the record. Every task is submitted as an {@code AsyncConfig.BlobPurgeTask} carrying its key count for
  * exactly that report.
  *
- * <p>Callers verify key ownership (own-prefix) BEFORE handing keys here; this class deletes what it is given.
+ * <p>Callers verify key ownership (own-prefix) BEFORE handing keys here; this class deletes what it is given,
+ * minus any key a {@link BlobReferenceGuard} reports as still referenced at purge time (B539: content-addressed
+ * category icons, re-checked on the executor thread right before the delete, check and delete inside the
+ * guard's {@link BlobReferenceGuard#exclusively} section). A guard that throws keeps the key
+ * (an orphan, counted on {@value #FAILED_KEYS_METRIC}) — never a delete the guard could not clear.
  */
 @Slf4j
 @Component
@@ -49,10 +54,18 @@ public class AfterCommitBlobPurger {
     private final TaskExecutor executor;
     private final Counter rejectedKeys;
     private final Counter failedKeys;
+    private final List<BlobReferenceGuard> guards;
 
+    /** No guards: for unit tests of callers that never purge guarded keys. */
+    public AfterCommitBlobPurger(R2StorageService r2, TaskExecutor executor, MeterRegistry meterRegistry) {
+        this(r2, executor, meterRegistry, List.of());
+    }
+
+    @Autowired
     public AfterCommitBlobPurger(R2StorageService r2, @Qualifier("blobPurgeExecutor") TaskExecutor executor,
-                                 MeterRegistry meterRegistry) {
+                                 MeterRegistry meterRegistry, List<BlobReferenceGuard> guards) {
         this.r2 = r2;
+        this.guards = List.copyOf(guards);
         this.executor = executor;
         this.rejectedKeys = Counter.builder(REJECTED_KEYS_METRIC)
                 .description("R2 keys orphaned because blobPurgeExecutor rejected the purge task")
@@ -82,6 +95,29 @@ public class AfterCommitBlobPurger {
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
+                dispatch(snapshot, context);
+            }
+        });
+    }
+
+    /**
+     * Registers ONE purge of {@code keys} that runs when the current transaction ends, whatever its outcome (commit
+     * or rollback); with no active synchronization it is dispatched now. Only for keys a {@link BlobReferenceGuard}
+     * covers: "delete unless a committed row references it" is then correct after either outcome (B539 — releasing
+     * an uploaded content-addressed object).
+     */
+    public void purgeAfterCompletion(Collection<String> keys, String context) {
+        if (keys == null || keys.isEmpty()) {
+            return;
+        }
+        List<String> snapshot = List.copyOf(keys);
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            dispatch(snapshot, context);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
                 dispatch(snapshot, context);
             }
         });
@@ -120,7 +156,23 @@ public class AfterCommitBlobPurger {
         }
     }
 
-    private void purgeNow(List<String> keys, String context) {
+    /** The check and the delete run inside every applicable guard's {@link BlobReferenceGuard#exclusively}. */
+    private void purgeNow(List<String> requested, String context) {
+        Runnable checkAndDelete = () -> deleteUnreferenced(requested, context);
+        for (BlobReferenceGuard guard : guards) {
+            if (requested.stream().anyMatch(guard::appliesTo)) {
+                Runnable inner = checkAndDelete;
+                checkAndDelete = () -> guard.exclusively(inner);
+            }
+        }
+        checkAndDelete.run();
+    }
+
+    private void deleteUnreferenced(List<String> requested, String context) {
+        List<String> keys = requested.stream().filter(key -> !stillReferenced(key, context)).toList();
+        if (keys.isEmpty()) {
+            return;
+        }
         try {
             Set<String> failed = r2.deleteFiles(keys);
             if (failed != null && !failed.isEmpty()) {
@@ -133,5 +185,25 @@ public class AfterCommitBlobPurger {
             log.warn("R2 blob purge failed (context={}, keyCount={}, keys=[omitted]): {}",
                     context, keys.size(), ex.getClass().getSimpleName());
         }
+    }
+
+    /** A guard that throws keeps the key: an orphan is recoverable, a deleted live object is not. */
+    private boolean stillReferenced(String key, String context) {
+        for (BlobReferenceGuard guard : guards) {
+            if (!guard.appliesTo(key)) {
+                continue;
+            }
+            try {
+                if (guard.isReferenced(key)) {
+                    return true;
+                }
+            } catch (RuntimeException ex) {
+                failedKeys.increment();
+                log.warn("Blob purge reference check failed; key kept (context={}, keys=[omitted]): {}",
+                        context, ex.getClass().getSimpleName());
+                return true;
+            }
+        }
+        return false;
     }
 }

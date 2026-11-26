@@ -27,10 +27,13 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -63,6 +66,10 @@ class InternalCategoryServiceCacheTest {
     @MockBean NotificationOutboxService notificationOutboxService;
     @MockBean AdminRequestsPortalLink adminRequestsPortalLink;
     @MockBean ServiceTypeSuggestionService serviceTypeSuggestionService;
+    // B539 / B541 collaborators (icon URL on the approved list, icon gate and icon set on create).
+    @MockBean com.beautica.catalog.icon.CategoryIconUrls categoryIconUrls;
+    @MockBean com.beautica.catalog.icon.CategoryIconGate categoryIconGate;
+    @MockBean com.beautica.catalog.icon.CategoryIconService categoryIconService;
 
     @Autowired InternalCategoryService internalCategoryService;
     @Autowired CategoryRequestService categoryRequestService;
@@ -141,5 +148,26 @@ class InternalCategoryServiceCacheTest {
         assertThat(suggestions).as("suggestion catalogue entry evicted on failed create").isNotNull();
         assertThat(suggestions.get()).as("suggestion catalogue cached object identity").isSameAs(warmSuggestions);
         verify(platformCategoryRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("create WITH an svg (B541): the @CacheEvict on create(request, actor) empties approved-categories, "
+            + "category order and suggestions after the icon transaction — the one eviction on that path")
+    void should_evictCategoryCaches_when_createWithSvg() {
+        assertThat(categoryRequestService.listApproved()).hasSize(1); // warm cache
+        cache("platform-category-order").put("all", "stale");
+        cache(SearchSuggestionCatalogue.CACHE_NAME).put("k", "stale");
+        when(categoryIconService.createWithIcon(eq("PEDICURE"), anyString(), any(), any()))
+                .thenAnswer(inv -> inv.<Supplier<?>>getArgument(3).get());
+
+        internalCategoryService.create(new CreatePlatformCategoryRequest("PEDICURE",
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"/>"), "beautica.ua@gmail.com");
+
+        assertThat(categoryRequestService.listApproved())
+                .as("approved list re-read after the create")
+                .extracting(ApprovedCategoryResponse::name)
+                .containsExactly("MANICURE", "PEDICURE");
+        assertThat(cache("platform-category-order").get("all")).as("order cache evicted").isNull();
+        assertThat(cache(SearchSuggestionCatalogue.CACHE_NAME).get("k")).as("suggestions evicted").isNull();
     }
 }

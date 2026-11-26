@@ -1,5 +1,6 @@
 package com.beautica.service.controller;
 
+import com.beautica.catalog.admin.AdminActor;
 import com.beautica.common.ApiResponse;
 import com.beautica.service.dto.CreatePlatformCategoryRequest;
 import com.beautica.service.dto.PlatformCategoryResponse;
@@ -12,6 +13,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -64,8 +66,9 @@ public class InternalCategoryController {
      */
     @PostMapping
     public ResponseEntity<ApiResponse<PlatformCategoryResponse>> createCategory(
+            @RequestHeader(value = AdminActor.HEADER, required = false) String actorHeader,
             @Valid @RequestBody CreatePlatformCategoryRequest request) {
-        PlatformCategoryResponse created = internalCategoryService.create(request);
+        PlatformCategoryResponse created = internalCategoryService.create(request, actorHeader);
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.ok(created));
     }
 }

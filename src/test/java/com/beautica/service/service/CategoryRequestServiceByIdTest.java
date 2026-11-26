@@ -1,5 +1,10 @@
 package com.beautica.service.service;
 
+import com.beautica.catalog.icon.CategoryIconGate;
+import com.beautica.catalog.icon.CategoryIconUrls;
+import com.beautica.config.CatalogIconProperties;
+import com.beautica.media.service.R2StorageService;
+
 import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.notification.EmailService;
@@ -25,6 +30,7 @@ import java.time.ZoneOffset;
 import java.util.Optional;
 import java.util.UUID;
 
+import static org.mockito.Mockito.mock;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -56,11 +62,17 @@ class CategoryRequestServiceByIdTest {
 
     @BeforeEach
     void setUp() {
-        service = new CategoryRequestService(platformCategoryRepository, emailService,
+        service = service(false);
+    }
+
+    private CategoryRequestService service(boolean iconRequired) {
+        CategoryRequestService built = new CategoryRequestService(platformCategoryRepository, emailService,
                 new AdminRequestsPortalLink("https://beautica.app"), serviceTypeSuggestionService,
                 Clock.fixed(NOW, ZoneOffset.UTC),
-                inAppNotificationService, notificationOutboxService);
-        ReflectionTestUtils.setField(service, "adminEmail", "admin@beautica.test");
+                inAppNotificationService, notificationOutboxService, new CategoryIconUrls(mock(R2StorageService.class)),
+                new CategoryIconGate(new CatalogIconProperties(iconRequired)));
+        ReflectionTestUtils.setField(built, "adminEmail", "admin@beautica.test");
+        return built;
     }
 
     private PlatformCategory pending(UUID requester, String initialServiceName, OffsetDateTime expiresAt) {
@@ -85,6 +97,46 @@ class CategoryRequestServiceByIdTest {
         verify(serviceTypeSuggestionService).submitSuggestionInternal("NAIL_ART", "Френч", null, requester);
         verify(inAppNotificationService).notifyCategoryRequestDecided(category, true);
         verify(notificationOutboxService).enqueueRequestDecided(RequestKind.CATEGORY_REQUEST, "503", true, requester);
+    }
+
+    @Test
+    @DisplayName("B541 gate ON: approveById without an icon → 409 CATEGORY_ICON_REQUIRED, row stays PENDING, nothing sent")
+    void should_refuseApprove_when_gateOnAndNoIcon() {
+        service = service(true);
+        PlatformCategory category = pending(UUID.randomUUID(), "Френч", NOW_UTC.plusDays(3));
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(category));
+
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(() -> service.approveById(ID));
+
+        assertThat(thrown).isInstanceOfSatisfying(CatalogRequestConflictException.class, ex -> assertThat(ex.getCode())
+                .isEqualTo(CatalogRequestConflictException.Code.CATEGORY_ICON_REQUIRED));
+        assertThat(category.getStatus()).isEqualTo(PlatformCategoryStatus.PENDING);
+        verifyNoInteractions(serviceTypeSuggestionService, inAppNotificationService, notificationOutboxService);
+    }
+
+    @Test
+    @DisplayName("B541 gate ON: approveById WITH an icon → APPROVED")
+    void should_approve_when_gateOnAndIconSet() {
+        service = service(true);
+        PlatformCategory category = pending(UUID.randomUUID(), null, NOW_UTC.plusDays(3));
+        category.changeIcon("catalog/category-icons/NAIL_ART/0123456789abcdef.svg", "a".repeat(64), NOW_UTC);
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(category));
+
+        DecisionOutcome outcome = service.approveById(ID);
+
+        assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
+    }
+
+    @Test
+    @DisplayName("B541 gate ON: rejectById never needs an icon")
+    void should_reject_when_gateOnAndNoIcon() {
+        service = service(true);
+        PlatformCategory category = pending(UUID.randomUUID(), null, NOW_UTC.plusDays(3));
+        when(platformCategoryRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(category));
+
+        DecisionOutcome outcome = service.rejectById(ID, null);
+
+        assertThat(outcome).isEqualTo(DecisionOutcome.REJECTED);
     }
 
     @Test

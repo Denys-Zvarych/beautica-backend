@@ -163,6 +163,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // branch (decision 4): anonymous callers are charged per IP on catalogueBrowseBuckets, a Bearer-carrying
     // call is deferred exactly like the other routes there. No new bucket bean.
     static final String APP_CONFIG_PATH = "/api/v1/app/config";
+    // B539 / W050 — GET /api/v1/service-categories/approved became permitAll (website booking pages read the category
+    // icons anonymously). Same catalogue-browse treatment as APP_CONFIG_PATH: anonymous per IP, Bearer deferred.
+    static final String APPROVED_CATEGORIES_PATH = "/api/v1/service-categories/approved";
     // permitAll public profile/roster reads, throttled to cap id-sweeps (audit 2026-10-05,
     // finding 2; the roster reads run an uncached bookability EXISTS gate per request via
     // MasterRepository#findBookableIdsBySalonId): GET /api/v1/masters/{id}, GET /api/v1/masters/by-salon/{salonId},
@@ -1650,7 +1653,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                         || (path.startsWith(MASTER_AVAILABILITY_PATH_PREFIX)
                                 && path.endsWith(MASTER_SERVICES_PATH_SUFFIX))
                         || isPublicProfileReadPath(path)
-                        || path.equals(APP_CONFIG_PATH))) {
+                        || path.equals(APP_CONFIG_PATH)
+                        || path.equals(APPROVED_CATEGORIES_PATH))) {
             if (BearerTokenExtractor.extract(request) != null) {
                 // NOT charged on any bucket here — not even the authenticated per-IP ceiling. This
                 // filter runs before JWT validation, so charging the ceiling here let a junk

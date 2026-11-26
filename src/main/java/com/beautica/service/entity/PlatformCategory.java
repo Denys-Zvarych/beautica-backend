@@ -1,5 +1,6 @@
 package com.beautica.service.entity;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -12,6 +13,8 @@ import jakarta.persistence.Table;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import org.hibernate.annotations.DynamicInsert;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 
 import java.time.OffsetDateTime;
 import java.util.UUID;
@@ -120,6 +123,31 @@ public class PlatformCategory {
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
 
+    /**
+     * B539 (SVC-58) — R2 object key of the category icon ({@code catalog/category-icons/{name}/{sha16}.svg}), never the
+     * URL: {@code iconUrl} is built at read time (track D8). {@code null} until an icon is set; the three icon columns
+     * are set together (V267 {@code chk_platform_categories_icon_all_or_none}).
+     *
+     * <p>External-storage contract: the object is purged after commit when the icon is replaced
+     * ({@code CategoryIconService}) and when the unused category is deleted (B505 delete path,
+     * {@code CatalogEntryAdminService#deleteCategory}). There is no FK CASCADE onto this table. Every purge of a key
+     * under {@code catalog/category-icons/} re-checks, at purge time, that no row still references it
+     * ({@code CategoryIconReferenceGuard}), because the content-addressed key can be re-used by a later write.
+     *
+     * <p>{@code @JsonIgnore}: a storage key is internal; clients only ever get the built {@code iconUrl}.
+     */
+    @JsonIgnore
+    @Column(name = "icon_key", length = 200)
+    private String iconKey;
+
+    /** B539 — lowercase hex sha256 of the canonical (stored) SVG bytes; the same-icon no-op compares this. */
+    @JdbcTypeCode(SqlTypes.CHAR)
+    @Column(name = "icon_sha256", length = 64)
+    private String iconSha256;
+
+    @Column(name = "icon_updated_at")
+    private OffsetDateTime iconUpdatedAt;
+
     private PlatformCategory(String name, String displayName, PlatformCategoryStatus status, boolean active) {
         this.name = name;
         this.displayName = displayName;
@@ -223,6 +251,20 @@ public class PlatformCategory {
     public void changeActive(boolean active) {
         requireApproved();
         this.active = active;
+    }
+
+    public boolean isRejected() {
+        return this.status == PlatformCategoryStatus.REJECTED;
+    }
+
+    /**
+     * B539 (SVC-58) — sets or replaces the icon. Caller has sanitised the SVG, uploaded it under {@code iconKey} and
+     * checked the category is not REJECTED.
+     */
+    public void changeIcon(String iconKey, String iconSha256, OffsetDateTime updatedAt) {
+        this.iconKey = iconKey;
+        this.iconSha256 = iconSha256;
+        this.iconUpdatedAt = updatedAt;
     }
 
     private void requireApproved() {

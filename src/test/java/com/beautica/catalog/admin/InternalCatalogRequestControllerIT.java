@@ -606,7 +606,7 @@ class InternalCatalogRequestControllerIT extends AbstractIntegrationTest {
                 "—");                   // no requester at all
         rows.forEach(n -> assertThat(keys(n)).as("row keys").containsExactlyInAnyOrder("kind", "id", "name",
                 "displayName", "categoryName", "initialServiceName", "description", "requesterLabel", "createdAt",
-                "status"));
+                "status", "iconUrl")); // B539: iconUrl additive (null here: no icon)
         assertThat(response.getBody()).as("no requester email or phone anywhere in the raw body")
                 .doesNotContain("@beautica.test", "it502-l-", "+38050111000", "380501110", "email", "phone");
     }

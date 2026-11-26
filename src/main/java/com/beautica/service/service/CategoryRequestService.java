@@ -1,5 +1,7 @@
 package com.beautica.service.service;
 
+import com.beautica.catalog.icon.CategoryIconGate;
+import com.beautica.catalog.icon.CategoryIconUrls;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.common.exception.NotFoundException;
@@ -62,6 +64,8 @@ public class CategoryRequestService {
     private final Clock clock;
     private final InAppNotificationService inAppNotificationService;
     private final NotificationOutboxService notificationOutboxService;
+    private final CategoryIconUrls categoryIconUrls;
+    private final CategoryIconGate categoryIconGate;
 
     @Value("${app.admin-email}")
     private String adminEmail;
@@ -166,8 +170,8 @@ public class CategoryRequestService {
      *
      * <p>Cached under a single global {@code 'all'} key — the list is platform-wide.
      * Eviction: {@code CatalogCacheEvictor.evictPlatformCatalog()} after a portal approve commits (B503 D5; since B545 the only
-     * approve eviction) and the {@code @CacheEvict} on {@link InternalCategoryService#create}; reject changes no
-     * cached data. An in-flight load that started before the commit is bounded only by the 60-minute TTL, acceptable
+     * approve eviction), {@code CatalogCacheEvictor.evictPlatformCatalog()} after an icon PUT commits (B539, {@code iconUrl}) and the
+     * {@code @CacheEvict} on {@link InternalCategoryService#create}; reject changes no cached data. An in-flight load that started before the commit is bounded only by the 60-minute TTL, acceptable
      * for a low-frequency admin click.
      * {@code submitRequest} only inserts PENDING rows (not in this list) so it needs
      * no eviction.
@@ -184,7 +188,7 @@ public class CategoryRequestService {
     @Cacheable(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY, sync = true)
     public List<ApprovedCategoryResponse> listApproved() {
         return platformCategoryRepository.findApprovedActive().stream()
-                .map(ApprovedCategoryResponse::from)
+                .map(category -> ApprovedCategoryResponse.from(category, categoryIconUrls::urlFor))
                 .toList();
     }
 
@@ -225,12 +229,14 @@ public class CategoryRequestService {
     }
 
     /**
-     * The ONE decision for a locked PENDING request ({@link #approveById} / {@link #rejectById}) — B503 D1. B541 adds
-     * its approve-branch check here.
+     * The ONE decision for a locked PENDING request ({@link #approveById} / {@link #rejectById}) — B503 D1. B541
+     * (SVC-60): an approve of a category without an icon is refused ({@code CATEGORY_ICON_REQUIRED}, while
+     * {@code app.catalog.icon-required} is on) before anything is written; reject never needs an icon.
      */
     private DecisionOutcome decide(PlatformCategory category, boolean approve, String reason) {
         OffsetDateTime now = OffsetDateTime.now(clock);
         if (approve) {
+            categoryIconGate.requireIcon(category);
             category.approve(now);
             createInitialServiceSuggestion(category);
             // Same transaction as the decision (MANDATORY): the feed item commits or rolls back with it.

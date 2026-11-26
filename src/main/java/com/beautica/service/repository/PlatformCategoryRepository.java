@@ -56,6 +56,13 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
     Optional<PlatformCategory> findByName(String name);
 
     /**
+     * B539 — true when any row (any status) references this icon object key. Read by the purge-time reference check
+     * ({@code CategoryIconReferenceGuard}) on {@code blobPurgeExecutor}, outside any transaction, so it sees only
+     * committed rows.
+     */
+    boolean existsByIconKey(String iconKey);
+
+    /**
      * B502 — the row a catalog-admin request edit mutates, locked ({@code FOR UPDATE}) so the edit serialises with a
      * concurrent portal approve/reject on the same row.
      */
@@ -129,6 +136,17 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
              ORDER BY pc.displayName
             """)
     List<PlatformCategory> findApprovedIncludingHidden();
+
+    /**
+     * B540 — the icon backfill's work list: every PENDING / APPROVED category (REJECTED ones never take an icon), by
+     * wire name. Reference data (a few dozen rows), read once per operator-triggered backfill.
+     */
+    @Query("""
+            SELECT pc FROM PlatformCategory pc
+             WHERE pc.status <> com.beautica.service.entity.PlatformCategoryStatus.REJECTED
+             ORDER BY pc.name
+            """)
+    List<PlatformCategory> findAllNotRejected();
 
     /**
      * Returns all platform categories with their usage counts from

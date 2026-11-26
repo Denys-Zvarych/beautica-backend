@@ -41,9 +41,20 @@ public class PlatformCatalogDeleteService {
     private final ServiceRepository serviceRepository;
     private final ServiceTypeSuggestionRepository suggestionRepository;
 
-    /** The deleted category's catalog fields (for the caller's audit row); no requester data. */
+    /**
+     * The deleted category's catalog fields (for the caller's audit row); no requester data. {@code iconKey} (B539) is
+     * the deleted row's R2 icon object, purged by the caller after commit; {@code null} when it had no icon.
+     */
     public record CategoryDeletion(String name, String displayName, PlatformCategoryStatus status, boolean active,
-                                   @Nullable String initialServiceName, @Nullable UUID serviceCategoryId) {}
+                                   @Nullable String initialServiceName, @Nullable UUID serviceCategoryId,
+                                   @Nullable String iconKey) {
+
+        /** A deletion of a category without an icon. */
+        public CategoryDeletion(String name, String displayName, PlatformCategoryStatus status, boolean active,
+                                @Nullable String initialServiceName, @Nullable UUID serviceCategoryId) {
+            this(name, displayName, status, active, initialServiceName, serviceCategoryId, null);
+        }
+    }
 
     /** The deleted type's catalog fields (for the caller's audit row); {@code nameEn} may be {@code ""}. */
     public record ServiceTypeDeletion(UUID id, String platformCategoryName, String slug, String nameUk,
@@ -54,8 +65,8 @@ public class PlatformCatalogDeleteService {
      * naming it (inactive included) and no PENDING suggestion references it. Decided suggestions are history and stay;
      * the requester's in-app decision notification goes with the row (V196 {@code ON DELETE CASCADE}).
      *
-     * <p>B539 hook: once categories carry an R2 icon, its object key must be removed AFTER COMMIT by the caller (never
-     * inside this transaction — a rollback would orphan the row's icon reference).
+     * <p>B539: the row's R2 icon key is returned in {@link CategoryDeletion#iconKey()}; the caller removes the object
+     * AFTER COMMIT (never inside this transaction — a rollback would leave the row pointing at a deleted object).
      *
      * @throws NotFoundException               no category with this wire name
      * @throws CatalogRequestConflictException {@code CATEGORY_NOT_APPROVED} for a pending / rejected request (decide it
@@ -74,7 +85,7 @@ public class PlatformCatalogDeleteService {
                 suggestionRepository.countPendingByCategoryName(name)));
         CategoryDeletion deletion = new CategoryDeletion(category.getName(), category.getDisplayName(),
                 category.getStatus(), category.isActive(), category.getInitialServiceName(),
-                category.getServiceCategoryId());
+                category.getServiceCategoryId(), category.getIconKey());
         deleteAndFlush(() -> {
             platformCategoryRepository.delete(category);
             platformCategoryRepository.flush();

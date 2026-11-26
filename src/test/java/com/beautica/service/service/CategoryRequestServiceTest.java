@@ -1,5 +1,7 @@
 package com.beautica.service.service;
 
+import com.beautica.catalog.icon.CategoryIconUrls;
+
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.CatalogRequestConflictException;
@@ -64,6 +66,8 @@ class CategoryRequestServiceTest {
     @Mock private ServiceTypeSuggestionService serviceTypeSuggestionService;
     @Mock private InAppNotificationService inAppNotificationService;
     @Mock private NotificationOutboxService notificationOutboxService;
+    @Mock private CategoryIconUrls categoryIconUrls;
+    @Mock private com.beautica.catalog.icon.CategoryIconGate categoryIconGate;
 
     private CategoryRequestService service;
 
@@ -72,7 +76,8 @@ class CategoryRequestServiceTest {
         Clock fixedClock = Clock.fixed(NOW, ZoneOffset.UTC);
         service = new CategoryRequestService(
                 platformCategoryRepository, emailService, new AdminRequestsPortalLink("https://beautica.app"),
-                serviceTypeSuggestionService, fixedClock, inAppNotificationService, notificationOutboxService);
+                serviceTypeSuggestionService, fixedClock, inAppNotificationService, notificationOutboxService,
+                categoryIconUrls, categoryIconGate);
         ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
     }
 
@@ -433,6 +438,23 @@ class CategoryRequestServiceTest {
                     assertThat(c.name()).isEqualTo("MANICURE");
                     assertThat(c.displayName()).isEqualTo("Манікюр");
                 });
+    }
+
+    @Test
+    @DisplayName("should_mapIconUrlFromStoredKey_when_listApproved (B539)")
+    void should_mapIconUrlFromStoredKey_when_listApproved() {
+        PlatformCategory withIcon = PlatformCategory.ofApproved("MANICURE", "Манікюр");
+        withIcon.changeIcon("catalog/category-icons/MANICURE/0123456789abcdef.svg", "a".repeat(64),
+                OffsetDateTime.ofInstant(NOW, ZoneOffset.UTC));
+        PlatformCategory withoutIcon = PlatformCategory.ofApproved("PEDICURE", "Педикюр");
+        when(platformCategoryRepository.findApprovedActive()).thenReturn(List.of(withIcon, withoutIcon));
+        when(categoryIconUrls.urlFor("catalog/category-icons/MANICURE/0123456789abcdef.svg"))
+                .thenReturn("https://cdn.example/catalog/category-icons/MANICURE/0123456789abcdef.svg");
+
+        var result = service.listApproved();
+
+        assertThat(result).extracting(c -> c.iconUrl()).containsExactly(
+                "https://cdn.example/catalog/category-icons/MANICURE/0123456789abcdef.svg", null);
     }
 
     // ── phase 372: request-decision notification ──────────────────────────────
