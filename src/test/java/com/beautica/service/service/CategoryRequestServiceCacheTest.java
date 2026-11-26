@@ -1,5 +1,7 @@
 package com.beautica.service.service;
 
+import com.beautica.catalog.icon.CategoryIconGate;
+import com.beautica.catalog.icon.CategoryIconUrls;
 import com.beautica.config.CacheConfig;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
@@ -67,6 +69,8 @@ class CategoryRequestServiceCacheTest {
     @MockBean NotificationOutboxService notificationOutboxService;
     @MockBean AdminRequestsPortalLink adminRequestsPortalLink;
     @MockBean ServiceTypeSuggestionService serviceTypeSuggestionService;
+    @MockBean CategoryIconUrls categoryIconUrls;
+    @MockBean CategoryIconGate categoryIconGate;
 
     @Autowired CategoryRequestService service;
     @Autowired PlatformCategoryOrderLookup platformCategoryOrderLookup;
