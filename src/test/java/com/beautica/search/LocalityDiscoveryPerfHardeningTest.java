@@ -189,12 +189,16 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     private static final long STRICT_RESOLVE_COLD_BUDGET_MS = 500L;
 
     /**
-     * Wall-clock headroom for the shared GitHub Actions runner (B523 audit cycle 3): 1.75 when
-     * {@code GITHUB_ACTIONS=true}, else 1.0. Applies to latency gates only — the statement-count
-     * gates are deterministic and stay unscaled.
+     * Wall-clock headroom for the shared GitHub Actions runner: 2.25 when
+     * {@code GITHUB_ACTIONS=true} (CI gate ≈ 1125 ms), else 1.0. Applies to latency gates only — the
+     * statement-count gates are deterministic and stay unscaled.
+     *
+     * <p>Raised from 1.75 (B523 audit cycle 3) to 2.25 by owner decision 2026-11-26: shared GitHub
+     * runners measured ~2× local (880 / 984 ms CI medians vs ~450 ms local), so 875 ms flaked. The
+     * 500 ms local product budget is unchanged.
      */
     private static final double CI_RUNNER_FACTOR =
-            "true".equals(System.getenv("GITHUB_ACTIONS")) ? 1.75 : 1.0;
+            "true".equals(System.getenv("GITHUB_ACTIONS")) ? 2.25 : 1.0;
 
     /** The asserted cold-resolve gate: {@link #STRICT_RESOLVE_COLD_BUDGET_MS} × {@link #CI_RUNNER_FACTOR}. */
     private static final long STRICT_RESOLVE_GATE_MS = Math.round(STRICT_RESOLVE_COLD_BUDGET_MS * CI_RUNNER_FACTOR);
