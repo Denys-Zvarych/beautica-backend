@@ -71,6 +71,7 @@ public class ProviderClientService {
     private final ClientRatingSummaryService ratingSummaryService;
     private final Clock clock;
     private final ObjectMapper objectMapper;
+    private final ClientListRemovalService listRemovalService;
 
     private static final TypeReference<List<ServedMasterJson>> SERVED_MASTERS_TYPE = new TypeReference<>() {
     };
@@ -348,6 +349,52 @@ public class ProviderClientService {
                 case MasterScope(UUID masterId, UUID ignoredSalonId) ->
                         repository.existsGuestByMaster(masterId, bookingId);
             };
+        };
+    }
+
+    // ── B564: remove a client from the list / undo (CLI-82..85) ────────────────
+
+    /**
+     * Hides the client's row in the scope's list until a booking for them is created there after now (CLI-83). The
+     * identity is resolved by the card's own gate ({@link #clientInScope}): unknown / out-of-scope / anonymised /
+     * registered-anchor is the card's identical 404 (D6). Bookings, history, ratings and blocks are untouched (CLI-84,
+     * MOD-40).
+     */
+    @Transactional
+    public void removeFromList(ClientScope scope, ClientRef ref, UUID actorId) {
+        listRemovalService.remove(scope, listIdentity(scope, ref), actorId);
+    }
+
+    /** Undo (D5): the row is back at once; 204 also when nothing was removed. Same 404 gate as the removal. */
+    @Transactional
+    public void restoreToList(ClientScope scope, ClientRef ref) {
+        listRemovalService.restore(scope, listIdentity(scope, ref));
+    }
+
+    /**
+     * A registered client passes the card's gate; a guest is keyed by the anchor's E.164 phone (the value the list
+     * groups on, D3), read under the same guard in one statement. It never leaves the service.
+     */
+    private ClientListRemovalService.ListIdentity listIdentity(ClientScope scope, ClientRef ref) {
+        return switch (ref) {
+            case Registered(UUID userId) -> {
+                if (!clientInScope(scope, ref)) {
+                    throw clientNotFound();
+                }
+                yield new ClientListRemovalService.ListIdentity.User(userId);
+            }
+            case GuestAnchor(UUID bookingId) -> new ClientListRemovalService.ListIdentity.Guest(
+                    guestAnchorPhone(scope, bookingId).orElseThrow(ProviderClientService::clientNotFound));
+        };
+    }
+
+    /** The removal scope's anchor read: a salon scope checks the anchor salon-wide (the removal keys the salon). */
+    private java.util.Optional<String> guestAnchorPhone(ClientScope scope, UUID bookingId) {
+        return switch (scope) {
+            case SalonScope(UUID salonId, UUID ignoredMasterId) ->
+                    repository.findGuestAnchorPhoneBySalon(salonId, bookingId);
+            case MasterScope(UUID masterId, UUID ignoredSalonId) ->
+                    repository.findGuestAnchorPhoneByMaster(masterId, bookingId);
         };
     }
 

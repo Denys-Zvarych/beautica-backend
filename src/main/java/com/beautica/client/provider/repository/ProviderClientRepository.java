@@ -8,6 +8,7 @@ import org.springframework.data.repository.query.Param;
 import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -158,4 +159,13 @@ public interface ProviderClientRepository extends Repository<Booking, UUID> {
 
     @Query(value = ClientRatingSql.EXISTS_GUEST_MASTER, nativeQuery = true)
     boolean existsGuestByMaster(@Param("masterId") UUID masterId, @Param("bookingId") UUID bookingId);
+
+    // B564 — a guest anchor's E.164 phone in scope, one read for gate + identity (empty = uniform 404)
+
+    @Query(value = ClientRatingSql.ANCHOR_PHONE_SALON, nativeQuery = true)
+    Optional<String> findGuestAnchorPhoneBySalon(@Param("salonId") UUID salonId, @Param("bookingId") UUID bookingId);
+
+    @Query(value = ClientRatingSql.ANCHOR_PHONE_MASTER, nativeQuery = true)
+    Optional<String> findGuestAnchorPhoneByMaster(
+            @Param("masterId") UUID masterId, @Param("bookingId") UUID bookingId);
 }

@@ -8,6 +8,8 @@ import com.beautica.client.provider.repository.ClientCardRowProjection;
 import com.beautica.client.provider.repository.ClientVisitItemProjection;
 import com.beautica.client.provider.repository.ClientVisitPageRowProjection;
 import com.beautica.client.provider.repository.ProviderClientRepository;
+import com.beautica.client.provider.service.ClientListRemovalService;
+import com.beautica.client.provider.service.ClientListRemovalService.ListIdentity;
 import com.beautica.client.provider.service.ClientPhonePolicy;
 import com.beautica.client.provider.service.ClientRef;
 import com.beautica.client.provider.service.ClientScope.MasterScope;
@@ -71,6 +73,7 @@ class ProviderClientServiceTest {
     @Mock private PhoneHasher phoneHasher;
     @Mock private AuthorizationService authz;
     @Mock private com.beautica.review.service.ClientRatingSummaryService ratingSummaryService;
+    @Mock private ClientListRemovalService listRemovalService;
 
     private ProviderClientService service;
 
@@ -82,7 +85,8 @@ class ProviderClientServiceTest {
     @BeforeEach
     void setUp() {
         service = new ProviderClientService(repository, clientBlockService, phoneHasher,
-                new ClientPhonePolicy(authz), ratingSummaryService, Clock.fixed(NOW, ZoneOffset.UTC), new ObjectMapper());
+                new ClientPhonePolicy(authz), ratingSummaryService, Clock.fixed(NOW, ZoneOffset.UTC), new ObjectMapper(),
+                listRemovalService);
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────
@@ -887,5 +891,79 @@ class ProviderClientServiceTest {
 
         assertThat(card.firstName()).isEqualTo("Іванна");
         assertThat(card.lastName()).isNull();
+    }
+
+    // ── B564: remove from the list / restore (CLI-82..85) ─────────────────────
+
+    @Test
+    @DisplayName("B564: removing an in-scope registered client writes the salon-scope removal with the actor")
+    void should_removeRegisteredFromSalonList_when_clientInScope() {
+        UUID actorId = UUID.randomUUID();
+        SalonScope scope = new SalonScope(salonId, null);
+        when(repository.existsUserBySalon(salonId, userId)).thenReturn(true);
+
+        service.removeFromList(scope, new ClientRef.Registered(userId), actorId);
+
+        verify(listRemovalService).remove(scope, new ListIdentity.User(userId), actorId);
+    }
+
+    @Test
+    @DisplayName("B564: a guest anchor in the master's scope is removed by the anchor's phone")
+    void should_removeGuestByAnchorPhone_when_anchorInMasterScope() {
+        UUID actorId = UUID.randomUUID();
+        MasterScope scope = new MasterScope(masterId, salonId);
+        when(repository.findGuestAnchorPhoneByMaster(masterId, bookingId)).thenReturn(Optional.of(PHONE));
+
+        service.removeFromList(scope, new ClientRef.GuestAnchor(bookingId), actorId);
+
+        verify(listRemovalService).remove(scope, new ListIdentity.Guest(PHONE), actorId);
+        verify(repository, never()).existsGuestByMaster(any(), any());
+    }
+
+    @Test
+    @DisplayName("B564: a salon guest anchor is read salon-wide in one statement")
+    void should_removeGuestByAnchorPhone_when_anchorInSalonScope() {
+        UUID actorId = UUID.randomUUID();
+        SalonScope scope = new SalonScope(salonId, null);
+        when(repository.findGuestAnchorPhoneBySalon(salonId, bookingId)).thenReturn(Optional.of(PHONE));
+
+        service.removeFromList(scope, new ClientRef.GuestAnchor(bookingId), actorId);
+
+        verify(listRemovalService).remove(scope, new ListIdentity.Guest(PHONE), actorId);
+    }
+
+    @Test
+    @DisplayName("B564 D6: a client with no booking in scope is the card's 404 and nothing is written")
+    void should_throwNotFound_when_removingClientOutOfScope() {
+        SalonScope scope = new SalonScope(salonId, null);
+        when(repository.existsUserBySalon(salonId, userId)).thenReturn(false);
+
+        assertThatThrownBy(() -> service.removeFromList(scope, new ClientRef.Registered(userId), UUID.randomUUID()))
+                .isInstanceOf(NotFoundException.class).hasMessage("CLIENT_NOT_FOUND");
+
+        verifyNoInteractions(listRemovalService);
+    }
+
+    @Test
+    @DisplayName("B564 D6: an out-of-scope / anonymised / registered guest anchor is the card's 404")
+    void should_throwNotFound_when_guestAnchorNotInScope() {
+        MasterScope scope = new MasterScope(masterId, null);
+        when(repository.findGuestAnchorPhoneByMaster(masterId, bookingId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.restoreToList(scope, new ClientRef.GuestAnchor(bookingId)))
+                .isInstanceOf(NotFoundException.class).hasMessage("CLIENT_NOT_FOUND");
+
+        verifyNoInteractions(listRemovalService);
+    }
+
+    @Test
+    @DisplayName("B564 D5: restoring an in-scope client deletes the scope's removal")
+    void should_restoreRegistered_when_clientInScope() {
+        MasterScope scope = new MasterScope(masterId, salonId);
+        when(repository.existsUserByMaster(masterId, userId)).thenReturn(true);
+
+        service.restoreToList(scope, new ClientRef.Registered(userId));
+
+        verify(listRemovalService).restore(scope, new ListIdentity.User(userId));
     }
 }

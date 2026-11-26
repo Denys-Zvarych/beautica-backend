@@ -9,6 +9,7 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.GuestBookingSubject;
 import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.GuestVisitCancellationService;
+import com.beautica.client.provider.service.ClientListRemovalService;
 import com.beautica.common.util.UkrainianPhoneNormalizer;
 import com.beautica.moderation.service.ClientBlockService;
 import com.beautica.notification.telegram.link.TelegramLinkRetentionService;
@@ -66,6 +67,9 @@ import java.util.stream.Collectors;
  * the two sweeps skip their visit invites too. The erase also expires the phone's {@code SENT} invites (audit-fix
  * cycle 1), so an already-delivered review link stops resolving. {@code sms_opt_outs} is never touched (402 D2).
  *
+ * <p><b>List removals (B564 D3).</b> Each retention batch and the erase delete, in the anonymising transaction, the
+ * {@code client_list_removals} rows of the wiped phones that have no open guest booking left.
+ *
  * <p><b>Telegram links (phase 409).</b> Each retention batch deletes, in its own transaction and as its last statement,
  * the links of the phones it just anonymised that have no other non-anonymised booking left, under a per-phone
  * retention lock taken before that check so two instances cannot both keep the link (D1). The erase deletes the
@@ -100,6 +104,7 @@ public class GuestPiiAnonymisationService {
     private final ClientBlockService clientBlockService;
     private final GuestReviewRetentionService guestReviewRetentionService;
     private final TelegramLinkRetentionService telegramLinkRetentionService;
+    private final ClientListRemovalService clientListRemovalService;
     private final GuestPiiRetentionProperties properties;
     private final MeterRegistry meterRegistry;
     private final Clock clock;
@@ -114,6 +119,7 @@ public class GuestPiiAnonymisationService {
             ClientBlockService clientBlockService,
             GuestReviewRetentionService guestReviewRetentionService,
             TelegramLinkRetentionService telegramLinkRetentionService,
+            ClientListRemovalService clientListRemovalService,
             GuestPiiRetentionProperties properties,
             MeterRegistry meterRegistry,
             Clock clock,
@@ -126,6 +132,7 @@ public class GuestPiiAnonymisationService {
         this.clientBlockService = clientBlockService;
         this.guestReviewRetentionService = guestReviewRetentionService;
         this.telegramLinkRetentionService = telegramLinkRetentionService;
+        this.clientListRemovalService = clientListRemovalService;
         this.properties = properties;
         this.meterRegistry = meterRegistry;
         this.clock = clock;
@@ -200,7 +207,13 @@ public class GuestPiiAnonymisationService {
         List<UUID> headerIds = appointmentRepository
                 .anonymiseGuestAppointmentsOfBookings(bookingIds, GuestPii.ANONYMISED_NAME);
         anonymiseGuestReviewData(bookingIds, headerIds);
-        return new int[]{bookingIds.size(), headerIds.size(), unlinkFreedPhones(claimed)};
+        Set<String> phones = claimed.stream()
+                .map(AnonymisedGuestBooking::getGuestPhone)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        // B564 (D3) — the phones' «Клієнти» removal rows go with the PII once no open guest booking is left.
+        clientListRemovalService.purgeGuestPhones(phones);
+        return new int[]{bookingIds.size(), headerIds.size(), unlinkFreedPhones(phones)};
     }
 
     /**
@@ -209,11 +222,7 @@ public class GuestPiiAnonymisationService {
      * count), then the link delete. Atomic with the batch: a rollback keeps the rows un-anonymised, so the next run
      * re-collects the phone.
      */
-    private int unlinkFreedPhones(List<AnonymisedGuestBooking> claimed) {
-        Set<String> phones = claimed.stream()
-                .map(AnonymisedGuestBooking::getGuestPhone)
-                .filter(Objects::nonNull)
-                .collect(Collectors.toCollection(LinkedHashSet::new));
+    private int unlinkFreedPhones(Set<String> phones) {
         if (phones.isEmpty()) {
             return 0;
         }
@@ -279,6 +288,8 @@ public class GuestPiiAnonymisationService {
         // Phase 398 D7 — the phone's GUEST blocks lose their name snapshot but keep hash + last 4: an active
         // safety record, so the block keeps refusing this phone. anonymiseDue never touches blocks.
         int blocksAnonymised = clientBlockService.anonymiseGuestBlocks(phone, GuestPii.ANONYMISED_NAME);
+        // B564 (D3) — every guest row of the phone is wiped above, so all its list-removal rows go too.
+        clientListRemovalService.purgeGuestPhones(List.of(phone));
         // Phase 402 — last: the review label update clears the persistence context. sms_opt_outs is kept (402 D2).
         anonymiseGuestReviewData(anonymisedBookingIds, anonymisedVisitIds);
         // Phase 402 audit-fix (sec LOW) — the phone's already-sent review links die with the erase (SENT → EXPIRED).

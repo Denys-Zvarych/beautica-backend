@@ -2,6 +2,7 @@ package com.beautica.client.provider.controller;
 
 import com.beautica.client.provider.dto.ClientCardResponse;
 import com.beautica.client.provider.dto.ClientListItemResponse;
+import com.beautica.client.provider.dto.ClientListRemovalRequest;
 import com.beautica.client.provider.dto.ClientOwnRatingResponse;
 import com.beautica.client.provider.dto.ClientVisitResponse;
 import com.beautica.client.provider.service.ClientRef;
@@ -12,15 +13,19 @@ import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.security.AuthenticationUtils;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.web.PageableDefault;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -169,6 +174,52 @@ public class ProviderClientController {
             @PathVariable UUID bookingId, @PageableDefault(size = 20) Pageable pageable,
             Authentication authentication) {
         return ratings(myScope(authentication), new ClientRef.GuestAnchor(bookingId), pageable);
+    }
+
+    // ── B564: remove a client from the list / undo (CLI-82..86) — 204; same @PreAuthorize per family as the list ──
+    // The salon family keys the salon list (owner + admins share it, D1): no masterId here, the narrowed view reads
+    // the same salon row. /masters/me keys the caller's own master row.
+
+    @PostMapping("/salons/{salonId}/clients/removals")
+    @PreAuthorize(SALON_ACCESS)
+    public ResponseEntity<Void> removeSalonClient(
+            @PathVariable UUID salonId, @Valid @RequestBody ClientListRemovalRequest request,
+            Authentication authentication) {
+        providerClientService.removeFromList(scopeResolver.forSalon(salonId, null), ref(request),
+                AuthenticationUtils.userId(authentication));
+        return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/salons/{salonId}/clients/removals/restore")
+    @PreAuthorize(SALON_ACCESS)
+    public ResponseEntity<Void> restoreSalonClient(
+            @PathVariable UUID salonId, @Valid @RequestBody ClientListRemovalRequest request) {
+        providerClientService.restoreToList(scopeResolver.forSalon(salonId, null), ref(request));
+        return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/masters/me/clients/removals")
+    @PreAuthorize(MASTER_ACCESS)
+    public ResponseEntity<Void> removeMyClient(
+            @Valid @RequestBody ClientListRemovalRequest request, Authentication authentication) {
+        providerClientService.removeFromList(myScope(authentication), ref(request),
+                AuthenticationUtils.userId(authentication));
+        return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/masters/me/clients/removals/restore")
+    @PreAuthorize(MASTER_ACCESS)
+    public ResponseEntity<Void> restoreMyClient(
+            @Valid @RequestBody ClientListRemovalRequest request, Authentication authentication) {
+        providerClientService.restoreToList(myScope(authentication), ref(request));
+        return ResponseEntity.noContent().build();
+    }
+
+    /** The body is validated to carry exactly one id (400 otherwise). */
+    private static ClientRef ref(ClientListRemovalRequest request) {
+        return request.clientId() != null
+                ? new ClientRef.Registered(request.clientId())
+                : new ClientRef.GuestAnchor(request.guestBookingId());
     }
 
     private ApiResponse<PageResponse<ClientOwnRatingResponse>> ratings(

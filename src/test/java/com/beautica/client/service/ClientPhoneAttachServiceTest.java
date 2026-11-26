@@ -45,13 +45,15 @@ class ClientPhoneAttachServiceTest {
     @Mock private UserRepository userRepository;
     @Mock private ApplicationEventPublisher eventPublisher;
     @Mock private org.springframework.transaction.PlatformTransactionManager transactionManager;
+    @Mock private com.beautica.client.provider.service.ClientListRemovalService clientListRemovalService;
 
     private ClientPhoneAttachService service;
 
     @BeforeEach
     void setUp() {
         service = new ClientPhoneAttachService(bookingRepository, appointmentRepository, userRepository,
-                eventPublisher, Clock.fixed(NOW, ZoneOffset.UTC), transactionManager, Runnable::run);
+                eventPublisher, Clock.fixed(NOW, ZoneOffset.UTC), transactionManager, Runnable::run,
+                clientListRemovalService);
     }
 
     private static User account() {
@@ -107,6 +109,48 @@ class ClientPhoneAttachServiceTest {
 
         assertThat(attached).isZero();
         verify(eventPublisher, never()).publishEvent(any(Object.class));
+    }
+
+    @Test
+    @DisplayName("B564 — after the guest rows are attached, the attached phone is purged from list-removal rows")
+    void should_purgeTheAttachedGuestPhone_when_guestRowsAreAttached() {
+        User user = accountWithId();
+        when(userRepository.findAttachableClientByVerifiedPhone(PHONE)).thenReturn(Optional.of(user));
+        when(bookingRepository.attachGuestRowsByPhone(PHONE, user.getId(), "PHONE_VERIFIED", NOW)).thenReturn(3);
+
+        service.attachByPhone(PHONE, AttachReason.PHONE_VERIFIED);
+
+        InOrder order = inOrder(appointmentRepository, bookingRepository, clientListRemovalService);
+        order.verify(appointmentRepository).attachGuestVisitsByPhone(PHONE, user.getId(), "PHONE_VERIFIED", NOW);
+        order.verify(bookingRepository).attachGuestRowsByPhone(PHONE, user.getId(), "PHONE_VERIFIED", NOW);
+        order.verify(clientListRemovalService).purgeGuestPhones(java.util.List.of(PHONE));
+        verify(clientListRemovalService).purgeGuestPhones(java.util.List.of(PHONE));
+        org.mockito.Mockito.verifyNoMoreInteractions(clientListRemovalService);
+    }
+
+    @Test
+    @DisplayName("B564 — the owner's phone is purged even when it had no open guest rows left to attach")
+    void should_stillPurgeTheGuestPhone_when_theOwnerHasZeroRowsToAttach() {
+        User user = accountWithId();
+        when(userRepository.findAttachableClientByVerifiedPhone(PHONE)).thenReturn(Optional.of(user));
+        when(bookingRepository.attachGuestRowsByPhone(PHONE, user.getId(), "PHONE_VERIFIED", NOW)).thenReturn(0);
+
+        service.attachByPhone(PHONE, AttachReason.PHONE_VERIFIED);
+
+        InOrder order = inOrder(bookingRepository, clientListRemovalService);
+        order.verify(bookingRepository).attachGuestRowsByPhone(PHONE, user.getId(), "PHONE_VERIFIED", NOW);
+        order.verify(clientListRemovalService).purgeGuestPhones(java.util.List.of(PHONE));
+    }
+
+    @Test
+    @DisplayName("B564 — no list-removal purge when no active client owns the phone (early return, nothing attached)")
+    void should_notPurgeTheGuestPhone_when_noActiveClientOwnsThePhone() {
+        when(userRepository.findAttachableClientByVerifiedPhone(PHONE)).thenReturn(Optional.empty());
+
+        int attached = service.attachByPhone(PHONE, AttachReason.PHONE_VERIFIED);
+
+        assertThat(attached).isZero();
+        verify(clientListRemovalService, never()).purgeGuestPhones(any());
     }
 
     private static User verifiedAccount() {
@@ -187,6 +231,7 @@ class ClientPhoneAttachServiceTest {
         verify(transactionManager).rollback(status);
         verify(transactionManager, never()).commit(any());
         verify(eventPublisher, never()).publishEvent(any(Object.class));
+        verify(clientListRemovalService, never()).purgeGuestPhones(any());
     }
 
     @Test
@@ -203,6 +248,7 @@ class ClientPhoneAttachServiceTest {
         verify(appointmentRepository, never()).attachGuestVisitsByPhone(any(), any(), any(), any());
         verify(bookingRepository, never()).attachGuestRowsByPhone(any(), any(), any(), any());
         verify(eventPublisher, never()).publishEvent(any(Object.class));
+        verify(clientListRemovalService, never()).purgeGuestPhones(any());
     }
 
     @Test
@@ -281,7 +327,8 @@ class ClientPhoneAttachServiceTest {
     void should_notThrow_when_theExecutorRejectsTheAttach() {
         ClientPhoneAttachService rejecting = new ClientPhoneAttachService(bookingRepository, appointmentRepository,
                 userRepository, eventPublisher, Clock.fixed(NOW, ZoneOffset.UTC), transactionManager,
-                r -> { throw new org.springframework.core.task.TaskRejectedException("full"); });
+                r -> { throw new org.springframework.core.task.TaskRejectedException("full"); },
+                clientListRemovalService);
         User user = verifiedAccount();
 
         org.assertj.core.api.Assertions.assertThatCode(
