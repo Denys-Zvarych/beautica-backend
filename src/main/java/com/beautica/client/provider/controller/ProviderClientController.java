@@ -180,6 +180,14 @@ public class ProviderClientController {
     // The salon family keys the salon list (owner + admins share it, D1): no masterId here, the narrowed view reads
     // the same salon row. /masters/me keys the caller's own master row.
 
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "204", description = "Removed from the list (repeat = removal time moves to now)"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "400",
+                    description = "Not exactly one of clientId / guestBookingId"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "403", description = "Role not allowed"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "404",
+                    description = "No such client in the caller's list scope (same body as the client card)")
+    })
     @PostMapping("/salons/{salonId}/clients/removals")
     @PreAuthorize(SALON_ACCESS)
     public ResponseEntity<Void> removeSalonClient(
@@ -190,6 +198,14 @@ public class ProviderClientController {
         return ResponseEntity.noContent().build();
     }
 
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "204", description = "Back on the list (idempotent: also when nothing was removed)"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "400",
+                    description = "Not exactly one of clientId / guestBookingId"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "403", description = "Role not allowed"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "404",
+                    description = "No such client in the caller's list scope (same body as the client card)")
+    })
     @PostMapping("/salons/{salonId}/clients/removals/restore")
     @PreAuthorize(SALON_ACCESS)
     public ResponseEntity<Void> restoreSalonClient(
@@ -198,6 +214,14 @@ public class ProviderClientController {
         return ResponseEntity.noContent().build();
     }
 
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "204", description = "Removed from the list (repeat = removal time moves to now)"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "400",
+                    description = "Not exactly one of clientId / guestBookingId"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "403", description = "Role not allowed"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "404",
+                    description = "No such client in the caller's list scope (same body as the client card)")
+    })
     @PostMapping("/masters/me/clients/removals")
     @PreAuthorize(MASTER_ACCESS)
     public ResponseEntity<Void> removeMyClient(
@@ -207,6 +231,14 @@ public class ProviderClientController {
         return ResponseEntity.noContent().build();
     }
 
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "204", description = "Back on the list (idempotent: also when nothing was removed)"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "400",
+                    description = "Not exactly one of clientId / guestBookingId"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "403", description = "Role not allowed"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "404",
+                    description = "No such client in the caller's list scope (same body as the client card)")
+    })
     @PostMapping("/masters/me/clients/removals/restore")
     @PreAuthorize(MASTER_ACCESS)
     public ResponseEntity<Void> restoreMyClient(
