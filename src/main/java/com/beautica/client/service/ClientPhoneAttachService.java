@@ -5,6 +5,7 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.AttachReason;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.client.provider.service.ClientListRemovalService;
 import com.beautica.client.event.ClientBookingsAttachedEvent;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
@@ -63,6 +64,7 @@ public class ClientPhoneAttachService {
     private final Clock clock;
     private final PlatformTransactionManager transactionManager;
     private final TaskExecutor attachExecutor;
+    private final ClientListRemovalService clientListRemovalService;
 
     public ClientPhoneAttachService(BookingRepository bookingRepository,
                                     AppointmentRepository appointmentRepository,
@@ -70,7 +72,8 @@ public class ClientPhoneAttachService {
                                     ApplicationEventPublisher eventPublisher,
                                     Clock clock,
                                     PlatformTransactionManager transactionManager,
-                                    @Qualifier("clientPhoneAttachExecutor") TaskExecutor attachExecutor) {
+                                    @Qualifier("clientPhoneAttachExecutor") TaskExecutor attachExecutor,
+                                    ClientListRemovalService clientListRemovalService) {
         this.bookingRepository = bookingRepository;
         this.appointmentRepository = appointmentRepository;
         this.userRepository = userRepository;
@@ -78,6 +81,7 @@ public class ClientPhoneAttachService {
         this.clock = clock;
         this.transactionManager = transactionManager;
         this.attachExecutor = attachExecutor;
+        this.clientListRemovalService = clientListRemovalService;
     }
 
     /**
@@ -247,6 +251,9 @@ public class ClientPhoneAttachService {
         Instant at = clock.instant();
         appointmentRepository.attachGuestVisitsByPhone(phoneE164, clientId, reason.name(), at);
         int attached = bookingRepository.attachGuestRowsByPhone(phoneE164, clientId, reason.name(), at);
+        // B564 (CLI-E13, D3) — same transaction: the phone's guest identity is gone (its open rows now belong to the
+        // account), so no list-removal row may keep the plain phone; the account's row was never removed.
+        clientListRemovalService.purgeGuestPhones(List.of(phoneE164));
         if (attached > 0) {
             log.info("Attached {} guest booking row(s) to client {} ({})", attached, clientId, reason);
             eventPublisher.publishEvent(new ClientBookingsAttachedEvent(clientId));

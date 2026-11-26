@@ -86,6 +86,9 @@ public abstract class AbstractIntegrationTest {
         // Phase 397 (V210): client_blocks FKs masters/salons/users (CASCADE) and users (SET NULL); no FK points at
         // it. Deleted explicitly before every parent so cleanup does not rely on the FK actions (§O-7).
         jdbcTemplate.execute("DELETE FROM client_blocks");
+        // B564 (V268): client_list_removals FKs salons/masters/users (CASCADE) and users (SET NULL); no FK points at
+        // it. Deleted explicitly before every parent so cleanup does not rely on the FK actions (§O-7).
+        jdbcTemplate.execute("DELETE FROM client_list_removals");
         // Phase 399 (V213): review_invites.appointment_id FK -> appointments(id) ON DELETE CASCADE; no FK points at
         // it. V215 (phase 400 D7) adds review_invites.booking_id FK -> bookings(id) ON DELETE CASCADE, so this row also
         // stays ahead of DELETE FROM bookings. Deleted explicitly before appointments so cleanup does not rely on

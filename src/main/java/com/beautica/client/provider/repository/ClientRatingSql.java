@@ -44,9 +44,17 @@ final class ClientRatingSql {
     // guard (ClientCardSql GUEST_CLOSE_ANCHOR): in scope, client_id IS NULL, phone present, not anonymised (GST-51).
     private static final String EXISTS_OPEN = "SELECT EXISTS (SELECT 1 FROM bookings b\n";
     private static final String EXISTS_USER_CLOSE = "   AND b.client_id = :userId)";
-    private static final String EXISTS_GUEST_CLOSE = """
+    private static final String GUEST_ANCHOR_GUARD = """
                AND b.id = :bookingId AND b.client_id IS NULL AND b.guest_phone IS NOT NULL
-               AND b.guest_pii_anonymised_at IS NULL)""";
+               AND b.guest_pii_anonymised_at IS NULL""";
+    private static final String EXISTS_GUEST_CLOSE = GUEST_ANCHOR_GUARD + ")";
+
+    // B564 — the removal's guest gate + identity in ONE read: the anchor's phone, under the exact guard of the
+    // existence check above (empty = the uniform 404). Removal keys the LIST scope, so the salon form checks the
+    // anchor salon-wide (a removal never carries masterId).
+    private static final String ANCHOR_PHONE_SELECT = "SELECT b.guest_phone FROM bookings b\n";
+    static final String ANCHOR_PHONE_SALON = ANCHOR_PHONE_SELECT + SALON_WHERE + GUEST_ANCHOR_GUARD;
+    static final String ANCHOR_PHONE_MASTER = ANCHOR_PHONE_SELECT + MASTER_WHERE + GUEST_ANCHOR_GUARD;
 
     static final String EXISTS_USER_SALON = EXISTS_OPEN + SALON_WHERE + EXISTS_USER_CLOSE;
     static final String EXISTS_USER_SALON_MASTER = EXISTS_OPEN + SALON_MASTER_WHERE + EXISTS_USER_CLOSE;

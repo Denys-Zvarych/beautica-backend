@@ -69,6 +69,7 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
     @Autowired private ClientBlockService clientBlockService;
     @Autowired private ClientPhonePolicy clientPhonePolicy;
     @Autowired private ClientRatingSummaryService clientRatingSummaryService;
+    @Autowired private com.beautica.client.provider.service.ClientListRemovalService clientListRemovalService;
 
     private ProviderClientFixtures fx;
 
@@ -1064,7 +1065,7 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
         fx.booking(s.masterId(), s.salonId(), c, "CONFIRMED", later);
         ProviderClientService fixedNow = new ProviderClientService(providerClientRepository, clientBlockService,
                 phoneHasher, clientPhonePolicy, clientRatingSummaryService, Clock.fixed(now, ZoneOffset.UTC),
-                objectMapper);
+                objectMapper, clientListRemovalService);
         SalonScope scope = new SalonScope(s.salonId(), null);
 
         ClientListItemResponse row = fixedNow.listClients(scope, null, PageRequest.of(0, 20)).getContent().get(0);

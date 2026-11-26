@@ -6,6 +6,7 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.GuestBookingSubject;
 import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.GuestVisitCancellationService;
+import com.beautica.client.provider.service.ClientListRemovalService;
 import com.beautica.moderation.service.ClientBlockService;
 import com.beautica.notification.telegram.link.TelegramLinkRetentionService;
 import com.beautica.review.invite.service.GuestReviewRetentionService;
@@ -57,6 +58,7 @@ class GuestPiiAnonymisationServiceTest {
     @Mock private ClientBlockService clientBlockService;
     @Mock private GuestReviewRetentionService guestReviewRetentionService;
     @Mock private TelegramLinkRetentionService telegramLinkRetentionService;
+    @Mock private ClientListRemovalService clientListRemovalService;
     @Mock private PlatformTransactionManager transactionManager;
 
     private GuestPiiAnonymisationService service;
@@ -65,7 +67,7 @@ class GuestPiiAnonymisationServiceTest {
     void setUp() {
         service = new GuestPiiAnonymisationService(bookingRepository, appointmentRepository,
                 bookingCancellationService, guestVisitCancellationService, phoneOtpService, clientBlockService,
-                guestReviewRetentionService, telegramLinkRetentionService, null, new SimpleMeterRegistry(),
+                guestReviewRetentionService, telegramLinkRetentionService, clientListRemovalService, null, new SimpleMeterRegistry(),
                 Clock.fixed(NOW, ZoneOffset.UTC), transactionManager);
         lenient().when(telegramLinkRetentionService.eraseForPhone(anyString()))
                 .thenReturn(new TelegramLinkRetentionService.Erasure(0, 0));
@@ -93,6 +95,18 @@ class GuestPiiAnonymisationServiceTest {
 
         InOrder order = inOrder(guestReviewRetentionService, telegramLinkRetentionService);
         order.verify(guestReviewRetentionService).expireSentInvitesOfPhone("+380501234567", NOW);
+        order.verify(telegramLinkRetentionService).eraseForPhone("+380501234567");
+    }
+
+    @Test
+    @DisplayName("B564 D3: erase purges the canonical phone's list-removal rows after the booking wipe, "
+            + "before the Telegram erase")
+    void should_purgeListRemovalsOfCanonicalPhone_when_erasingByPhone() {
+        service.eraseByPhone("050 123 45 67", "SUP-4");
+
+        InOrder order = inOrder(bookingRepository, clientListRemovalService, telegramLinkRetentionService);
+        order.verify(bookingRepository).anonymiseGuestBookingsByPhone("+380501234567", GuestPii.ANONYMISED_NAME);
+        order.verify(clientListRemovalService).purgeGuestPhones(List.of("+380501234567"));
         order.verify(telegramLinkRetentionService).eraseForPhone("+380501234567");
     }
 
