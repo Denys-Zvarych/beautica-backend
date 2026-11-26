@@ -194,7 +194,7 @@ class InternalCategoryControllerTest {
     @DisplayName("POST with valid key and valid name returns 201")
     void should_return201_when_validKeyAndValidNamePosted() throws Exception {
         var created = new PlatformCategoryResponse(8L, "NAIL_ART", true);
-        when(internalCategoryService.create(any(CreatePlatformCategoryRequest.class))).thenReturn(created);
+        when(internalCategoryService.create(any(CreatePlatformCategoryRequest.class), org.mockito.ArgumentMatchers.isNull())).thenReturn(created);
 
         mockMvc.perform(post("/api/v1/internal/service-categories")
                         .servletPath("/api/v1/internal/service-categories")
@@ -210,7 +210,7 @@ class InternalCategoryControllerTest {
     @Test
     @DisplayName("POST with valid key and duplicate name returns 409")
     void should_return409_when_validKeyAndDuplicateName() throws Exception {
-        when(internalCategoryService.create(any(CreatePlatformCategoryRequest.class)))
+        when(internalCategoryService.create(any(CreatePlatformCategoryRequest.class), org.mockito.ArgumentMatchers.isNull()))
                 .thenThrow(new BusinessException(HttpStatus.CONFLICT, "Category already exists: MANICURE"));
 
         mockMvc.perform(post("/api/v1/internal/service-categories")

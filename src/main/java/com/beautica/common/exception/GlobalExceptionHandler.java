@@ -412,7 +412,24 @@ public class GlobalExceptionHandler {
                             case CATEGORY_NOT_APPROVED -> "Category is not approved";
                             case CATALOG_IN_USE -> "Catalog entry is in use; hide it instead";
                             case CATEGORY_BUSY -> "Category is being updated; please try again";
+                            case CATEGORY_REJECTED -> "Category request was rejected";
+                            case CATEGORY_ICON_REQUIRED -> "Category needs an icon first";
                         }));
+    }
+
+    /**
+     * B539 (SVC-59) — a rejected category icon upload: 400 with {@code data = {"code":"ICON_INVALID","reason":"…"}},
+     * which {@link #handleBusiness}'s genericised BAD_REQUEST branch would drop. Fixed message, never the SVG.
+     */
+    @ExceptionHandler(CategoryIconInvalidException.class)
+    public ResponseEntity<ApiResponse<CategoryIconInvalidResponse>> handleCategoryIconInvalid(
+            CategoryIconInvalidException ex) {
+        logBusiness(ex);
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(new ApiResponse<>(false,
+                        new CategoryIconInvalidResponse(CategoryIconInvalidException.ERROR_CODE, ex.getReason().name()),
+                        "Invalid category icon"));
     }
 
     /**

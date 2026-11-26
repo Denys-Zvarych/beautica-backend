@@ -37,6 +37,7 @@ class PlatformCatalogEditServiceTest {
 
     @Mock private PlatformCategoryRepository platformCategoryRepository;
     @Mock private ServiceTypeRepository serviceTypeRepository;
+    @Mock private com.beautica.catalog.icon.CategoryIconGate categoryIconGate;
 
     @InjectMocks private PlatformCatalogEditService service;
 
@@ -58,6 +59,32 @@ class PlatformCatalogEditServiceTest {
     }
 
     // ── category ───────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("B541: an unhide asks the icon gate; a refusal (gate on, no icon) leaves the category hidden")
+    void should_keepHidden_when_iconGateRefusesUnhide() {
+        PlatformCategory category = approvedCategory("Масаж ніг", false);
+        when(platformCategoryRepository.findByNameForUpdate(CATEGORY)).thenReturn(Optional.of(category));
+        org.mockito.Mockito.doThrow(new CatalogRequestConflictException(
+                        CatalogRequestConflictException.Code.CATEGORY_ICON_REQUIRED))
+                .when(categoryIconGate).requireIcon(category);
+
+        Throwable thrown = catchThrowable(() -> service.editCategory(CATEGORY, null, true));
+
+        assertThat(conflictCode(thrown)).isEqualTo(CatalogRequestConflictException.Code.CATEGORY_ICON_REQUIRED);
+        assertThat(category.isActive()).isFalse();
+    }
+
+    @Test
+    @DisplayName("B541: a hide and a rename never ask the icon gate")
+    void should_notAskIconGate_when_hideOrRename() {
+        PlatformCategory category = approvedCategory("Масаж ніг", true);
+        when(platformCategoryRepository.findByNameForUpdate(CATEGORY)).thenReturn(Optional.of(category));
+
+        service.editCategory(CATEGORY, null, false);
+
+        org.mockito.Mockito.verifyNoInteractions(categoryIconGate);
+    }
 
     @Test
     @DisplayName("rename stores the canonical (NFKC, space-collapsed) display name; the wire name never changes")

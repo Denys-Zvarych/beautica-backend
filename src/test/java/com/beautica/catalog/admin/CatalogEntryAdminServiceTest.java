@@ -8,6 +8,7 @@ import com.beautica.catalog.admin.repository.CatalogEntryQueryRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.media.service.AfterCommitBlobPurger;
 import com.beautica.service.service.PlatformCatalogEditService;
 import com.beautica.common.exception.CatalogUsage;
 import com.beautica.service.entity.PlatformCategoryStatus;
@@ -53,12 +54,14 @@ class CatalogEntryAdminServiceTest {
     @Mock private PlatformCatalogDeleteService deleteService;
     @Mock private CatalogAdminAuditService auditService;
     @Mock private CatalogCacheEvictor cacheEvictor;
+    @Mock private AfterCommitBlobPurger blobPurger;
 
     private CatalogEntryAdminService service;
 
     @BeforeEach
     void setUp() {
-        service = new CatalogEntryAdminService(queryRepository, editService, deleteService, auditService, cacheEvictor);
+        service = new CatalogEntryAdminService(queryRepository, editService, deleteService, auditService, cacheEvictor,
+                blobPurger);
     }
 
     // ── lists ──────────────────────────────────────────────────────────────────
@@ -229,6 +232,19 @@ class CatalogEntryAdminServiceTest {
         order.verify(auditService).record(ACTOR, "DELETE", CatalogAuditTargetType.CATEGORY, CATEGORY, before, null);
         order.verify(cacheEvictor).evictPlatformCatalog();
         verify(cacheEvictor, never()).evictAll();
+        verifyNoInteractions(blobPurger);
+    }
+
+    @Test
+    @DisplayName("category delete with an icon: its R2 object is handed to the after-commit purger (B539)")
+    void should_purgeIconAfterCommit_when_deletedCategoryHadIcon() {
+        String iconKey = "catalog/category-icons/" + CATEGORY + "/0123456789abcdef.svg";
+        when(deleteService.deleteCategory(CATEGORY)).thenReturn(new CategoryDeletion(CATEGORY, "Масаж ніг",
+                PlatformCategoryStatus.APPROVED, true, null, null, iconKey));
+
+        service.deleteCategory(ACTOR, CATEGORY);
+
+        verify(blobPurger).purgeAfterCommit(List.of(iconKey), "category-icon-delete");
     }
 
     @Test

@@ -8,6 +8,7 @@ import com.beautica.catalog.admin.dto.UpdateCatalogServiceTypeRequest;
 import com.beautica.catalog.admin.repository.CatalogEntryQueryRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.media.service.AfterCommitBlobPurger;
 import com.beautica.service.service.PlatformCatalogEditService;
 import com.beautica.service.service.PlatformCatalogDeleteService;
 import com.beautica.service.service.PlatformCatalogDeleteService.CategoryDeletion;
@@ -49,6 +50,7 @@ public class CatalogEntryAdminService {
     static final String UNHIDE_ACTION = "UNHIDE";
     static final String DELETE_ACTION = "DELETE";
     private static final String ACTIVE = "active";
+    private static final String ICON_PURGE_CONTEXT = "category-icon-delete";
 
     /** Same rule as {@code chk_platform_categories_name}; anything else cannot be a wire name. */
     private static final Pattern WIRE_NAME = Pattern.compile("^[A-Z][A-Z0-9_]{0,99}$");
@@ -58,6 +60,7 @@ public class CatalogEntryAdminService {
     private final PlatformCatalogDeleteService deleteService;
     private final CatalogAdminAuditService auditService;
     private final CatalogCacheEvictor cacheEvictor;
+    private final AfterCommitBlobPurger blobPurger;
 
     @Transactional(readOnly = true)
     public List<CatalogCategoryAdminDto> listCategories() {
@@ -122,6 +125,10 @@ public class CatalogEntryAdminService {
         before.put("serviceCategoryId", Objects.toString(deleted.serviceCategoryId(), null));
         auditService.record(actor, DELETE_ACTION, CatalogAuditTargetType.CATEGORY, categoryName, before, null);
         cacheEvictor.evictPlatformCatalog();
+        if (deleted.iconKey() != null) {
+            // B539: the deleted row's icon object goes only after the delete commits (a rollback keeps both).
+            blobPurger.purgeAfterCommit(List.of(deleted.iconKey()), ICON_PURGE_CONTEXT);
+        }
     }
 
     /** Deletes an unused service type (404 unknown, 409 in use). */

@@ -1,5 +1,6 @@
 package com.beautica.service.service;
 
+import com.beautica.catalog.icon.CategoryIconGate;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.common.exception.NotFoundException;
@@ -42,6 +43,7 @@ public class PlatformCatalogEditService {
 
     private final PlatformCategoryRepository platformCategoryRepository;
     private final ServiceTypeRepository serviceTypeRepository;
+    private final CategoryIconGate categoryIconGate;
 
     /** A category's editable fields before and after the edit (for the caller's audit rows). */
     public record CategoryEdit(String name, String displayNameBefore, String displayNameAfter,
@@ -97,6 +99,10 @@ public class PlatformCatalogEditService {
         }
         boolean activeAfter = active == null ? activeBefore : active;
         if (activeAfter != activeBefore) {
+            if (activeAfter) {
+                // B541 (SVC-60): an unhide makes the category live again, so it needs an icon (gate on only).
+                categoryIconGate.requireIcon(category);
+            }
             category.changeActive(activeAfter);
         }
         return new CategoryEdit(name, displayBefore, displayAfter, activeBefore, activeAfter);

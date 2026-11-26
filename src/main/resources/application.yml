@@ -778,6 +778,11 @@ app:
   # this base default is safe on every profile; prod and staging (profiles prod,staging) both read INTERNAL_CATALOG_KEY,
   # and EnvironmentFingerprintGuard requires >= 32 chars and != INTERNAL_API_KEY whenever it is set there.
   internal-catalog-key: ${INTERNAL_CATALOG_KEY:}
+  catalog:
+    # B541 (SVC-60) — category icon gate: approve / unhide / internal create without an icon → 409
+    # CATEGORY_ICON_REQUIRED. OFF by default on every profile; switch on per env only after the B540 backfill reported
+    # missing = [] there (runbook: docs/backend-phases/phase-541-category-icon-mandatory-gate.md).
+    icon-required: ${APP_CATALOG_ICON_REQUIRED:false}
   # app.internal-api-key is deliberately NOT defined in the base profile: a base default would
   # reach prod. It is mapped from INTERNAL_API_KEY in application-prod.yml (staging inherits it;
   # EnvironmentFingerprintGuard enforces non-blank, non-default, >= 32 chars) and given a dev-only

@@ -1,6 +1,10 @@
 package com.beautica.service.service;
 
+import com.beautica.catalog.admin.AdminActor;
+import com.beautica.catalog.icon.CategoryIconGate;
+import com.beautica.catalog.icon.CategoryIconService;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.dto.CreatePlatformCategoryRequest;
 import com.beautica.service.dto.PlatformCategoryResponse;
@@ -11,6 +15,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Caching;
 import org.springframework.http.HttpStatus;
+import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -27,6 +32,8 @@ import java.util.List;
 public class InternalCategoryService {
 
     private final PlatformCategoryRepository platformCategoryRepository;
+    private final CategoryIconGate categoryIconGate;
+    private final CategoryIconService categoryIconService;
 
     /**
      * Returns all platform categories with their current usage counts from
@@ -56,15 +63,44 @@ public class InternalCategoryService {
             @CacheEvict(value = SearchSuggestionCatalogue.CACHE_NAME, allEntries = true)
     })
     public PlatformCategoryResponse create(CreatePlatformCategoryRequest request) {
+        return create(request, null);
+    }
+
+    /**
+     * B541 (SVC-60) — {@link #create(CreatePlatformCategoryRequest)} with an optional icon: when {@code svg} is present
+     * the row and the icon are written in ONE transaction via {@link CategoryIconService#createWithIcon} (audited as
+     * {@code actorHeader}, which is then required — 400 when missing / invalid); any icon failure rolls the create
+     * back. The icon's R2 PUT runs BEFORE that transaction opens, so no connection or row lock is held across it
+     * (hence no {@code @Transactional} here; without an icon the single {@code save} is its own transaction). Without
+     * {@code svg} the create is refused with 409 {@code CATEGORY_ICON_REQUIRED} while the icon gate is on.
+     *
+     * <p>Cache eviction: exactly once, by the {@code @CacheEvict}s below, after the method returns (both paths have
+     * committed by then); {@code createWithIcon} itself evicts nothing.
+     */
+    @Caching(evict = {
+            @CacheEvict(value = CategoryRequestService.APPROVED_CATEGORIES_CACHE,
+                    key = CategoryRequestService.APPROVED_CATEGORIES_KEY),
+            @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY),
+            @CacheEvict(value = PlatformCategoryOrderLookup.LABELS_CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY),
+            @CacheEvict(value = SearchSuggestionCatalogue.CACHE_NAME, allEntries = true)
+    })
+    public PlatformCategoryResponse create(CreatePlatformCategoryRequest request, @Nullable String actorHeader) {
         if (platformCategoryRepository.existsByNameIgnoreCase(request.name())) {
             throw BusinessException.withUserInput(HttpStatus.CONFLICT, "Category already exists: " + request.name());
+        }
+        AdminActor actor = request.svg() == null ? null : AdminActor.of(actorHeader);
+        if (actor == null && categoryIconGate.isEnabled()) {
+            throw new CatalogRequestConflictException(CatalogRequestConflictException.Code.CATEGORY_ICON_REQUIRED);
         }
 
         // Ops-created categories are immediately usable: APPROVED + active. The
         // internal CRUD DTO carries no display name, so the wire name doubles as the
         // display label (same fallback as the V65 backfill for legacy ops rows).
         PlatformCategory category = PlatformCategory.ofApproved(request.name(), request.name());
-        PlatformCategory saved = platformCategoryRepository.save(category);
-        return PlatformCategoryResponse.from(saved);
+        if (actor == null) {
+            return PlatformCategoryResponse.from(platformCategoryRepository.save(category));
+        }
+        return categoryIconService.createWithIcon(request.name(), request.svg(), actor,
+                () -> PlatformCategoryResponse.from(platformCategoryRepository.save(category)));
     }
 }

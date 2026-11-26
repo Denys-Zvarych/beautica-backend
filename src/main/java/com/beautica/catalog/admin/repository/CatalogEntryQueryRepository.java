@@ -2,9 +2,11 @@ package com.beautica.catalog.admin.repository;
 
 import com.beautica.catalog.admin.dto.CatalogCategoryAdminDto;
 import com.beautica.catalog.admin.dto.CatalogServiceTypeAdminDto;
+import com.beautica.catalog.icon.CategoryIconUrls;
 import com.beautica.service.entity.PlatformCategoryStatus;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Repository;
 
 import java.util.List;
@@ -18,12 +20,14 @@ import java.util.UUID;
  * category holds at most a few dozen types; the caller is the key-only internal portal.
  */
 @Repository
+@RequiredArgsConstructor
 public class CatalogEntryQueryRepository {
 
     private static final String CATEGORIES_SQL = """
             SELECT pc.name, pc.display_name, pc.status, pc.active,
                    (SELECT COUNT(*) FROM service_definitions sd WHERE sd.category = pc.name) AS usage_count,
-                   (SELECT COUNT(*) FROM service_types st WHERE st.platform_category_name = pc.name) AS type_count
+                   (SELECT COUNT(*) FROM service_types st WHERE st.platform_category_name = pc.name) AS type_count,
+                   pc.icon_key
               FROM platform_categories pc
              ORDER BY pc.display_name, pc.name
             """;
@@ -39,6 +43,9 @@ public class CatalogEntryQueryRepository {
     private static final String CATEGORY_EXISTS_SQL =
             "SELECT EXISTS (SELECT 1 FROM platform_categories WHERE name = :name)";
 
+    /** B539 — {@code icon_key} → {@code iconUrl} at read time (track D8). */
+    private final CategoryIconUrls iconUrls;
+
     @PersistenceContext
     private EntityManager entityManager;
 
@@ -53,7 +60,8 @@ public class CatalogEntryQueryRepository {
                         PlatformCategoryStatus.valueOf((String) row[2]),
                         (Boolean) row[3],
                         ((Number) row[4]).longValue(),
-                        ((Number) row[5]).longValue()))
+                        ((Number) row[5]).longValue(),
+                        iconUrls.urlFor((String) row[6])))
                 .toList();
     }
 

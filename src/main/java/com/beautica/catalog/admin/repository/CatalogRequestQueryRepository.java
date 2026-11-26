@@ -3,8 +3,10 @@ package com.beautica.catalog.admin.repository;
 import com.beautica.catalog.admin.CatalogRequestKind;
 import com.beautica.catalog.admin.CatalogRequestStatus;
 import com.beautica.catalog.admin.dto.CatalogRequestDto;
+import com.beautica.catalog.icon.CategoryIconUrls;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Repository;
 
 import java.sql.Timestamp;
@@ -22,6 +24,7 @@ import java.util.List;
  * {@code users.email} or {@code users.phone}. Bounded by the caller's {@code Pageable} (global cap 100).
  */
 @Repository
+@RequiredArgsConstructor
 public class CatalogRequestQueryRepository {
 
     /** Requester label when no user / name resolves (same placeholder as the request notification emails). */
@@ -31,13 +34,13 @@ public class CatalogRequestQueryRepository {
             SELECT 'CATEGORY' AS kind, CAST(pc.id AS text) AS id, pc.name AS name, pc.display_name AS display_name,
                    CAST(NULL AS text) AS category_name, pc.initial_service_name AS initial_service_name,
                    CAST(NULL AS text) AS description, pc.requested_by_user_id AS requester_id,
-                   pc.created_at AS created_at, pc.status AS status
+                   pc.created_at AS created_at, pc.status AS status, pc.icon_key AS icon_key
               FROM platform_categories pc
              WHERE pc.status = :status AND pc.requested_at IS NOT NULL
             UNION ALL
             SELECT 'SERVICE_TYPE', CAST(s.id AS text), s.suggested_name, CAST(NULL AS text),
                    s.category_name, CAST(NULL AS text), s.description, s.requested_by_user_id,
-                   s.created_at, s.status
+                   s.created_at, s.status, CAST(NULL AS text)
               FROM service_type_suggestion s
              WHERE s.status = :status
             """;
@@ -50,7 +53,7 @@ public class CatalogRequestQueryRepository {
                        NULLIF(btrim(concat_ws(' ', u.first_name, u.last_name)), ''),
                        (SELECT ws.name FROM salons ws WHERE ws.id = u.salon_id),
                        :unknown) AS requester_label,
-                   r.created_at, r.status
+                   r.created_at, r.status, r.icon_key
               FROM (%s) r
               LEFT JOIN users u ON u.id = r.requester_id
              ORDER BY r.created_at, r.kind, r.id
@@ -62,6 +65,9 @@ public class CatalogRequestQueryRepository {
                      WHERE pc.status = :status AND pc.requested_at IS NOT NULL)
                  + (SELECT COUNT(*) FROM service_type_suggestion s WHERE s.status = :status)
             """;
+
+    /** B539 — {@code icon_key} → {@code iconUrl} at read time (track D8). */
+    private final CategoryIconUrls iconUrls;
 
     @PersistenceContext
     private EntityManager entityManager;
@@ -75,7 +81,7 @@ public class CatalogRequestQueryRepository {
                 .setParameter("limit", limit)
                 .setParameter("offset", offset)
                 .getResultList();
-        return rows.stream().map(CatalogRequestQueryRepository::toDto).toList();
+        return rows.stream().map(this::toDto).toList();
     }
 
     public long count(CatalogRequestStatus status) {
@@ -85,7 +91,7 @@ public class CatalogRequestQueryRepository {
         return total.longValue();
     }
 
-    private static CatalogRequestDto toDto(Object[] row) {
+    private CatalogRequestDto toDto(Object[] row) {
         return new CatalogRequestDto(
                 CatalogRequestKind.valueOf((String) row[0]),
                 (String) row[1],
@@ -96,7 +102,8 @@ public class CatalogRequestQueryRepository {
                 (String) row[6],
                 (String) row[7],
                 toInstant(row[8]),
-                CatalogRequestStatus.valueOf((String) row[9]));
+                CatalogRequestStatus.valueOf((String) row[9]),
+                iconUrls.urlFor((String) row[10]));
     }
 
     /** Hibernate 6 maps {@code timestamptz} in a native result to {@code OffsetDateTime} or {@code Instant} by config. */

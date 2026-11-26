@@ -41,6 +41,7 @@ import static org.springframework.security.test.web.servlet.request.SecurityMock
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -59,8 +60,10 @@ class CategoryRequestControllerTest {
                     .csrf(AbstractHttpConfigurer::disable)
                     .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                     .authorizeHttpRequests(auth -> auth
-                            // GET /approved and POST /requests both require authentication;
-                            // role enforcement on /requests is via @PreAuthorize.
+                            // Mirrors SecurityConfig: GET /approved is public (B539 / W050); POST /requests
+                            // requires authentication, role enforcement via @PreAuthorize.
+                            .requestMatchers(org.springframework.http.HttpMethod.GET,
+                                    "/api/v1/service-categories/approved").permitAll()
                             .anyRequest().authenticated())
                     .exceptionHandling(ex -> ex
                             .authenticationEntryPoint((req, res, exc) ->
@@ -211,16 +214,25 @@ class CategoryRequestControllerTest {
 
     // ── GET /approved ─────────────────────────────────────────────────────────
 
+    /** B539 audit: browser revalidates, CDN may share for 5 min; the body is identical for every caller. */
+    private static final String APPROVED_CACHE_CONTROL = "max-age=0, public, s-maxage=300";
+
     @Test
-    @DisplayName("should_return401_when_unauthenticatedListsApproved")
-    void should_return401_when_unauthenticatedListsApproved() throws Exception {
+    @DisplayName("GET /approved anonymous (B539 / W050: public) — 200 with iconUrl and the shared Cache-Control")
+    void should_return200WithIconUrl_when_anonymousListsApproved() throws Exception {
+        when(categoryRequestService.listApproved()).thenReturn(List.of(new ApprovedCategoryResponse("MANICURE",
+                "Манікюр", "https://cdn.example/catalog/category-icons/MANICURE/0123456789abcdef.svg")));
+
         mockMvc.perform(get("/api/v1/service-categories/approved")
                         .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isUnauthorized());
+                .andExpect(status().isOk())
+                .andExpect(header().string("Cache-Control", APPROVED_CACHE_CONTROL))
+                .andExpect(jsonPath("$.data[0].iconUrl")
+                        .value("https://cdn.example/catalog/category-icons/MANICURE/0123456789abcdef.svg"));
     }
 
     @Test
-    @DisplayName("should_return200WithList_when_authenticatedListsApproved")
+    @DisplayName("GET /approved as a CLIENT — 200 with name / displayName and the same Cache-Control")
     void should_return200WithList_when_authenticatedListsApproved() throws Exception {
         when(categoryRequestService.listApproved())
                 .thenReturn(List.of(new ApprovedCategoryResponse("MANICURE", "Манікюр")));
@@ -231,6 +243,7 @@ class CategoryRequestControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data[0].name").value("MANICURE"))
-                .andExpect(jsonPath("$.data[0].displayName").value("Манікюр"));
+                .andExpect(jsonPath("$.data[0].displayName").value("Манікюр"))
+                .andExpect(header().string("Cache-Control", APPROVED_CACHE_CONTROL));
     }
 }

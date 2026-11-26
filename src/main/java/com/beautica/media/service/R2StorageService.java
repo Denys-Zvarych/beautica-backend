@@ -139,6 +139,18 @@ public class R2StorageService {
      *                           the original {@link S3Exception} / {@link SdkClientException}
      */
     public void uploadFile(String key, InputStream content, long contentLength, String contentType) {
+        uploadFile(key, content, contentLength, contentType, IMMUTABLE_CACHE_CONTROL);
+    }
+
+    /**
+     * B539 — {@link #uploadFile(String, InputStream, long, String)} with an explicit {@code Cache-Control}, for a
+     * caller whose keys carry their own content hash (category icons: {@code public, max-age=31536000, immutable}).
+     * Same disabled-mode and failure contract.
+     *
+     * @param cacheControl the {@code Cache-Control} value stored on the object; a fixed constant, never caller input
+     */
+    public void uploadFile(String key, InputStream content, long contentLength, String contentType,
+                           String cacheControl) {
         if (!r2Enabled) {
             // Key encodes the user UUID — omit from WARN log to avoid PII in log aggregators.
             log.warn("uploadFile(key=[key omitted], size={}B){}", contentLength, DISABLED_SUFFIX);
@@ -150,7 +162,7 @@ public class R2StorageService {
                 .key(key)
                 .contentType(contentType)
                 .contentLength(contentLength)
-                .cacheControl(IMMUTABLE_CACHE_CONTROL)
+                .cacheControl(cacheControl)
                 .build();
 
         try {

@@ -178,6 +178,12 @@ public class SecurityConfig {
                     // bookable masters before authenticating to book.
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/services/{serviceDefId}/masters").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories").permitAll();
+                    // B539 / W050 — the approved category picker list {name, displayName, iconUrl} is public catalogue
+                    // data (no id, requester or owner field); the website's booking pages read it anonymously for
+                    // the category icons. Exact path, GET only; anonymous callers are throttled per IP on
+                    // catalogueBrowseBuckets (AuthRateLimitFilter), the result is the sync=true approved-categories
+                    // cache. POST /requests stays authenticated (role-gated).
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories/approved").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-types").permitAll();
                     // Phase 437 — app version compatibility config (env-backed, no PII, identical for every
                     // caller). Exact path; anonymous callers are throttled per IP on catalogueBrowseBuckets.
@@ -185,8 +191,8 @@ public class SecurityConfig {
                     // B545 (SVC-61) — the retired emailed category-request review / approve / reject links. They
                     // stay anonymous so a link in an email sent before the deploy reaches the 410 «use the portal»
                     // page (RetiredCatalogRequestLinksController); the handlers read no token and take no decision.
-                    // POST /requests (provider role-gated) and GET /approved (any authenticated user) are NOT
-                    // listed here and fall through to anyRequest().authenticated().
+                    // POST /requests (provider role-gated) is NOT listed here and falls through to
+                    // anyRequest().authenticated(); GET /approved is public since B539 (above).
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories/requests/review/*").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-categories/requests/approve").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-categories/requests/reject").permitAll();

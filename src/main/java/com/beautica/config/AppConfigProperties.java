@@ -48,7 +48,8 @@ import org.springframework.context.annotation.Configuration;
         AuthConsentProperties.class,
         AppCheckProperties.class,
         InviteSmsPolicyConfig.class,
-        AuthLimitsProperties.class
+        AuthLimitsProperties.class,
+        CatalogIconProperties.class
 })
 public class AppConfigProperties {
 }
