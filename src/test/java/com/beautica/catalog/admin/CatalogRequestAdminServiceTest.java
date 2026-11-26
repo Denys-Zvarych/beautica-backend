@@ -154,7 +154,7 @@ class CatalogRequestAdminServiceTest {
     // ── approve / reject (B503) ────────────────────────────────────────────────
 
     @Test
-    @DisplayName("approve SERVICE_TYPE → decide by id, then APPROVE audit {status}, then evict every catalog cache")
+    @DisplayName("approve SERVICE_TYPE → decide by id, then APPROVE audit {status}, then evict the platform catalog (not per-master caches)")
     void should_decideAuditThenEvict_when_suggestionApproved() {
         UUID id = UUID.randomUUID();
 
@@ -164,7 +164,8 @@ class CatalogRequestAdminServiceTest {
         order.verify(suggestionService).approveById(id);
         order.verify(auditService).record(ACTOR, "APPROVE", CatalogAuditTargetType.TYPE_SUGGESTION, id.toString(),
                 Map.of("status", "PENDING"), Map.of("status", "APPROVED"));
-        order.verify(cacheEvictor).evictAll();
+        order.verify(cacheEvictor).evictPlatformCatalog();
+        verify(cacheEvictor, never()).evictAll();
         verifyNoInteractions(categoryRequestService);
     }
 
@@ -176,7 +177,8 @@ class CatalogRequestAdminServiceTest {
         verify(categoryRequestService).approveById(77L);
         verify(auditService).record(ACTOR, "APPROVE", CatalogAuditTargetType.CATEGORY_REQUEST, "77",
                 Map.of("status", "PENDING"), Map.of("status", "APPROVED"));
-        verify(cacheEvictor).evictAll();
+        verify(cacheEvictor).evictPlatformCatalog();
+        verify(cacheEvictor, never()).evictAll();
     }
 
     @Test

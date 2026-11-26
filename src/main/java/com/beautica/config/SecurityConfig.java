@@ -45,13 +45,6 @@ public class SecurityConfig {
     /** BCrypt cost factor; {@code AuthService.DUMMY_PASSWORD_HASH} must be hashed at the same cost. */
     public static final int BCRYPT_STRENGTH = 10;
 
-    /** Same-origin POSTs from the server-rendered admin review pages; see {@link #corsConfigurationSource()}. */
-    private static final List<String> REVIEW_POST_PATHS = List.of(
-            "/api/v1/service-categories/requests/approve",
-            "/api/v1/service-categories/requests/reject",
-            "/api/v1/service-types/suggestions/approve",
-            "/api/v1/service-types/suggestions/reject");
-
     /**
      * Phase 414: the moderation-action confirm form (moderation-action-confirm.html) posts here. Own CORS entry that
      * admits ONLY the API's public origin (the page is served by this backend; the website never posts here).
@@ -189,23 +182,17 @@ public class SecurityConfig {
                     // Phase 437 — app version compatibility config (env-backed, no PII, identical for every
                     // caller). Exact path; anonymous callers are throttled per IP on catalogueBrowseBuckets.
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/app/config").permitAll();
-                    // Self-service category approval pages — token-authenticated
-                    // (the unguessable single-use token IS the credential), so the
-                    // routes are permitAll at the Spring Security layer. The GET
-                    // review page performs NO state change; only the POST
-                    // approve/reject mutate. POST /requests (provider role-gated)
-                    // and GET /approved (any authenticated user) are NOT listed
-                    // here and fall through to anyRequest().authenticated().
-                    // Token rides as the trailing path segment (review/{token}) to keep
-                    // it out of the email-link query string (proxy/Referer log exposure).
+                    // B545 (SVC-61) — the retired emailed category-request review / approve / reject links. They
+                    // stay anonymous so a link in an email sent before the deploy reaches the 410 «use the portal»
+                    // page (RetiredCatalogRequestLinksController); the handlers read no token and take no decision.
+                    // POST /requests (provider role-gated) and GET /approved (any authenticated user) are NOT
+                    // listed here and fall through to anyRequest().authenticated().
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories/requests/review/*").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-categories/requests/approve").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-categories/requests/reject").permitAll();
-                    // Phase 16.8 service-type suggestion review pages — token-authenticated
-                    // (the unguessable single-use token IS the credential), identical to the
-                    // category-request review routes above. GET review performs NO state
-                    // change; only the POST approve/reject mutate. POST /service-types/suggest
-                    // (provider role-gated) is NOT listed and falls through to authenticated().
+                    // B545 — the retired service-type suggestion links, same 410 treatment as above.
+                    // POST /service-types/suggest (provider role-gated) is NOT listed and falls through to
+                    // authenticated().
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-types/suggestions/review").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-types/suggestions/approve").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-types/suggestions/reject").permitAll();
@@ -347,16 +334,11 @@ public class SecurityConfig {
         config.setMaxAge(3600L);
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
         // Registered BEFORE "/**": UrlBasedCorsConfigurationSource uses the first matching pattern.
-        // The server-rendered admin review pages post to a relative path, so the browser sends
+        // The server-rendered moderation confirm page posts to a relative path, so the browser sends
         // Origin = this API's own public origin. Behind Railway's TLS proxy the app sees http
         // (forward-headers-strategy is deliberately unset), so CorsUtils treats it as cross-origin.
-        CorsConfiguration reviewPost = new CorsConfiguration();
-        reviewPost.setAllowedOrigins(List.of(publicBaseUrlProperties.getPublicBaseUrl(), frontendBaseUrl));
-        reviewPost.setAllowedMethods(List.of("POST"));
-        reviewPost.setAllowCredentials(false);
-        for (String path : REVIEW_POST_PATHS) {
-            source.registerCorsConfiguration(path, reviewPost);
-        }
+        // (B545 removed the former admin review-page POST entry: those pages are gone and the retired
+        // POSTs answer 410 under the default "/**" policy.)
         CorsConfiguration moderationConfirm = new CorsConfiguration();
         moderationConfirm.setAllowedOrigins(List.of(publicBaseUrlProperties.getPublicBaseUrl()));
         moderationConfirm.setAllowedMethods(List.of("POST"));

@@ -18,8 +18,10 @@ import java.util.UUID;
  * Materializes an APPROVED {@link ServiceTypeSuggestion} into a real, catalog-level
  * {@link ServiceType} under the approved platform category (Phase 16.9, Option A —
  * <strong>catalog-only</strong>; this reverses the earlier Option B "auto-create draft
- * master service" behaviour). The suggestion service owns the token/decision lifecycle;
- * this collaborator performs ONLY the catalog write, idempotently.
+ * master service" behaviour). Approve/reject decisions are taken by
+ * {@code ServiceTypeSuggestionService.approveById}/{@code rejectById} (admin portal); this
+ * collaborator performs ONLY the catalog write — it creates or reuses a catalog
+ * {@link ServiceType}, idempotently.
  *
  * <p>On approval this creates (or reuses) exactly one {@link ServiceType} under the approved
  * platform category — reusing an existing active type with the same category +
@@ -36,7 +38,7 @@ import java.util.UUID;
  * System-A bucket (seeded V13) so the NOT NULL is satisfied without any migration.
  *
  * <p><strong>Transaction.</strong> MUST run inside the caller's transaction
- * ({@code ServiceTypeSuggestionService.approve}) so a promotion failure rolls back the
+ * ({@code ServiceTypeSuggestionService.approveById}) so a promotion failure rolls back the
  * APPROVED flip — no "approved but not created" split-brain.
  *
  * <p><strong>Requester resolution.</strong> The requester identity is irrelevant under

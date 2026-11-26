@@ -1,7 +1,6 @@
 package com.beautica.catalog.admin;
 
 import com.beautica.AbstractIntegrationTest;
-import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.service.service.ServiceTypeSuggestionService;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -50,7 +49,6 @@ class CatalogDeleteSuggestionRaceIT extends AbstractIntegrationTest {
     @Autowired private ObjectMapper objectMapper;
     @Autowired private JdbcTemplate jdbcTemplate;
     @Autowired private PasswordEncoder passwordEncoder;
-    @Autowired private TokenGenerator tokenGenerator;
     @Autowired private PlatformTransactionManager transactionManager;
     @Autowired private ServiceTypeSuggestionService suggestionService;
     @Autowired private CatalogEntryAdminService adminService;
@@ -60,7 +58,7 @@ class CatalogDeleteSuggestionRaceIT extends AbstractIntegrationTest {
 
     @BeforeEach
     void seed() {
-        fixture = new CatalogRequestFixture(jdbcTemplate, passwordEncoder, tokenGenerator);
+        fixture = new CatalogRequestFixture(jdbcTemplate, passwordEncoder);
         fixture.insertCategory(CATEGORY, "Іт505 гоночна категорія", "APPROVED", null,
                 Instant.parse("2020-01-01T10:00:00Z"));
         race = new HeldTransactionRace(transactionManager, jdbcTemplate);

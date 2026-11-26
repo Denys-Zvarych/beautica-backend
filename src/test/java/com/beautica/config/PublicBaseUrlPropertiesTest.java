@@ -16,8 +16,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Pins the fail-fast contract on {@link PublicBaseUrlProperties#getPublicBaseUrl()}.
  *
- * <p>{@code submitRequest} builds the admin approval link as
- * {@code publicBaseUrl + REVIEW_PATH + rawToken}. A null/blank base URL would email a
+ * <p>Links to pages served by this backend (e.g. the moderation action links) are built as
+ * {@code publicBaseUrl + path + rawToken}. A null/blank base URL would email a
  * {@code "null/..."}-prefixed broken link. The property is {@code @NotBlank} on a
  * {@code @Validated @ConfigurationProperties} bean, so a blank value fails binding at
  * application startup rather than silently shipping a broken link. These tests assert

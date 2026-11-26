@@ -179,13 +179,12 @@ class ResponseCompressionIT extends AbstractIntegrationTest {
     /**
      * Pins the BREACH-hardening scope decision: {@code text/html} was REMOVED from
      * {@code server.compression.mime-types} (formerly
-     * {@code application/json,application/problem+json,text/html,text/plain}). The Thymeleaf
-     * review pages co-locate a 32-byte review token with an attacker-chosen {@code displayName}
-     * in one compressible body — a textbook BREACH oracle — so they must ship uncompressed.
+     * {@code application/json,application/problem+json,text/html,text/plain}). The former Thymeleaf
+     * review pages (retired by B545) co-located a review token with an attacker-chosen {@code displayName}
+     * in one compressible body — a textbook BREACH oracle — so HTML pages must ship uncompressed.
      *
-     * <p>The probe is the permitAll token-review page hit with a well-formed but unknown token:
-     * {@code loadForReview} returns an invalid view and the handler renders the {@code text/html}
-     * neutral-status page — no auth fixture, no DB row, unaffected by {@code cleanDb()}. Because
+     * <p>The probe is a retired (B545) permitAll review link with a well-formed token: it renders the
+     * {@code text/html} 410 «use the portal» page — no auth fixture, no DB row, unaffected by {@code cleanDb()}. Because
      * the threshold is inert for chunked bodies (see the test above), size is irrelevant here: the
      * ONLY thing keeping {@code Content-Encoding} off this response is the mime-types narrowing.
      * Re-widen {@code mime-types} to include {@code text/html} and this test flips red — which is
@@ -207,7 +206,7 @@ class ResponseCompressionIT extends AbstractIntegrationTest {
                 .matches(ct -> ct.isCompatibleWith(MediaType.TEXT_HTML));
         assertThat(response.getHeaders().getFirst(HttpHeaders.CONTENT_ENCODING))
                 .as("text/html is intentionally OUT of server.compression.mime-types; a re-widening "
-                        + "reopens the BREACH oracle on the token-review pages")
+                        + "reopens the BREACH oracle for any page pairing a secret with attacker-chosen text")
                 .isNull();
     }
 

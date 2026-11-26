@@ -142,8 +142,7 @@ class PlatformCatalogEditServiceTest {
     @Test
     @DisplayName("a PENDING request row is 409 CATEGORY_NOT_APPROVED and stays inactive")
     void should_throwCategoryNotApproved_when_categoryIsPendingRequest() {
-        PlatformCategory pending = PlatformCategory.ofPendingRequest(CATEGORY, "Масаж ніг", UUID.randomUUID(),
-                "hash", OffsetDateTime.parse("2026-11-01T10:00:00Z"), OffsetDateTime.parse("2026-11-08T10:00:00Z"),
+        PlatformCategory pending = PlatformCategory.ofPendingRequest(CATEGORY, "Масаж ніг", UUID.randomUUID(), OffsetDateTime.parse("2026-11-01T10:00:00Z"),
                 null);
         when(platformCategoryRepository.findByNameForUpdate(CATEGORY)).thenReturn(Optional.of(pending));
 

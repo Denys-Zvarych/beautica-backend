@@ -1,7 +1,6 @@
 package com.beautica.catalog.admin;
 
 import com.beautica.AbstractIntegrationTest;
-import com.beautica.auth.TokenGenerator;
 import com.beautica.catalog.CatalogCacheEvictor;
 import com.beautica.service.ServiceTestFixtures;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -60,7 +59,6 @@ class InternalCatalogDeleteIT extends AbstractIntegrationTest {
     @Autowired private ObjectMapper objectMapper;
     @Autowired private JdbcTemplate jdbcTemplate;
     @Autowired private PasswordEncoder passwordEncoder;
-    @Autowired private TokenGenerator tokenGenerator;
     @Autowired private CatalogCacheEvictor cacheEvictor;
     @Autowired private CatalogEntryAdminService adminService;
     @Autowired private PlatformTransactionManager transactionManager;
@@ -71,7 +69,7 @@ class InternalCatalogDeleteIT extends AbstractIntegrationTest {
 
     @BeforeEach
     void seed() {
-        fixture = new CatalogRequestFixture(jdbcTemplate, passwordEncoder, tokenGenerator);
+        fixture = new CatalogRequestFixture(jdbcTemplate, passwordEncoder);
         serviceFixtures = new ServiceTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
         fixture.insertCategory(CATEGORY, "Іт505 категорія", "APPROVED", null, CREATED);
         fixture.insertCategory(CATEGORY_2, "Іт505 друга категорія", "APPROVED", null, CREATED);

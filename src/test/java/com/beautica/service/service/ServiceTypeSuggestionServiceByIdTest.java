@@ -1,9 +1,7 @@
 package com.beautica.service.service;
 
-import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.CatalogRequestConflictException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
@@ -38,8 +36,7 @@ import static org.mockito.Mockito.when;
 
 /**
  * B503 — {@link ServiceTypeSuggestionService#approveById} / {@link ServiceTypeSuggestionService#rejectById}: the locked
- * by-id front end of the shared decision. Kept apart from {@code ServiceTypeSuggestionServiceTest} so that file (the
- * token-path guard) stays byte-for-byte unchanged.
+ * by-id front end of the shared decision. Kept apart from {@code ServiceTypeSuggestionServiceTest}.
  */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("ServiceTypeSuggestionService — decision by id (unit)")
@@ -51,9 +48,7 @@ class ServiceTypeSuggestionServiceByIdTest {
 
     @Mock private ServiceTypeSuggestionRepository suggestionRepository;
     @Mock private PlatformCategoryRepository platformCategoryRepository;
-    @Mock private TokenGenerator tokenGenerator;
     @Mock private EmailService emailService;
-    @Mock private PublicBaseUrlProperties publicBaseUrlProperties;
     @Mock private ServiceTypePromotionService promotionService;
     @Mock private InAppNotificationService inAppNotificationService;
     @Mock private NotificationOutboxService notificationOutboxService;
@@ -62,22 +57,22 @@ class ServiceTypeSuggestionServiceByIdTest {
 
     @BeforeEach
     void setUp() {
-        service = new ServiceTypeSuggestionService(suggestionRepository, platformCategoryRepository, tokenGenerator, emailService,
-                publicBaseUrlProperties, promotionService, Clock.fixed(NOW, ZoneOffset.UTC), inAppNotificationService,
+        service = new ServiceTypeSuggestionService(suggestionRepository, platformCategoryRepository, emailService,
+                new AdminRequestsPortalLink("https://beautica.app"), promotionService, Clock.fixed(NOW, ZoneOffset.UTC), inAppNotificationService,
                 notificationOutboxService);
         ReflectionTestUtils.setField(service, "adminEmail", "admin@beautica.test");
     }
 
     private ServiceTypeSuggestion pending(UUID requester, OffsetDateTime expiresAt) {
         ServiceTypeSuggestion suggestion =
-                ServiceTypeSuggestion.ofPending("HAIR", "Балаяж", null, requester, "hash", expiresAt);
+                ServiceTypeSuggestion.ofPending("HAIR", "Балаяж", null, requester);
         ReflectionTestUtils.setField(suggestion, "id", ID);
         return suggestion;
     }
 
     @Test
-    @DisplayName("approveById → promoted, requester notified, token cleared")
-    void should_promoteNotifyAndClearToken_when_approvedById() {
+    @DisplayName("approveById → promoted, requester notified")
+    void should_promoteAndNotify_when_approvedById() {
         UUID requester = UUID.randomUUID();
         ServiceTypeSuggestion suggestion = pending(requester, NOW_UTC.plusDays(3));
         when(suggestionRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(suggestion));
@@ -86,23 +81,10 @@ class ServiceTypeSuggestionServiceByIdTest {
 
         assertThat(outcome).isEqualTo(DecisionOutcome.APPROVED);
         assertThat(suggestion.getStatus()).isEqualTo(ServiceTypeSuggestionStatus.APPROVED);
-        assertThat(suggestion.getTokenHash()).as("email link invalidated").isNull();
         verify(promotionService).promote(suggestion);
         verify(inAppNotificationService).notifySuggestionDecided(suggestion, true);
         verify(notificationOutboxService).enqueueRequestDecided(RequestKind.SERVICE_TYPE_SUGGESTION, ID.toString(),
                 true, requester);
-        verify(suggestionRepository, never()).findByTokenHashForUpdate(anyString());
-    }
-
-    @Test
-    @DisplayName("approveById ignores an expired email token — the portal is the authority")
-    void should_approve_when_emailTokenExpired() {
-        ServiceTypeSuggestion suggestion = pending(UUID.randomUUID(), NOW_UTC.minusDays(1));
-        when(suggestionRepository.findByIdForUpdate(ID)).thenReturn(Optional.of(suggestion));
-
-        DecisionOutcome outcome = service.approveById(ID);
-
-        assertThat(outcome).as("token expiry bounds the link, not the portal").isEqualTo(DecisionOutcome.APPROVED);
     }
 
     @Test
@@ -117,7 +99,6 @@ class ServiceTypeSuggestionServiceByIdTest {
         assertThat(outcome).isEqualTo(DecisionOutcome.REJECTED);
         assertThat(suggestion.getStatus()).isEqualTo(ServiceTypeSuggestionStatus.REJECTED);
         assertThat(suggestion.getDecisionReason()).isEqualTo("Вже існує");
-        assertThat(suggestion.getTokenHash()).isNull();
         verifyNoInteractions(promotionService);
         verify(notificationOutboxService).enqueueRequestDecided(RequestKind.SERVICE_TYPE_SUGGESTION, ID.toString(),
                 false, requester);

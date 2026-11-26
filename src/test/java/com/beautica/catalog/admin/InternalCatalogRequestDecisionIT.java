@@ -3,7 +3,6 @@ package com.beautica.catalog.admin;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
-import com.beautica.auth.TokenGenerator;
 import com.beautica.catalog.admin.CatalogRequestFixture.Seeded;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.notification.service.NotificationOutboxDrainWorker;
@@ -57,8 +56,8 @@ import static org.mockito.Mockito.verify;
 
 /**
  * B503 (SVC-06) — {@code POST /api/v1/internal/catalog/requests/{kind}/{id}/approve|reject} through the REAL chain
- * (Tomcat, Security, {@code InternalApiKeyFilter} with the catalog-scoped key, MVC) on Postgres. The portal decision is
- * the email-link decision: same promotion, same {@code REQUEST_DECIDED} outbox row, and the email token is spent.
+ * (Tomcat, Security, {@code InternalApiKeyFilter} with the catalog-scoped key, MVC) on Postgres. Since B545 the portal
+ * is the only decision path (the emailed links answer 410, {@code RetiredRequestLinksIT}).
  */
 @DisplayName("InternalCatalogRequestController (IT) — approve / reject by id")
 @TestPropertySource(properties = "app.internal-catalog-key=" + InternalCatalogRequestDecisionIT.CATALOG_KEY)
@@ -76,7 +75,6 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
     @Autowired private ObjectMapper objectMapper;
     @Autowired private PasswordEncoder passwordEncoder;
     @Autowired private JwtTokenProvider jwtTokenProvider;
-    @Autowired private TokenGenerator tokenGenerator;
     @Autowired private NotificationOutboxDrainWorker drainWorker;
     @Autowired private CatalogRequestAdminService adminService;
     @Autowired private PlatformTransactionManager transactionManager;
@@ -89,7 +87,7 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
 
     @BeforeEach
     void createFixture() {
-        fixture = new CatalogRequestFixture(jdbcTemplate, passwordEncoder, tokenGenerator);
+        fixture = new CatalogRequestFixture(jdbcTemplate, passwordEncoder);
     }
 
     @AfterEach
@@ -108,11 +106,7 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
     }
 
     private Seeded<UUID> seedSuggestion(String name, UUID requester) {
-        return seedSuggestion(name, requester, Instant.now().plus(Duration.ofDays(3)));
-    }
-
-    private Seeded<UUID> seedSuggestion(String name, UUID requester, Instant tokenExpiresAt) {
-        return fixture.pendingSuggestionWithToken(SEEDED_CATEGORY, name, requester, tokenExpiresAt, null);
+        return new Seeded<>(fixture.pendingSuggestion(SEEDED_CATEGORY, name, requester, null));
     }
 
     private Seeded<Long> seedCategory(String name, String displayName, UUID requester) {
@@ -120,8 +114,7 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
     }
 
     private Seeded<Long> seedCategory(String name, String displayName, UUID requester, String initialServiceName) {
-        return fixture.pendingCategoryWithToken(name, displayName, requester, initialServiceName,
-                Instant.now().plus(Duration.ofDays(3)), null);
+        return new Seeded<>(fixture.pendingCategory(name, displayName, requester, initialServiceName, null));
     }
 
     // ── HTTP ───────────────────────────────────────────────────────────────────
@@ -187,14 +180,6 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
         return decide(kind, id, "reject", CATALOG_KEY, ACTOR, json);
     }
 
-    private ResponseEntity<String> emailLink(String path, String rawToken) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
-        MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
-        form.add("token", rawToken);
-        return restTemplate.exchange(path, HttpMethod.POST, new HttpEntity<>(form, headers), String.class);
-    }
-
     private void assertOk(ResponseEntity<String> response) throws Exception {
         assertThat(response.getStatusCode()).as("body: %s", response.getBody()).isEqualTo(HttpStatus.OK);
         JsonNode body = objectMapper.readTree(response.getBody());
@@ -237,7 +222,7 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
     // ── approve ────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("approve SERVICE_TYPE → service_types row, token spent, exactly one REQUEST_DECIDED row, APPROVE audit")
+    @DisplayName("approve SERVICE_TYPE → service_types row, exactly one REQUEST_DECIDED row, APPROVE audit")
     void should_promoteAndEnqueueOneDecision_when_suggestionApprovedById() throws Exception {
         UUID requester = insertRequester();
         Seeded<UUID> row = seedSuggestion("IT503 Ритуал схвалення", requester);
@@ -247,9 +232,8 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
         assertOk(response);
         assertThat(typeRows("IT503 Ритуал схвалення")).isEqualTo(1L);
         Map<String, Object> stored = jdbcTemplate.queryForMap(
-                "SELECT status, token_hash, decided_at FROM service_type_suggestion WHERE id = ?", row.id());
+                "SELECT status, decided_at FROM service_type_suggestion WHERE id = ?", row.id());
         assertThat(stored.get("status")).isEqualTo("APPROVED");
-        assertThat(stored.get("token_hash")).as("email link invalidated").isNull();
         assertThat(stored.get("decided_at")).isNotNull();
         assertThat(decisionRows(RequestKind.SERVICE_TYPE_SUGGESTION, row.id().toString())).isEqualTo(1L);
         Map<String, Object> audit = onlyAuditRow(row.id().toString());
@@ -278,10 +262,9 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
 
         assertOk(response);
         Map<String, Object> stored = jdbcTemplate.queryForMap(
-                "SELECT status, active, token_hash FROM platform_categories WHERE id = ?", row.id());
+                "SELECT status, active FROM platform_categories WHERE id = ?", row.id());
         assertThat(stored.get("status")).isEqualTo("APPROVED");
         assertThat(stored.get("active")).isEqualTo(true);
-        assertThat(stored.get("token_hash")).isNull();
         assertThat(after.getBody()).as("cache evicted after commit").contains("IT503_CAT_APPROVE");
         assertThat(decisionRows(RequestKind.CATEGORY_REQUEST, String.valueOf(row.id()))).isEqualTo(1L);
         assertThat(onlyAuditRow(String.valueOf(row.id())).get("target_type")).isEqualTo("CATEGORY_REQUEST");
@@ -314,27 +297,31 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
     }
 
     /**
-     * SVC-06 / phase 503: the portal is the authority, so an expired email token does not block a portal decision —
-     * expiry bounds the e-mailed link only. The link itself is dead (neutral page), the portal still approves.
+     * B545 expand/contract (V266): during the Railway deploy overlap a pre-B545 pod can still mint a request WITH a
+     * token; a B545 pod no longer maps the token columns and leaves the hash on the decided row. V266 dropped the
+     * token-pending CHECKs, so that decision commits instead of failing on the CHECK (falsified by re-adding the
+     * CHECK: approve → 500).
      */
     @Test
-    @DisplayName("expired email token → the link is dead, but the portal approve still promotes and enqueues the e-mail")
-    void should_approveViaPortal_when_emailTokenExpired() throws Exception {
-        Seeded<UUID> row = seedSuggestion("IT503 Ритуал прострочений", insertRequester(),
-                Instant.now().minus(Duration.ofDays(1)));
+    @DisplayName("deploy overlap: a request minted with a token by a pre-B545 pod is still approved in the portal")
+    void should_approve_when_pendingRowStillCarriesLegacyToken() throws Exception {
+        UUID requester = insertRequester();
+        Seeded<Long> category = seedCategory("IT545_CAT_LEGACY_TOKEN", "Стара заявка IT545", requester);
+        Seeded<UUID> suggestion = seedSuggestion("IT545 Ритуал старий токен", requester);
+        jdbcTemplate.update("UPDATE platform_categories SET token_hash = ?, token_expires_at = now() + interval '1 day' "
+                + "WHERE id = ?", "a".repeat(64), category.id());
+        jdbcTemplate.update("UPDATE service_type_suggestion SET token_hash = ?, "
+                + "token_expires_at = now() + interval '1 day' WHERE id = ?", "b".repeat(64), suggestion.id());
 
-        ResponseEntity<String> link = emailLink("/api/v1/service-types/suggestions/approve", row.rawToken());
-        String statusAfterLink = jdbcTemplate.queryForObject("SELECT status FROM service_type_suggestion WHERE id = ?",
-                String.class, row.id());
-        ResponseEntity<String> portal = approve("SERVICE_TYPE", row.id());
+        ResponseEntity<String> categoryResponse = approve("CATEGORY", category.id());
+        ResponseEntity<String> suggestionResponse = approve("SERVICE_TYPE", suggestion.id());
 
-        assertThat(link.getBody()).as("expired link shows the neutral page").contains("Посилання недоступне");
-        assertThat(statusAfterLink).isEqualTo("PENDING");
-        assertOk(portal);
+        assertOk(categoryResponse);
+        assertOk(suggestionResponse);
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM platform_categories WHERE id = ?", String.class,
+                category.id())).isEqualTo("APPROVED");
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM service_type_suggestion WHERE id = ?",
-                String.class, row.id())).isEqualTo("APPROVED");
-        assertThat(typeRows("IT503 Ритуал прострочений")).isEqualTo(1L);
-        assertThat(decisionRows(RequestKind.SERVICE_TYPE_SUGGESTION, row.id().toString())).isEqualTo(1L);
+                String.class, suggestion.id())).isEqualTo("APPROVED");
     }
 
     // ── reject ─────────────────────────────────────────────────────────────────
@@ -353,10 +340,9 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
         assertOk(response);
         assertThat(typeRows("IT503 Ритуал відмови")).isZero();
         Map<String, Object> stored = jdbcTemplate.queryForMap(
-                "SELECT status, decision_reason, token_hash FROM service_type_suggestion WHERE id = ?", row.id());
+                "SELECT status, decision_reason FROM service_type_suggestion WHERE id = ?", row.id());
         assertThat(stored.get("status")).isEqualTo("REJECTED");
         assertThat(stored.get("decision_reason")).isEqualTo(cleaned);
-        assertThat(stored.get("token_hash")).isNull();
         verify(emailNotificationService).sendRequestDecisionEmail(eq(REQUESTER_EMAIL),
                 eq(RequestKind.SERVICE_TYPE_SUGGESTION), eq(false), eq("IT503 Ритуал відмови"), eq(cleaned));
         Map<String, Object> audit = onlyAuditRow(row.id().toString());
@@ -414,36 +400,6 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
         onlyAuditRow(row.id().toString());
     }
 
-    @Test
-    @DisplayName("email token after a by-id approve → «Рішення вже прийнято» page, no second promotion or e-mail")
-    void should_showAlreadyDecided_when_emailLinkUsedAfterByIdApprove() throws Exception {
-        Seeded<UUID> row = seedSuggestion("IT503 Ритуал посилання", insertRequester());
-
-        ResponseEntity<String> portal = approve("SERVICE_TYPE", row.id());
-        ResponseEntity<String> link = emailLink("/api/v1/service-types/suggestions/approve", row.rawToken());
-
-        assertOk(portal);
-        assertThat(link.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(link.getBody()).contains("Рішення вже прийнято");
-        assertThat(typeRows("IT503 Ритуал посилання")).isEqualTo(1L);
-        assertThat(decisionRows(RequestKind.SERVICE_TYPE_SUGGESTION, row.id().toString())).isEqualTo(1L);
-    }
-
-    @Test
-    @DisplayName("email link decides first → the portal approve gets 409 REQUEST_NOT_PENDING")
-    void should_return409_when_emailLinkDecidedFirst() throws Exception {
-        Seeded<Long> row = seedCategory("IT503_CAT_LINK", "Посилання IT503", insertRequester());
-
-        ResponseEntity<String> link = emailLink("/api/v1/service-categories/requests/reject", row.rawToken());
-        ResponseEntity<String> portal = approve("CATEGORY", row.id());
-
-        assertThat(link.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertRequestNotPending(portal);
-        assertThat(jdbcTemplate.queryForObject("SELECT status FROM platform_categories WHERE id = ?",
-                String.class, row.id())).isEqualTo("REJECTED");
-        assertThat(count("SELECT COUNT(*) FROM catalog_admin_audit")).isZero();
-    }
-
     /**
      * Two approves of one id: the first holds the {@code FOR UPDATE} row lock; the parallel HTTP approve waits, then
      * sees APPROVED → 409. Falsified by swapping {@code findByIdForUpdate} for an unlocked load in
@@ -468,8 +424,8 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
 
     /**
      * The public {@code GET /service-types} list is cached ({@code service-types} 'ALL') and warmed BEFORE the decision,
-     * so the edited name showing up afterwards proves the portal approve's {@code evictAll} reached the cache the app
-     * reads (falsified by dropping {@code cacheEvictor.evictAll()} from {@code CatalogRequestAdminService#approve}).
+     * so the edited name showing up afterwards proves the portal approve's {@code evictPlatformCatalog} reached the cache the app
+     * reads (falsified by dropping {@code cacheEvictor.evictPlatformCatalog()} from {@code CatalogRequestAdminService#approve}).
      */
     @Test
     @DisplayName("portal SERVICE_TYPE lifecycle: queued → renamed → approved shows the EDITED name in the cached public "
@@ -535,31 +491,6 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
         assertThat(cachedAfter).doesNotContain("IT503_CAT_REFUSED", "Категорія відхилена", "Категорія до правки");
         assertThat(queueIds("REJECTED")).contains(String.valueOf(refused.id()));
         assertThat(queueIds("PENDING")).doesNotContain(String.valueOf(kept.id()), String.valueOf(refused.id()));
-    }
-
-    // ── mixed paths ────────────────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("portal reject CATEGORY → the e-mailed approve link shows «Рішення вже прийнято»; still REJECTED, "
-            + "exactly one decision e-mail")
-    void should_showAlreadyDecidedAndSendOneEmail_when_emailLinkUsedAfterPortalReject() throws Exception {
-        Seeded<Long> row = seedCategory("IT503_CAT_MIXED", "Змішана IT503", insertRequester());
-
-        ResponseEntity<String> portal = reject("CATEGORY", row.id(), null);
-        ResponseEntity<String> link = emailLink("/api/v1/service-categories/requests/approve", row.rawToken());
-        drainWorker.drain();
-
-        assertOk(portal);
-        assertThat(link.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(link.getBody()).contains("Рішення вже прийнято");
-        Map<String, Object> stored = jdbcTemplate.queryForMap(
-                "SELECT status, active FROM platform_categories WHERE id = ?", row.id());
-        assertThat(stored).containsEntry("status", "REJECTED").containsEntry("active", false);
-        assertThat(decisionRows(RequestKind.CATEGORY_REQUEST, String.valueOf(row.id()))).isEqualTo(1L);
-        verify(emailNotificationService, times(1)).sendRequestDecisionEmail(anyString(), any(), anyBoolean(),
-                anyString(), any());
-        verify(emailNotificationService).sendRequestDecisionEmail(eq(REQUESTER_EMAIL), eq(RequestKind.CATEGORY_REQUEST),
-                eq(false), eq("Змішана IT503"), eq(null));
     }
 
     // ── decision e-mail content ─────────────────────────────────────────────────
@@ -632,7 +563,7 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("reject without actor, unknown kind on approve/reject, 301-code-point CATEGORY reason → 400; still "
-            + "PENDING with its token, no audit, outbox or in-app row")
+            + "PENDING, no audit, outbox or in-app row")
     void should_return400AndLeaveNoTrace_when_rejectInputInvalid() throws Exception {
         Seeded<Long> row = seedCategory("IT503_CAT_BAD_INPUT", "Погане введення IT503", insertRequester());
         String reason = objectMapper.writeValueAsString(Map.of("reason", "ж".repeat(301)));
@@ -647,10 +578,9 @@ class InternalCatalogRequestDecisionIT extends AbstractIntegrationTest {
                 .extracting(ResponseEntity::getStatusCode)
                 .containsOnly(HttpStatus.BAD_REQUEST);
         Map<String, Object> stored = jdbcTemplate.queryForMap(
-                "SELECT status, active, token_hash, decision_reason FROM platform_categories WHERE id = ?", row.id());
+                "SELECT status, active, decision_reason FROM platform_categories WHERE id = ?", row.id());
         assertThat(stored).containsEntry("status", "PENDING").containsEntry("active", false)
                 .containsEntry("decision_reason", null);
-        assertThat(stored.get("token_hash")).as("email link still live").isNotNull();
         assertThat(count("SELECT COUNT(*) FROM catalog_admin_audit")).isZero();
         assertThat(count("SELECT COUNT(*) FROM notification_outbox")).isZero();
         assertThat(inAppRows()).isEmpty();

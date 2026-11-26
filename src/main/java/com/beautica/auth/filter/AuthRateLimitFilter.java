@@ -278,18 +278,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final int RETRY_AFTER_SECONDS = 60;
     // review-decision bucket window is 60 minutes — Retry-After reflects the window.
     private static final int REVIEW_DECISION_RETRY_AFTER_SECONDS = 3600;
-    // The four token-authenticated, permitAll admin review POSTs (SecurityConfig#REVIEW_POST_PATHS).
-    // A garbage token is a cheap no-op but still hits the DB, so they share ONE per-IP bucket
+    // The four retired (B545, 410), permitAll admin review POSTs.
+    // They touch no DB any more but stay throttled as anonymous routes, so they share ONE per-IP bucket
     // (reviewDecisionBuckets); capacity: RateLimitConfig#reviewDecisionCapacity.
     private static final java.util.Set<String> REVIEW_DECISION_PATHS = java.util.Set.of(
             "/api/v1/service-categories/requests/approve",
             "/api/v1/service-categories/requests/reject",
             "/api/v1/service-types/suggestions/approve",
             "/api/v1/service-types/suggestions/reject");
-    // The two token-bearing admin review GET pages (CategoryRequestReviewController, token as trailing
-    // path segment; ServiceTypeSuggestionReviewController, exact path + ?token=). A garbage token
-    // still hits the DB via loadForReview. Charged to a SIBLING per-IP bucket (reviewPageBuckets) so
-    // opening the page plus Approve never exhausts the POST bucket. Window is 60 minutes.
+    // The two retired admin review GET links (B545, RetiredCatalogRequestLinksController: 410 portal page; token as
+    // trailing path segment / exact path + ?token=, never read). Still anonymous, so still throttled, on a
+    // SIBLING per-IP bucket (reviewPageBuckets) kept apart from the POST bucket. Window is 60 minutes.
     private static final int REVIEW_PAGE_RETRY_AFTER_SECONDS = 3600;
     private static final String CATEGORY_REVIEW_PAGE_PATH_PREFIX = "/api/v1/service-categories/requests/review/";
     private static final String SUGGESTION_REVIEW_PAGE_PATH = "/api/v1/service-types/suggestions/review";
@@ -1846,8 +1845,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         }
 
         // Admin review-page rate-limit: GET /api/v1/service-categories/requests/review/{token} and
-        // GET /api/v1/service-types/suggestions/review — both permitAll, token-in-URL, and both hit the
-        // DB on a garbage token (loadForReview). Matched on the normalised path (encoded variants
+        // GET /api/v1/service-types/suggestions/review — both permitAll, retired (B545, 410 page, no DB) but still
+        // throttled as anonymous routes. Matched on the normalised path (encoded variants
         // collapse), checked before the unconditional non-POST bypass below, and charged to the
         // sibling reviewPageBuckets so it never drains the POST reviewDecisionBuckets.
         // HEAD is routed by Spring to the @GetMapping handler, so it must be throttled identically.

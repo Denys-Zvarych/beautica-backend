@@ -25,7 +25,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * <ul>
  *   <li>{@code findApprovedActive} — filters to {@code APPROVED AND active} and orders
  *       by {@code displayName}.</li>
- *   <li>{@code findByTokenHash} — exact hash match for the approve/reject lookup.</li>
  *   <li>{@code existsByNameIgnoreCaseAndStatusIn} (ignore-case) vs
  *       {@code existsByNameAndActiveTrueAndStatus} (exact-case) — the case sensitivity
  *       contract is the difference between the conflict guard and the usability gate.</li>
@@ -64,10 +63,10 @@ class PlatformCategoryRepositoryTest extends AbstractDataJpaTest {
         return category;
     }
 
-    private PlatformCategory pending(String name, String displayName, String tokenHash) {
+    private PlatformCategory pending(String name, String displayName) {
         OffsetDateTime now = OffsetDateTime.now();
         return persist(PlatformCategory.ofPendingRequest(
-                name, displayName, null, tokenHash, now, now.plusDays(7), null));
+                name, displayName, null, now, null));
     }
 
     // ── findApprovedActive ─────────────────────────────────────────────────────
@@ -77,7 +76,7 @@ class PlatformCategoryRepositoryTest extends AbstractDataJpaTest {
     void should_returnApprovedActiveOrderedByDisplayName_when_findApprovedActive() {
         approved("ZED", "Аква");          // displayName sorts first
         approved("ALPHA", "Манікюр");     // displayName sorts last
-        pending("PENDING_ONE", "Очікує", "a".repeat(64));  // PENDING — must be excluded
+        pending("PENDING_ONE", "Очікує");  // PENDING — must be excluded
 
         List<PlatformCategory> result = repository.findApprovedActive();
 
@@ -104,30 +103,6 @@ class PlatformCategoryRepositoryTest extends AbstractDataJpaTest {
                 .extracting(PlatformCategory::getName)
                 .as("only the APPROVED+active row is returned")
                 .containsExactly("LIVE");
-    }
-
-    // ── findByTokenHash ────────────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("returns the PENDING row matching the exact token hash")
-    void should_returnRow_when_findByTokenHashMatches() {
-        String hash = "b".repeat(64);
-        pending("TOKENED", "Токен", hash);
-
-        Optional<PlatformCategory> found = repository.findByTokenHash(hash);
-
-        assertThat(found).isPresent();
-        assertThat(found.get().getName()).isEqualTo("TOKENED");
-    }
-
-    @Test
-    @DisplayName("returns empty when no row carries the token hash")
-    void should_returnEmpty_when_findByTokenHashMisses() {
-        pending("TOKENED", "Токен", "c".repeat(64));
-
-        Optional<PlatformCategory> found = repository.findByTokenHash("d".repeat(64));
-
-        assertThat(found).isEmpty();
     }
 
     // ── case-sensitivity contract ──────────────────────────────────────────────
@@ -181,7 +156,7 @@ class PlatformCategoryRepositoryTest extends AbstractDataJpaTest {
     @Test
     @DisplayName("existsByNameAndActiveTrueAndStatus returns false for a PENDING row")
     void should_returnFalse_when_categoryPendingForUsabilityGate() {
-        pending("PENDING_GATE", "Очікує", "e".repeat(64));
+        pending("PENDING_GATE", "Очікує");
 
         boolean selectable = repository.existsByNameAndActiveTrueAndStatus(
                 "PENDING_GATE", PlatformCategoryStatus.APPROVED);
@@ -199,7 +174,7 @@ class PlatformCategoryRepositoryTest extends AbstractDataJpaTest {
         approved("HAIR", "Волосся");
         approved("NAIL_SERVICE", "Манікюр");
         // PENDING — must be excluded even though requested.
-        pending("PENDING_CAT", "Очікує", "a".repeat(64));
+        pending("PENDING_CAT", "Очікує");
         // REJECTED (inactive) — must be excluded.
         PlatformCategory rejected = PlatformCategory.ofApproved("REJECTED_CAT", "Відхилено");
         rejected.reject(OffsetDateTime.now());
@@ -244,7 +219,7 @@ class PlatformCategoryRepositoryTest extends AbstractDataJpaTest {
     void should_roundTripInitialServiceName_when_persistedAndReloaded() {
         OffsetDateTime now = OffsetDateTime.now();
         PlatformCategory saved = persist(PlatformCategory.ofPendingRequest(
-                "WITH_INITIAL", "З назвою", null, "f".repeat(64), now, now.plusDays(7),
+                "WITH_INITIAL", "З назвою", null, now,
                 "Класичний манікюр"));
         em.getEntityManager().detach(saved);
 
@@ -258,7 +233,7 @@ class PlatformCategoryRepositoryTest extends AbstractDataJpaTest {
     @Test
     @DisplayName("a request without an initial service name leaves the column null")
     void should_leaveInitialServiceNameNull_when_notProvided() {
-        PlatformCategory saved = pending("NO_INITIAL", "Без назви", "g".repeat(64));
+        PlatformCategory saved = pending("NO_INITIAL", "Без назви");
         em.getEntityManager().detach(saved);
 
         PlatformCategory reloaded = repository.findById(saved.getId()).orElseThrow();

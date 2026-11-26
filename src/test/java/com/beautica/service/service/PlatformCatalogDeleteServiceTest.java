@@ -118,8 +118,8 @@ class PlatformCatalogDeleteServiceTest {
     @DisplayName("deleting a pending / rejected category request is 409 CATEGORY_NOT_APPROVED before any count")
     void should_throwNotApproved_when_deletingCategoryRequest() {
         OffsetDateTime requestedAt = OffsetDateTime.parse("2026-11-01T10:00:00Z");
-        PlatformCategory pending = PlatformCategory.ofPendingRequest(CATEGORY, "Масаж ніг", UUID.randomUUID(), "hash",
-                requestedAt, requestedAt.plusDays(1), null);
+        PlatformCategory pending = PlatformCategory.ofPendingRequest(CATEGORY, "Масаж ніг", UUID.randomUUID(),
+                requestedAt, null);
         when(platformCategoryRepository.findByNameForDelete(CATEGORY)).thenReturn(Optional.of(pending));
 
         Throwable thrown = catchThrowable(() -> service.deleteCategory(CATEGORY));

@@ -1,6 +1,5 @@
 package com.beautica.catalog.admin;
 
-import com.beautica.auth.TokenGenerator;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
@@ -18,23 +17,19 @@ import java.util.UUID;
  */
 final class CatalogRequestFixture {
 
-    /** A request row and the raw email token whose hash it stores. */
-    record Seeded<I>(I id, String rawToken) {}
-
-    private static final long LONG_EXPIRY_SECONDS = 86_400_000L;
+    /** A seeded request row's id. */
+    record Seeded<I>(I id) {}
 
     private final JdbcTemplate jdbcTemplate;
     private final PasswordEncoder passwordEncoder;
-    private final TokenGenerator tokenGenerator;
 
     private final List<UUID> suggestionIds = new ArrayList<>();
     private final List<String> categoryNames = new ArrayList<>();
     private final List<String> typeNames = new ArrayList<>();
 
-    CatalogRequestFixture(JdbcTemplate jdbcTemplate, PasswordEncoder passwordEncoder, TokenGenerator tokenGenerator) {
+    CatalogRequestFixture(JdbcTemplate jdbcTemplate, PasswordEncoder passwordEncoder) {
         this.jdbcTemplate = jdbcTemplate;
         this.passwordEncoder = passwordEncoder;
-        this.tokenGenerator = tokenGenerator;
     }
 
     /** Active, e-mail-verified user with a real BCrypt hash. */
@@ -46,67 +41,54 @@ final class CatalogRequestFixture {
         return id;
     }
 
-    /** Category request in any status; a PENDING one gets a placeholder (non-redeemable) token hash. */
+    /** Category request in any status. */
     long insertCategory(String name, String displayName, String status, UUID requester, Instant createdAt) {
         categoryNames.add(name);
-        boolean pending = "PENDING".equals(status);
         jdbcTemplate.update("INSERT INTO platform_categories (name, display_name, active, status, requested_by_user_id, "
-                        + "requested_at, token_hash, token_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "requested_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 name, displayName, "APPROVED".equals(status), status, requester, Timestamp.from(createdAt),
-                pending ? "hash-" + name : null,
-                pending ? Timestamp.from(createdAt.plusSeconds(LONG_EXPIRY_SECONDS)) : null,
                 Timestamp.from(createdAt));
         return categoryId(name);
     }
 
-    /** Suggestion in any status; a PENDING one gets a placeholder (non-redeemable) token hash. */
+    /** Suggestion in any status. */
     UUID insertSuggestion(String category, String name, String status, UUID requester, Instant createdAt) {
         UUID id = UUID.randomUUID();
         suggestionIds.add(id);
-        boolean pending = "PENDING".equals(status);
         jdbcTemplate.update("INSERT INTO service_type_suggestion (id, requested_by_user_id, category_name, "
-                        + "suggested_name, description, status, token_hash, token_expires_at, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                id, requester, category, name, "опис", status,
-                pending ? "hash-" + id : null,
-                pending ? Timestamp.from(createdAt.plusSeconds(LONG_EXPIRY_SECONDS)) : null,
-                Timestamp.from(createdAt));
+                        + "suggested_name, description, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                id, requester, category, name, "опис", status, Timestamp.from(createdAt));
         return id;
     }
 
     /**
-     * PENDING suggestion with a REAL email token (redeemable on the review link). {@code createdAt} {@code null} = the
-     * database's {@code NOW()}. The suggested name is tracked as a service type an approve may promote.
+     * PENDING suggestion to be decided. {@code createdAt} {@code null} = the database's {@code NOW()}. The suggested
+     * name is tracked as a service type an approve may promote.
      */
-    Seeded<UUID> pendingSuggestionWithToken(String category, String name, UUID requester, Instant tokenExpiresAt,
-                                            Instant createdAt) {
+    UUID pendingSuggestion(String category, String name, UUID requester, Instant createdAt) {
         UUID id = UUID.randomUUID();
-        String raw = "it-sugg-token-" + id;
         suggestionIds.add(id);
         typeNames.add(name);
         jdbcTemplate.update("INSERT INTO service_type_suggestion (id, requested_by_user_id, category_name, "
-                        + "suggested_name, status, token_hash, token_expires_at, created_at) "
-                        + "VALUES (?, ?, ?, ?, 'PENDING', ?, ?, COALESCE(CAST(? AS timestamptz), NOW()))",
-                id, requester, category, name, tokenGenerator.hash(raw), Timestamp.from(tokenExpiresAt),
-                timestampOrNull(createdAt));
-        return new Seeded<>(id, raw);
+                        + "suggested_name, status, created_at) "
+                        + "VALUES (?, ?, ?, ?, 'PENDING', COALESCE(CAST(? AS timestamptz), NOW()))",
+                id, requester, category, name, timestampOrNull(createdAt));
+        return id;
     }
 
     /**
-     * PENDING category request with a REAL email token; {@code requested_at} = {@code created_at} = {@code createdAt},
-     * or the database's {@code NOW()} when {@code null}.
+     * PENDING category request to be decided; {@code requested_at} = {@code created_at} = {@code createdAt}, or the
+     * database's {@code NOW()} when {@code null}.
      */
-    Seeded<Long> pendingCategoryWithToken(String name, String displayName, UUID requester, String initialServiceName,
-                                          Instant tokenExpiresAt, Instant createdAt) {
+    long pendingCategory(String name, String displayName, UUID requester, String initialServiceName,
+                         Instant createdAt) {
         categoryNames.add(name);
-        String raw = "it-cat-token-" + UUID.randomUUID();
         Timestamp created = timestampOrNull(createdAt);
         jdbcTemplate.update("INSERT INTO platform_categories (name, display_name, active, status, requested_by_user_id, "
-                        + "requested_at, token_hash, token_expires_at, created_at, initial_service_name) "
-                        + "VALUES (?, ?, false, 'PENDING', ?, COALESCE(CAST(? AS timestamptz), NOW()), ?, ?, COALESCE(CAST(? AS timestamptz), NOW()), ?)",
-                name, displayName, requester, created, tokenGenerator.hash(raw), Timestamp.from(tokenExpiresAt),
-                created, initialServiceName);
-        return new Seeded<>(categoryId(name), raw);
+                        + "requested_at, created_at, initial_service_name) VALUES (?, ?, false, 'PENDING', ?, "
+                        + "COALESCE(CAST(? AS timestamptz), NOW()), COALESCE(CAST(? AS timestamptz), NOW()), ?)",
+                name, displayName, requester, created, created, initialServiceName);
+        return categoryId(name);
     }
 
     /** A service-type name an approve will promote, removed on cleanup. */

@@ -8,11 +8,9 @@ import org.springframework.validation.annotation.Validated;
 /**
  * Typed config for the platform's externally-reachable base URL.
  *
- * <p>Binding key: {@code app.public-base-url}. Used to build the admin approval
- * link ({@code {public-base-url}/api/v1/service-categories/requests/review?token=...})
- * embedded in the category-request notification email. Distinct from
- * {@code app.frontend.base-url} (the mobile/web app origin) because the approval
- * page is served by THIS backend, not the frontend.
+ * <p>Binding key: {@code app.public-base-url}. Used to build links to pages served by THIS backend (e.g. the
+ * one-click moderation action links). Distinct from {@code app.frontend.base-url} (the mobile/web app origin). The
+ * catalog-request emails no longer use it (B545: they link to the portal on {@code app.frontend.base-url}).
  */
 @Validated
 @ConfigurationProperties(prefix = "app")

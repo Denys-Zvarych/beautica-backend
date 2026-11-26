@@ -17,6 +17,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.timeout;
 
 /**
  * B516 (AUTH-12, AUTH-15, AUTH-D18, D4, D6) — forgot-password takes a phone or an email; the channel comes from the
@@ -38,7 +39,7 @@ class ForgotPasswordByPhoneIT extends AbstractPhoneIdentityIT {
 
     private String emailedResetCode() {
         ArgumentCaptor<String> code = ArgumentCaptor.forClass(String.class);
-        verify(emailNotificationService).sendPasswordResetOtpEmail(any(User.class), code.capture());
+        verify(emailNotificationService, timeout(MAIL_WAIT_MS)).sendPasswordResetOtpEmail(any(User.class), code.capture());
         return code.getValue();
     }
 

@@ -1,7 +1,6 @@
 package com.beautica.catalog.admin;
 
 import com.beautica.AbstractIntegrationTest;
-import com.beautica.auth.TokenGenerator;
 import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.catalog.CatalogCacheEvictor;
 import com.beautica.common.TimeZones;
@@ -74,7 +73,6 @@ class InternalCatalogControllerIT extends AbstractIntegrationTest {
     @Autowired private ObjectMapper objectMapper;
     @Autowired private JdbcTemplate jdbcTemplate;
     @Autowired private PasswordEncoder passwordEncoder;
-    @Autowired private TokenGenerator tokenGenerator;
     @Autowired private CatalogCacheEvictor cacheEvictor;
     @Autowired private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     @Autowired private CacheManager cacheManager;
@@ -87,7 +85,7 @@ class InternalCatalogControllerIT extends AbstractIntegrationTest {
 
     @BeforeEach
     void seed() {
-        fixture = new CatalogRequestFixture(jdbcTemplate, passwordEncoder, tokenGenerator);
+        fixture = new CatalogRequestFixture(jdbcTemplate, passwordEncoder);
         serviceFixtures = new ServiceTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
         fixture.insertCategory(CATEGORY, CATEGORY_LABEL, "APPROVED", null, Instant.parse("2020-01-01T10:00:00Z"));
         typeA = insertType(TYPE_A, "Zyxquorbel footwork", "it504-type-a");

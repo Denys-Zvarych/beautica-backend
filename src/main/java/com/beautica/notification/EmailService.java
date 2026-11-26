@@ -24,7 +24,7 @@ import java.util.concurrent.CompletableFuture;
 /**
  * Legacy email transport retained for {@link #sendAdminNotification} (still wired
  * into {@code ServiceCatalogService} service-type suggestion path) and the new
- * {@link #sendCategoryRequestNotification} admin-approval email.
+ * {@link #sendCategoryRequestNotification} operator notification email.
  *
  * <p>The invite/booking email paths are owned by {@code EmailNotificationService}
  * via the outbox drain worker. New transactional user-facing emails belong there;
@@ -69,8 +69,8 @@ public class EmailService {
     }
 
     /**
-     * Sends the platform admin a "new service-category request" email with an
-     * Approve/Reject link carrying the raw single-use token.
+     * Sends the platform operator a notification-only "new service-category request" email: the request facts and
+     * one «Відкрити заявки» button to the catalog portal (B545 — no approve / reject, no token).
      *
      * <p>All dynamic values are rendered through Thymeleaf with auto-escaping, so
      * a malicious display name cannot inject markup; the subject is plain text and
@@ -79,10 +79,10 @@ public class EmailService {
      * already-sanitized category name).
      *
      * @param toEmail       admin recipient
-     * @param requesterId   requester UUID (shown for audit, never the token)
+     * @param requesterId   requester UUID (shown for audit)
      * @param categoryName  validated uppercase wire name
      * @param displayName   human-readable label (auto-escaped on render)
-     * @param reviewUrl     fully-built approval link with the raw token query param
+     * @param portalUrl     the portal's pending-requests page ({@code {FRONTEND_BASE_URL}/admin/requests})
      */
     @Async("emailExecutor")
     public void sendCategoryRequestNotification(
@@ -90,13 +90,13 @@ public class EmailService {
             String requesterId,
             String categoryName,
             String displayName,
-            String reviewUrl) {
+            String portalUrl) {
         try {
             Context ctx = new Context(Locale.of("uk"));
             ctx.setVariable("requesterId", requesterId);
             ctx.setVariable("categoryName", categoryName);
             ctx.setVariable("displayName", displayName);
-            ctx.setVariable("reviewUrl", reviewUrl);
+            ctx.setVariable("portalUrl", portalUrl);
 
             String html = templateEngine.process("email/category-request", ctx);
 
@@ -116,8 +116,8 @@ public class EmailService {
     }
 
     /**
-     * Sends the platform admin a "new service-type suggestion" email with a
-     * Review/Approve/Reject link carrying the raw single-use token.
+     * Sends the platform operator a notification-only "new service-type suggestion" email: the suggestion facts and
+     * one «Відкрити заявки» button to the catalog portal (B545 — no approve / reject, no token).
      *
      * <p>All dynamic values are rendered through Thymeleaf with auto-escaping, so a
      * malicious suggested name or description cannot inject markup; the subject is a
@@ -125,11 +125,11 @@ public class EmailService {
      * header because the fields come from the validated suggestion DTO).
      *
      * @param toEmail        admin recipient
-     * @param requesterId    requester UUID (shown for audit, never the token)
+     * @param requesterId    requester UUID (shown for audit)
      * @param categoryName   validated System-B category slug
      * @param suggestedName  suggested service-type name (auto-escaped on render)
      * @param description    optional description (auto-escaped on render; may be null)
-     * @param reviewUrl      fully-built review link with the raw token query param
+     * @param portalUrl      the portal's pending-requests page ({@code {FRONTEND_BASE_URL}/admin/requests})
      */
     @Async("emailExecutor")
     public void sendServiceTypeSuggestionNotification(
@@ -138,14 +138,14 @@ public class EmailService {
             String categoryName,
             String suggestedName,
             String description,
-            String reviewUrl) {
+            String portalUrl) {
         try {
             Context ctx = new Context(Locale.of("uk"));
             ctx.setVariable("requesterId", requesterId);
             ctx.setVariable("categoryName", categoryName);
             ctx.setVariable("suggestedName", suggestedName);
             ctx.setVariable("description", description);
-            ctx.setVariable("reviewUrl", reviewUrl);
+            ctx.setVariable("portalUrl", portalUrl);
 
             String html = templateEngine.process("email/service-type-suggestion", ctx);
 

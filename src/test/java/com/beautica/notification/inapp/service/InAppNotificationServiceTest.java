@@ -650,7 +650,7 @@ class InAppNotificationServiceTest {
         UUID requesterId = UUID.randomUUID();
         com.beautica.service.entity.PlatformCategory category =
                 com.beautica.service.entity.PlatformCategory.ofPendingRequest(
-                        "NAIL_ART", "Нейл-арт", requesterId, "h", null, null, null);
+                        "NAIL_ART", "Нейл-арт", requesterId, null, null);
         org.springframework.test.util.ReflectionTestUtils.setField(category, "id", 77L);
 
         service.notifyCategoryRequestDecided(category, true);
@@ -670,7 +670,7 @@ class InAppNotificationServiceTest {
         UUID suggestionId = UUID.randomUUID();
         com.beautica.service.entity.ServiceTypeSuggestion suggestion =
                 com.beautica.service.entity.ServiceTypeSuggestion.ofPending(
-                        "NAIL_ART", "Гель", null, requesterId, "h", null);
+                        "NAIL_ART", "Гель", null, requesterId);
         org.springframework.test.util.ReflectionTestUtils.setField(suggestion, "id", suggestionId);
 
         service.notifySuggestionDecided(suggestion, true);
@@ -687,10 +687,10 @@ class InAppNotificationServiceTest {
     void should_makeNoRepositoryCall_when_requesterNull() {
         com.beautica.service.entity.PlatformCategory category =
                 com.beautica.service.entity.PlatformCategory.ofPendingRequest(
-                        "NAIL_ART", "Нейл-арт", null, "h", null, null, null);
+                        "NAIL_ART", "Нейл-арт", null, null, null);
         com.beautica.service.entity.ServiceTypeSuggestion suggestion =
                 com.beautica.service.entity.ServiceTypeSuggestion.ofPending(
-                        "NAIL_ART", "Гель", null, null, "h", null);
+                        "NAIL_ART", "Гель", null, null);
 
         service.notifyCategoryRequestDecided(category, true);
         service.notifySuggestionDecided(suggestion, false);
@@ -706,7 +706,7 @@ class InAppNotificationServiceTest {
         UUID requesterId = UUID.randomUUID();
         com.beautica.service.entity.PlatformCategory category =
                 com.beautica.service.entity.PlatformCategory.ofPendingRequest(
-                        "NAIL_ART", "Нейл-арт", requesterId, "h", null, null, null);
+                        "NAIL_ART", "Нейл-арт", requesterId, null, null);
         org.springframework.test.util.ReflectionTestUtils.setField(category, "id", 5L);
 
         service.notifyCategoryRequestDecided(category, false);

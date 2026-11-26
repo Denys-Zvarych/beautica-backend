@@ -13,14 +13,18 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Import;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.thymeleaf.spring6.SpringTemplateEngine;
 
 import java.util.UUID;
 import java.util.function.Consumer;
 
+import static com.beautica.notification.CatalogRequestOperatorEmailExpectedCopy.NOTIFICATION_ONLY_FOOTER;
+import static com.beautica.notification.CatalogRequestOperatorEmailExpectedCopy.PORTAL_BUTTON;
+import static com.beautica.notification.CatalogRequestOperatorEmailExpectedCopy.RETIRED_LINK_MARKERS;
+import static com.beautica.notification.CatalogRequestOperatorEmailExpectedCopy.portalUrl;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -29,19 +33,21 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * The admin approval e-mail links are built from the bound {@code app.public-base-url}, not a
- * hard-coded or localhost default. Real context, real property binding; only the mail sender is mocked.
+ * B545 (SVC-06) — the operator's request e-mails are notification-only: the one link is the portal's requests page,
+ * built from the bound {@code app.frontend.base-url} ({@code FRONTEND_BASE_URL}), and the rendered body carries no
+ * token and no review / approve / reject link. Real context, real property binding; only SMTP is stubbed.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("Approval e-mail links use the configured app.public-base-url")
-class ApprovalLinkBaseUrlIntegrationTest extends AbstractIntegrationTest {
+@DisplayName("Request e-mails link to the portal built from app.frontend.base-url, never a token link")
+class RequestEmailPortalLinkIT extends AbstractIntegrationTest {
 
-    private static final String BASE = "https://api.beautica.test";
     private static final String CATEGORY_NAME = "ITLINKBASE_CAT";
+
+    @Value("${app.frontend.base-url}")
+    private String frontendBaseUrl;
 
     @Autowired private CategoryRequestService categoryRequestService;
     @Autowired private ServiceTypeSuggestionService suggestionService;
-    @Autowired private JdbcTemplate jdbcTemplate;
     @Autowired private org.springframework.boot.test.web.client.TestRestTemplate restTemplate;
     @Autowired private com.fasterxml.jackson.databind.ObjectMapper objectMapper;
     @Autowired private org.springframework.security.crypto.password.PasswordEncoder passwordEncoder;
@@ -61,8 +67,8 @@ class ApprovalLinkBaseUrlIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("category request link starts with the configured base URL, no double slash")
-    void should_buildCategoryRequestLink_fromConfiguredPublicBaseUrl() throws Exception {
+    @DisplayName("category request e-mail: the link is {FRONTEND_BASE_URL}/admin/requests; body has no token link")
+    void should_linkCategoryEmailToPortal_when_requestSubmitted() throws Exception {
         UUID requester = createRequester();
 
         categoryRequestService.submitRequest(
@@ -71,12 +77,16 @@ class ApprovalLinkBaseUrlIntegrationTest extends AbstractIntegrationTest {
         ArgumentCaptor<String> url = ArgumentCaptor.forClass(String.class);
         verify(emailService).sendCategoryRequestNotification(
                 anyString(), eq(requester.toString()), eq(CATEGORY_NAME), eq("Лінк-тест"), url.capture());
-        assertLink(url.getValue());
+        assertThat(url.getValue()).isEqualTo(portalUrl(frontendBaseUrl));
+        String body = renderBody(real -> real.sendCategoryRequestNotification(
+                "admin@beautica.test", requester.toString(), CATEGORY_NAME, "Лінк-тест", url.getValue()));
+        assertNotificationOnly(body, url.getValue());
     }
 
     @Test
-    @DisplayName("service-type suggestion link starts with the configured base URL, no double slash")
-    void should_buildSuggestionLink_fromConfiguredPublicBaseUrl() throws Exception {
+    @DisplayName("service-type suggestion e-mail: the link is {FRONTEND_BASE_URL}/admin/requests;"
+            + " body has no token link")
+    void should_linkSuggestionEmailToPortal_when_suggestionSubmitted() throws Exception {
         UUID requester = createRequester();
 
         suggestionService.submitSuggestionInternal(CATEGORY_NAME, "Link Type", "desc", requester);
@@ -84,42 +94,15 @@ class ApprovalLinkBaseUrlIntegrationTest extends AbstractIntegrationTest {
         ArgumentCaptor<String> url = ArgumentCaptor.forClass(String.class);
         verify(emailService).sendServiceTypeSuggestionNotification(
                 anyString(), eq(requester.toString()), eq(CATEGORY_NAME), eq("Link Type"), eq("desc"), url.capture());
-        assertLink(url.getValue());
-    }
-
-    @Test
-    @DisplayName("rendered category-request e-mail body carries the configured base URL as the review link href")
-    void should_renderCategoryEmailBody_withConfiguredPublicBaseUrl() throws Exception {
-        UUID requester = createRequester();
-        categoryRequestService.submitRequest(
-                new CreateCategoryRequestRequest(CATEGORY_NAME, "Лінк-тест", null), requester);
-        ArgumentCaptor<String> url = ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendCategoryRequestNotification(
-                anyString(), anyString(), anyString(), anyString(), url.capture());
-
-        String body = renderBody(real -> real.sendCategoryRequestNotification(
-                "admin@beautica.test", requester.toString(), CATEGORY_NAME, "Лінк-тест", url.getValue()));
-
-        assertThat(body).contains("href=\"" + url.getValue() + "\"");
-        assertThat(body).contains("href=\"" + BASE + "/api/v1/service-categories/requests/review/");
-        assertThat(body).doesNotContain("localhost");
-    }
-
-    @Test
-    @DisplayName("rendered service-type-suggestion e-mail body carries the configured base URL as the review link href")
-    void should_renderSuggestionEmailBody_withConfiguredPublicBaseUrl() throws Exception {
-        UUID requester = createRequester();
-        suggestionService.submitSuggestionInternal(CATEGORY_NAME, "Link Type", "desc", requester);
-        ArgumentCaptor<String> url = ArgumentCaptor.forClass(String.class);
-        verify(emailService).sendServiceTypeSuggestionNotification(
-                anyString(), anyString(), anyString(), anyString(), anyString(), url.capture());
-
+        assertThat(url.getValue()).isEqualTo(portalUrl(frontendBaseUrl));
         String body = renderBody(real -> real.sendServiceTypeSuggestionNotification(
                 "admin@beautica.test", requester.toString(), CATEGORY_NAME, "Link Type", "desc", url.getValue()));
+        assertNotificationOnly(body, url.getValue());
+    }
 
-        assertThat(body).contains("href=\"" + url.getValue() + "\"");
-        assertThat(body).contains("href=\"" + BASE + "/api/v1/service-types/suggestions/review?token=");
-        assertThat(body).doesNotContain("localhost");
+    private static void assertNotificationOnly(String body, String portalUrl) {
+        assertThat(body).contains("href=\"" + portalUrl + "\"", PORTAL_BUTTON, NOTIFICATION_ONLY_FOOTER);
+        assertThat(body).doesNotContain(RETIRED_LINK_MARKERS.toArray(String[]::new));
     }
 
     /**
@@ -135,11 +118,5 @@ class ApprovalLinkBaseUrlIntegrationTest extends AbstractIntegrationTest {
         ArgumentCaptor<MimeMessage> sent = ArgumentCaptor.forClass(MimeMessage.class);
         verify(sender).send(sent.capture());
         return (String) sent.getValue().getContent();
-    }
-
-    private static void assertLink(String link) {
-        assertThat(link).startsWith(BASE + "/api/v1/");
-        assertThat(link.substring("https://".length())).doesNotContain("//");
-        assertThat(link).doesNotContain("localhost");
     }
 }

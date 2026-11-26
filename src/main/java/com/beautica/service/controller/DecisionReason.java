@@ -3,14 +3,14 @@ package com.beautica.service.controller;
 import java.util.regex.Pattern;
 
 /**
- * Normalises the OPTIONAL free-text reason an admin types on a token-authenticated reject form
- * (phase 372, D4). The endpoints are {@code permitAll} and the value is later shown to the requester,
+ * Normalises the OPTIONAL free-text reason the operator types when rejecting a catalog request
+ * (phase 372, D4). The value is later shown to the requester,
  * so it is cleaned at the boundary: line breaks/tabs fold to one space, every other control or
  * format character is removed, then the value is trimmed and a blank collapses to "no reason".
  * Output is HTML-escaped at render time ({@code th:text}), never here. The value is never logged.
  *
- * <p>Public since B503: the catalog portal's reject ({@code CatalogRequestAdminService}) runs the SAME rules, so a
- * reason reaches the decision e-mail identically from either path.
+ * <p>Public since B503: the catalog portal's reject ({@code CatalogRequestAdminService}) runs these rules; since B545
+ * it is the only reject path (the emailed form is retired).
  */
 public final class DecisionReason {
 

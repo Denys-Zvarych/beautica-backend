@@ -22,7 +22,7 @@
             <tr><td style="color:#3D2B1A;font-size:15px;line-height:1.7;padding-bottom:24px;
                            font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
               Майстер або власник салону запропонував новий тип послуги.
-              Перегляньте деталі та прийміть або відхиліть пропозицію.
+              Розгляньте пропозицію в порталі адміністратора.
             </td></tr>
 
             <!-- Suggestion details — all values auto-escaped by Thymeleaf -->
@@ -40,19 +40,15 @@
             </td></tr>
 
             <tr><td align="center" style="padding-bottom:28px;">
-              <a th:href="${reviewUrl}"
+              <a th:href="${portalUrl}"
                  style="display:inline-block;background:#6A4A28;color:#F5EDE0;
                         text-decoration:none;font-size:16px;font-weight:700;
                         padding:16px 36px;border-radius:12px;
                         font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
-                Переглянути пропозицію
+                Відкрити заявки
               </a>
             </td></tr>
 
-            <tr><td style="color:#6A4A28;font-size:13px;padding-bottom:8px;
-                           font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
-              Посилання дійсне протягом 7 днів і може бути використане лише один раз.
-            </td></tr>
           </table>
 
         </td></tr>
@@ -60,7 +56,7 @@
         <tr><td style="padding:24px 40px 32px;border-top:1px solid #EDE4D7;">
           <span style="color:#9A836E;font-size:12px;line-height:1.6;
                        font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
-            Жодних змін не відбудеться, доки ви не натиснете «Прийняти» на сторінці перегляду.
+            Цей лист лише повідомляє про нову заявку. Рішення приймається тільки в порталі.
           </span>
         </td></tr>
       </table>

@@ -16,9 +16,9 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Per-IP throttle on the two token-bearing, {@code permitAll} admin review GET pages. A garbage token
- * still hits the DB via {@code loadForReview}, and every non-POST used to bypass the filter. They are
- * charged to {@code reviewPageBuckets}, a SIBLING of the POST {@code reviewDecisionBuckets}.
+ * Per-IP throttle on the two {@code permitAll} admin review GET links (retired by B545: a 410 portal page that
+ * reads no token and touches no DB, still throttled as anonymous routes; every non-POST used to bypass the filter).
+ * They are charged to {@code reviewPageBuckets}, a SIBLING of the POST {@code reviewDecisionBuckets}.
  */
 @DisplayName("AuthRateLimitFilter — admin review GET pages per-IP throttle")
 class ReviewGetRateLimitRegressionTest {

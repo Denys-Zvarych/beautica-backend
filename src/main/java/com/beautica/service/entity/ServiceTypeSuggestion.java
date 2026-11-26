@@ -21,31 +21,22 @@ import java.util.UUID;
  * (formerly fire-and-forget) {@code POST /service-types/suggest} path.
  *
  * <p>This is its OWN small table, NOT a row in {@code service_types}: an unreviewed
- * suggestion must never appear in the catalog/picker. A suggestion is a PENDING row
- * carrying a hashed single-use token; a platform admin approves or rejects it via an
- * emailed token-authenticated link. Approve marks the record {@code APPROVED}; the
+ * suggestion must never appear in the catalog/picker. A suggestion is a PENDING row; the
+ * platform operator approves or rejects it in the catalog portal (B545: the operator email
+ * only announces it). Approve marks the record {@code APPROVED}; the
  * catalog/service materialization (a {@code service_types} row + a draft
  * {@code service_definitions} row for the requesting master) is performed by
  * {@code ServiceTypeSuggestionService.decide} via {@code ServiceTypePromotionService}
  * (Phase 16.9, supersedes the Phase 16.8 "no auto-promotion" decision). This entity's
  * mutators never touch repositories.
  *
- * <p>Mirrors {@link PlatformCategory} verbatim for security properties:
- * <ul>
- *   <li>Raw token never persisted — only {@code SHA-256(token)} hex is stored.</li>
- *   <li>7-day expiry; single-use (token nulled on decision).</li>
- *   <li>State transitions go through factory methods and the
- *       {@link #approve(OffsetDateTime)} / {@link #reject(OffsetDateTime)} mutators;
- *       no public setters.</li>
- * </ul>
- *
- * <p>No {@code @ToString} is generated — the token hash must never leak into logs.
+ * <p>State transitions go through the factory method and the {@link #approve(OffsetDateTime)} /
+ * {@link #reject(OffsetDateTime)} mutators; no public setters.
  */
 @Entity
 @Table(
         name = "service_type_suggestion",
         indexes = {
-                @Index(name = "idx_service_type_suggestion_token_hash", columnList = "token_hash"),
                 // V159 (phase 295 audit MEDIUM-6). Same ON DELETE SET NULL RI-trigger rationale as
                 // PlatformCategory's index of the same name shape.
                 @Index(name = "idx_service_type_suggestion_requested_by", columnList = "requested_by_user_id")
@@ -87,13 +78,6 @@ public class ServiceTypeSuggestion {
     @Column(nullable = false, length = 20)
     private ServiceTypeSuggestionStatus status = ServiceTypeSuggestionStatus.PENDING;
 
-    /** SHA-256 hex of the raw approval token; never the raw token. Single-use. */
-    @Column(name = "token_hash", length = 64)
-    private String tokenHash;
-
-    @Column(name = "token_expires_at")
-    private OffsetDateTime tokenExpiresAt;
-
     @Column(name = "decided_at")
     private OffsetDateTime decidedAt;
 
@@ -108,39 +92,29 @@ public class ServiceTypeSuggestion {
             String categoryName,
             String suggestedName,
             String description,
-            UUID requestedByUserId,
-            String tokenHash,
-            OffsetDateTime tokenExpiresAt) {
+            UUID requestedByUserId) {
         this.categoryName = categoryName;
         this.suggestedName = suggestedName;
         this.description = description;
         this.requestedByUserId = requestedByUserId;
         this.status = ServiceTypeSuggestionStatus.PENDING;
-        this.tokenHash = tokenHash;
-        this.tokenExpiresAt = tokenExpiresAt;
     }
 
     /**
-     * Creates a PENDING suggestion: not promoted into the catalog until approval, with a
-     * hashed single-use token and a 7-day expiry. On approval the suggestion is
+     * Creates a PENDING suggestion: not promoted into the catalog until approval. On approval the suggestion is
      * materialized into a {@code service_types} row + a draft service for the requester
      * (Phase 16.9).
-     *
-     * @param tokenHash SHA-256 hex of the raw token (raw token is emailed, never stored)
      */
     public static ServiceTypeSuggestion ofPending(
             String categoryName,
             String suggestedName,
             String description,
-            UUID requestedByUserId,
-            String tokenHash,
-            OffsetDateTime tokenExpiresAt) {
-        return new ServiceTypeSuggestion(
-                categoryName, suggestedName, description, requestedByUserId, tokenHash, tokenExpiresAt);
+            UUID requestedByUserId) {
+        return new ServiceTypeSuggestion(categoryName, suggestedName, description, requestedByUserId);
     }
 
     /**
-     * Approves a PENDING suggestion: marks APPROVED and clears the token (single-use).
+     * Approves a PENDING suggestion: marks APPROVED.
      * Caller guarantees the current status is PENDING. The catalog/service materialization
      * happens in {@code ServiceTypeSuggestionService.decide} via
      * {@code ServiceTypePromotionService} (Phase 16.9) — this mutator never touches
@@ -149,11 +123,10 @@ public class ServiceTypeSuggestion {
     public void approve(OffsetDateTime decidedAt) {
         this.status = ServiceTypeSuggestionStatus.APPROVED;
         this.decidedAt = decidedAt;
-        clearToken();
     }
 
     /**
-     * Rejects a PENDING suggestion: marks REJECTED and clears the token (single-use).
+     * Rejects a PENDING suggestion: marks REJECTED.
      * Caller guarantees the current status is PENDING.
      */
     public void reject(OffsetDateTime decidedAt) {
@@ -165,7 +138,6 @@ public class ServiceTypeSuggestion {
         this.status = ServiceTypeSuggestionStatus.REJECTED;
         this.decidedAt = decidedAt;
         this.decisionReason = reason;
-        clearToken();
     }
 
     public boolean isPending() {
@@ -173,8 +145,7 @@ public class ServiceTypeSuggestion {
     }
 
     /**
-     * B502 (SVC-55) — corrects the suggested name of a PENDING suggestion. The token stays valid (track D2): the
-     * emailed link then approves the corrected name. Caller has already validated and canonicalised the name.
+     * B502 (SVC-55) — corrects the suggested name of a PENDING suggestion. Caller has already validated and canonicalised the name.
      *
      * @throws IllegalStateException when the suggestion is no longer PENDING (the service checks first)
      */
@@ -183,10 +154,5 @@ public class ServiceTypeSuggestion {
             throw new IllegalStateException("Only a PENDING suggestion can be renamed");
         }
         this.suggestedName = canonicalName;
-    }
-
-    private void clearToken() {
-        this.tokenHash = null;
-        this.tokenExpiresAt = null;
     }
 }
