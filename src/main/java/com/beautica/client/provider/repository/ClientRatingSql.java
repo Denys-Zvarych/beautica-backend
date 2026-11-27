@@ -7,17 +7,23 @@ import static com.beautica.client.provider.repository.ClientListSql.SALON_WHERE;
 /**
  * B526 — the viewer's own visible ratings of one client (CLI-59); B546 adds the guest (phone-keyed) arm. Scope = B507's WHERE blocks verbatim;
  * {@code client_reviews.booking_id} is unique (uq_client_reviews_booking), so the join is an index read from the
- * scope's bookings. Only {@code cr.rating} is selected — never the comment, author or review id (REV-36).
+ * scope's bookings. The own-ratings page selects only {@code cr.rating} — never the comment, author or review id
+ * (REV-36). B565 adds the anonymous cross-provider comments page (REV-44): review id, visit month, stars, text and a
+ * per-viewer {@code own} flag; never the author, salon, master, service or exact date.
  */
 final class ClientRatingSql {
 
     private ClientRatingSql() {
     }
 
-    /** The one join shared by the page and the count (the three scope WHEREs + FILTER follow it). */
-    private static final String FROM = """
+    /** B565 — the review-to-visit join alone; the comments page needs no service (REV-44: no service, no date). */
+    private static final String FROM_REVIEWS = """
             FROM bookings b
               JOIN client_reviews cr ON cr.booking_id = b.id
+            """;
+
+    /** The one join shared by the page and the count (the three scope WHEREs + FILTER follow it). */
+    private static final String FROM = FROM_REVIEWS + """
               JOIN master_services ms ON ms.id = b.master_service_id
               JOIN service_definitions sd ON sd.id = ms.service_def_id
             """;
@@ -93,6 +99,50 @@ final class ClientRatingSql {
     static final String COUNT_GUEST_SALON = COUNT_SELECT + SALON_WHERE + FILTER_GUEST;
     static final String COUNT_GUEST_SALON_MASTER = COUNT_SELECT + SALON_MASTER_WHERE + FILTER_GUEST;
     static final String COUNT_GUEST_MASTER = COUNT_SELECT + MASTER_WHERE + FILTER_GUEST;
+
+    // ── B565 (REV-44, REV-D10): every visible non-blank comment about the client, from ANY provider ──
+    // Cross-provider on purpose: no scope WHERE here — the caller first passes the card's own gate (EXISTS / anchor
+    // phone). Anonymous: the author columns feed only the per-viewer `own` predicate, never a selected column.
+    // Non-blank = at least one non-whitespace character (the write path stores the text as sent, so a
+    // newline-only comment exists); `\S` instead of `[[:space:]]`, whose colon would parse as a named parameter.
+
+    private static final String COMMENTS_SELECT_OPEN = """
+            SELECT cr.id AS reviewId,
+                   to_char(b.starts_at AT TIME ZONE 'Europe/Kyiv', 'YYYY-MM') AS visitMonth,
+                   cr.rating AS stars, cr.comment AS comment,
+            """;
+    private static final String OWN_SALON = "       (cr.salon_id IS NOT NULL AND cr.salon_id = :salonId) AS own\n";
+    private static final String OWN_INDEPENDENT =
+            "       (cr.author_master_id = :masterId AND cr.salon_id IS NULL) AS own\n";
+    private static final String OWN_SALON_MASTER = "       (cr.author_master_id = :masterId) AS own\n";
+
+    private static final String COMMENTS_VISIBLE = """
+               AND cr.moderation_status = 'VISIBLE' AND cr.comment IS NOT NULL AND cr.comment ~ '\\S'
+            """;
+    private static final String COMMENTS_USER_WHERE = " WHERE cr.subject_client_id = :userId\n" + COMMENTS_VISIBLE;
+    private static final String COMMENTS_GUEST_WHERE = " WHERE cr.subject_guest_phone = :phone\n" + COMMENTS_VISIBLE;
+    private static final String COMMENTS_TAIL = """
+             ORDER BY cr.created_at DESC, cr.id
+             LIMIT :limit OFFSET :offset
+            """;
+
+    static final String COMMENTS_USER_SALON =
+            COMMENTS_SELECT_OPEN + OWN_SALON + FROM_REVIEWS + COMMENTS_USER_WHERE + COMMENTS_TAIL;
+    static final String COMMENTS_USER_INDEPENDENT =
+            COMMENTS_SELECT_OPEN + OWN_INDEPENDENT + FROM_REVIEWS + COMMENTS_USER_WHERE + COMMENTS_TAIL;
+    static final String COMMENTS_USER_SALON_MASTER =
+            COMMENTS_SELECT_OPEN + OWN_SALON_MASTER + FROM_REVIEWS + COMMENTS_USER_WHERE + COMMENTS_TAIL;
+    static final String COMMENTS_GUEST_SALON =
+            COMMENTS_SELECT_OPEN + OWN_SALON + FROM_REVIEWS + COMMENTS_GUEST_WHERE + COMMENTS_TAIL;
+    static final String COMMENTS_GUEST_INDEPENDENT =
+            COMMENTS_SELECT_OPEN + OWN_INDEPENDENT + FROM_REVIEWS + COMMENTS_GUEST_WHERE + COMMENTS_TAIL;
+    static final String COMMENTS_GUEST_SALON_MASTER =
+            COMMENTS_SELECT_OPEN + OWN_SALON_MASTER + FROM_REVIEWS + COMMENTS_GUEST_WHERE + COMMENTS_TAIL;
+    // The count reads client_reviews alone: every predicate is a cr column and booking_id is a NOT NULL FK (V128),
+    // so the bookings join of the page (needed only for the visit month) cannot change the row count.
+    private static final String COUNT_COMMENTS_FROM = "SELECT COUNT(*)\nFROM client_reviews cr\n";
+    static final String COUNT_COMMENTS_USER = COUNT_COMMENTS_FROM + COMMENTS_USER_WHERE;
+    static final String COUNT_COMMENTS_GUEST = COUNT_COMMENTS_FROM + COMMENTS_GUEST_WHERE;
 
     static final String COUNT_SALON = COUNT_SELECT + SALON_WHERE + FILTER;
     static final String COUNT_SALON_MASTER = COUNT_SELECT + SALON_MASTER_WHERE + FILTER;
