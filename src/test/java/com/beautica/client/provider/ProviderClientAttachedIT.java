@@ -32,8 +32,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * B527 (CLI-62..64, D7, D8) — what a PROVIDER sees once guest / walk-in bookings are attached to a client account: one
  * client row and one card per person (cases 10, 11), the account's current verified phone on the booking detail (12),
- * one block answer per person (13, 15) and the provider's rating of an attached walk-in (17). The attach itself runs
- * through the real {@link ClientPhoneAttachService}.
+ * one block answer per person (13, 15) and the provider's rating of an attached walk-in, rated as the account (17,
+ * REV-D04). The attach itself runs through the real {@link ClientPhoneAttachService}.
  */
 @DisplayName("Provider surfaces after a phone attach — B527")
 class ProviderClientAttachedIT extends AbstractIntegrationTest {
@@ -210,9 +210,9 @@ class ProviderClientAttachedIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("17 (REV-D04, audit MEDIUM): an attached COMPLETED STAFF walk-in is NOT rateable — 400, no review row, "
-            + "no rating change")
-    void should_return400_when_providerRatesAnAttachedWalkIn() throws Exception {
+    @DisplayName("17 (REV-D04, B546): an attached COMPLETED STAFF walk-in IS rateable — 201, the review's subject is the "
+            + "attached account (no guest phone) and users.avg_rating / review_count include it")
+    void should_rateAttachedWalkIn_when_providerRatesCompletedAttachedBooking() throws Exception {
         Salon s = fx.salon();
         UUID account = verifiedClient("Петро", "Сидоренко", PHONE);
         UUID staff = fx.guestBooking(s.masterId(), s.salonId(), "STAFF", PHONE, "Іванна", "Гість", "COMPLETED", fx.at(-5));
@@ -220,11 +220,15 @@ class ProviderClientAttachedIT extends AbstractIntegrationTest {
 
         ResponseEntity<String> response = rate(s, staff);
 
-        assertThat(response.getStatusCode()).as(response.getBody()).isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?",
-                Integer.class, staff)).isZero();
+        assertThat(response.getStatusCode()).as(response.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(jdbcTemplate.queryForObject("SELECT subject_client_id FROM client_reviews WHERE booking_id = ?",
+                UUID.class, staff)).isEqualTo(account);
+        assertThat(jdbcTemplate.queryForObject("SELECT subject_guest_phone FROM client_reviews WHERE booking_id = ?",
+                String.class, staff)).isNull();
+        assertThat(jdbcTemplate.queryForObject("SELECT avg_rating FROM users WHERE id = ?", java.math.BigDecimal.class,
+                account)).isEqualByComparingTo("4");
         assertThat(jdbcTemplate.queryForObject("SELECT review_count FROM users WHERE id = ?", Integer.class, account))
-                .isZero();
+                .isOne();
     }
 
     @Test
