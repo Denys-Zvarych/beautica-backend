@@ -18,6 +18,8 @@
 -- The partial index backs the guest readout (ClientRatingSql guest arm) and the GST-51 delete; JPA @Index cannot
 -- declare a partial index, so it is documented on ClientReview instead of mirrored in @Table.
 -- No external-storage column (§O-8 n/a). Fix-forward version: max existing = V268.
+-- non-destructive
+-- both CHECKs hold for every existing row (all carry subject_client_id) and for every previous-app INSERT (sets subject_client_id, never subject_guest_phone).
 SET LOCAL lock_timeout = '3s';
 SET LOCAL statement_timeout = '5min';
 

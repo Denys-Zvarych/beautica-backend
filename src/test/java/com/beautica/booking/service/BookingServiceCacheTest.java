@@ -161,6 +161,8 @@ class BookingServiceCacheTest {
     // eviction paths exercised here never reach either.
     @MockBean com.beautica.moderation.service.ClientBlockService clientBlockService;
     @MockBean com.beautica.moderation.service.BookingBlockGuard bookingBlockGuard;
+    // B547: ClientRatingEligibility entered the BookingService constructor — same slice rule, mocked.
+    @MockBean com.beautica.review.service.ClientRatingEligibility clientRatingEligibility;
 
     /** Fixed so a test can seed a master-calendar key that really belongs to the booking's master. */
     private static final UUID MASTER_ID = UUID.randomUUID();
