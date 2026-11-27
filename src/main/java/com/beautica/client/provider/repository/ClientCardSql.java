@@ -66,8 +66,13 @@ final class ClientCardSql {
     // The anchor = the newest scope row; the guest name + surname come from ONE row, the newest that carries a name
     // (never a mixed «Марія Петренко»). Two top-1 reads of the (single-client, multiply-referenced hence materialised)
     // `scoped` CTE instead of three per-aggregate array builds.
+    // B530 (CLI-89): nextVisitKey = the visit of the earliest CONFIRMED row starting after :now (tie: lowest booking
+    // id, the nextVisitAt order); a scalar top-1 over the same `scoped` CTE, so ?masterId= narrowing holds.
     private static final String CARD_AGG = """
-            SELECT agg.*, lt.id AS anchorBookingId, nm.guest_name AS guestName, nm.guest_surname AS guestSurname
+            SELECT agg.*, lt.id AS anchorBookingId, nm.guest_name AS guestName, nm.guest_surname AS guestSurname,
+                   (SELECT s2.visit_key FROM scoped s2
+                     WHERE s2.status = 'CONFIRMED' AND s2.starts_at > :now
+                     ORDER BY s2.starts_at, s2.id LIMIT 1) AS nextVisitKey
               FROM (SELECT COUNT(DISTINCT visit_key) AS totalVisits,
                            COUNT(DISTINCT visit_key) FILTER (WHERE status = 'COMPLETED') AS completedVisits,
                            COUNT(DISTINCT visit_key) FILTER (WHERE status = 'CONFIRMED' AND starts_at > :now)

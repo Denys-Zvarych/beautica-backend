@@ -23,6 +23,9 @@ public interface ClientCardRowProjection {
 
     Instant getNextVisitAt();
 
+    /** B530: the visit key holding the earliest CONFIRMED booking after now in scope; null when none. */
+    UUID getNextVisitKey();
+
     /** The guest's latest booking in scope (the stable card handle); null for a registered client. */
     UUID getAnchorBookingId();
 

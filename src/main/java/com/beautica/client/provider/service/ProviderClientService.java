@@ -215,9 +215,12 @@ public class ProviderClientService {
     // ── B508: client card + visit history (CLI-42..45) ───────────────────────
 
     /**
-     * One aggregate statement + one block lookup (the guest phone is read inside the aggregate from the anchor booking).
-     * Unknown / out-of-scope / anonymised / registered-anchor all produce zero visits in scope and the same
-     * {@link NotFoundException} (D6) — never a 403, so ids cannot be probed across salons.
+     * One aggregate statement + one block lookup (the guest phone is read inside the aggregate from the anchor booking),
+     * plus the next visit's items only when there is one (B530, CLI-89). Unknown / out-of-scope / anonymised /
+     * registered-anchor all produce zero visits in scope and the same {@link NotFoundException} (D6) — never a 403, so
+     * ids cannot be probed across salons. Default isolation (B530 D4, display-only read): if the next visit changes
+     * between the aggregate and the items statement, the {@code items.isEmpty()} guard yields {@code nextVisit = null}
+     * and the next load self-heals.
      */
     @Transactional(readOnly = true)
     public ClientCardResponse getCard(ClientScope scope, ClientRef ref) {
@@ -229,6 +232,7 @@ public class ProviderClientService {
         ClientCardResponse.Stats stats = new ClientCardResponse.Stats((int) total,
                 toInt(row.getCompletedVisits()), toInt(row.getUpcomingVisits()));
         List<ClientCardResponse.ServedMaster> servedBy = parseServedByMasters(row.getServedByMasters());
+        ClientVisitResponse nextVisit = loadNextVisit(scope, row.getNextVisitKey());
         return switch (ref) {
             case Registered(UUID userId) -> {
                 // B527 D7: account row OR the hash of the account's verified phone (one blockedAmong statement).
@@ -248,7 +252,7 @@ public class ProviderClientService {
                         ratingCount > 0 ? row.getAvgRating() : null, ratingCount, distribution,
                         utc(row.getFirstVisitAt()),
                         utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats, servedBy,
-                        namePart(row.getFirstName()), namePart(row.getLastName()));
+                        namePart(row.getFirstName()), namePart(row.getLastName()), nextVisit);
             }
             case GuestAnchor ignored -> {
                 String guestPhone = row.getGuestPhone();
@@ -266,7 +270,7 @@ public class ProviderClientService {
                         phonePolicy.phoneFor(guestPhone), blocked, ratingCount > 0 ? row.getAvgRating() : null,
                         ratingCount, distribution,
                         utc(row.getFirstVisitAt()), utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats,
-                        servedBy, namePart(row.getGuestName()), namePart(row.getGuestSurname()));
+                        servedBy, namePart(row.getGuestName()), namePart(row.getGuestSurname()), nextVisit);
             }
         };
     }
@@ -297,10 +301,8 @@ public class ProviderClientService {
         }
         List<ClientVisitResponse> visits = new ArrayList<>(keys.size());
         for (ClientVisitPageRowProjection page : pageRows) {
-            List<ClientVisitItemProjection> items = itemsByVisit.getOrDefault(page.getVisitKey(), List.of());
-            visits.add(new ClientVisitResponse(page.getVisitKey(), utc(page.getStartsAt()),
-                    items.isEmpty() ? null : items.get(0).getSalonId(),
-                    items.stream().map(ProviderClientService::toItem).toList()));
+            visits.add(toVisitResponse(page.getVisitKey(), utc(page.getStartsAt()),
+                    itemsByVisit.getOrDefault(page.getVisitKey(), List.of())));
         }
         return new PageImpl<>(visits, pageable, total);
     }
@@ -576,6 +578,30 @@ public class ProviderClientService {
                     repository.visitItemsBySalonAndMaster(salonId, masterId, keys);
             case MasterScope(UUID masterId, UUID ignoredSalonId) -> repository.visitItemsByMaster(masterId, keys);
         };
+    }
+
+    /**
+     * B530 — the card's next visit in the visits-page row shape: one items statement (the page's, same scope), only
+     * when the aggregate found a key. {@code startsAt} = the earliest item start (items come ordered by start), as the
+     * page's MIN over the same scope rows; null when the visit's rows left scope between the aggregate and this
+     * statement (default isolation, B530 D4: a moment-stale card self-heals on the next load).
+     */
+    @Nullable
+    private ClientVisitResponse loadNextVisit(ClientScope scope, @Nullable UUID nextVisitKey) {
+        if (nextVisitKey == null) {
+            return null;
+        }
+        List<ClientVisitItemProjection> items = loadVisitItems(scope, List.of(nextVisitKey));
+        if (items.isEmpty()) {
+            return null;
+        }
+        return toVisitResponse(nextVisitKey, utc(items.get(0).getStartsAt()), items);
+    }
+
+    private static ClientVisitResponse toVisitResponse(UUID visitKey, @Nullable OffsetDateTime startsAt,
+                                                       List<ClientVisitItemProjection> items) {
+        return new ClientVisitResponse(visitKey, startsAt, items.isEmpty() ? null : items.get(0).getSalonId(),
+                items.stream().map(ProviderClientService::toItem).toList());
     }
 
     private static ClientVisitResponse.Item toItem(ClientVisitItemProjection p) {
