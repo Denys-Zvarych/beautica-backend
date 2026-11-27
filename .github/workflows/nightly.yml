@@ -10,10 +10,11 @@ name: Nightly
 # Takes effect only once it is on main (via the dev -> main release PR; never a hotfix). Requires the repo setting
 # "Workflow permissions" to allow the GITHUB_TOKEN `actions: write` scope below.
 #
-# Failure notification: a dispatched run is fire-and-forget, so a red nightly would be invisible. This
-# job therefore finds the run it dispatched and WAITS for it, failing when it fails. A failed run of
-# THIS workflow is what GitHub e-mails/notifies (the user who last touched the cron), so the dispatched
-# result needs no extra notification plumbing. Cost: one idle runner for the length of the suite.
+# Failure notification (phase 567 L4, fire-and-forget): this job dispatches, confirms the run exists
+# (fails when it never appears) and exits; it no longer idles a runner for the whole suite. The
+# dispatched run's own `Nightly report` job (pr-validate.yml, reason=nightly only) opens or comments on
+# the one open `nightly-red` issue and fails when the run's CI Gate is not green, cancelled included.
+# (Not a `workflow_run` reporter: CiInfraCoverageTest denies that trigger repo-wide.)
 #
 # Skip rule: a scheduled run is skipped when the newest NIGHTLY run on main (run title
 # `dispatch:nightly:*`, i.e. reason=nightly, which always runs with --rerun) succeeded on the current
@@ -24,8 +25,7 @@ name: Nightly
 # gives each its own concurrency group, so this job passes token=<this run id>-<attempt> and finds the
 # run by that exact title. No createdAt/clock comparison, and no other run can replace or cancel it.
 #
-# Timeout: 75 min = plan 10 + test 45 + verify 10 plus slack, the dispatched workflow's own ceiling.
-# The watcher idles one runner for that whole time; accepted as the price of a visible red nightly.
+# Timeout: 5 min = dispatch + up to 2 min polling for the run to appear.
 
 on:
   schedule:
@@ -38,8 +38,8 @@ permissions:
 jobs:
   dispatch-full-run:
     name: Dispatch full run on main
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
+    timeout-minutes: 5
     permissions:
       actions: write
       contents: read
@@ -70,7 +70,7 @@ jobs:
 
       # GITHUB_TOKEN is allowed to trigger workflow_dispatch (the one exception to the
       # "no recursive workflow triggers" rule).
-      - name: Dispatch pr-validate on main and wait for it
+      - name: Dispatch pr-validate on main
         if: steps.gate.outputs.skip != 'true'
         run: |
           set -euo pipefail
@@ -87,5 +87,4 @@ jobs:
           done
           [[ -n "$id" ]] || { echo "::error::dispatched run '$title' did not appear"; exit 1; }
           echo "Dispatched run: https://github.com/$GH_REPO/actions/runs/$id" | tee -a "$GITHUB_STEP_SUMMARY"
-          # --exit-status: non-zero when the dispatched run fails or is cancelled, which fails this job.
-          gh run watch "$id" --interval 60 --exit-status >/dev/null
+          # No watcher (phase 567 L4): the dispatched run reports a red result itself (Nightly report job).
