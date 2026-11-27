@@ -4,8 +4,12 @@ name: Gitleaks
 # SECRET SCAN (free replacement for GitHub Advanced Security push protection)
 #
 # Scans the repository for committed secrets (API keys, tokens, DB URLs,
-# private keys, etc.) using gitleaks. Runs on every PR and push to dev/main,
-# plus a weekly FULL-HISTORY sweep. Any finding fails the job.
+# private keys, etc.) using gitleaks. Runs on every PR into dev/main, plus a
+# weekly FULL-HISTORY sweep. Any finding fails the job.
+#
+# No `push` trigger (phase 567 L7): dev/main only receive commits through PRs
+# (rulesets block direct pushes), and every PR was already scanned; the weekly
+# full-history scan is the backstop.
 #
 # Cost / licensing:
 #   - Free for personal-account repos (Denys-Zvarych/*). The GITLEAKS_LICENSE
@@ -22,8 +26,6 @@ name: Gitleaks
 on:
   pull_request:
     branches: [main, dev]
-  push:
-    branches: [main, dev]
   schedule:
     # Weekly full-history sweep — Mondays 06:00 UTC.
     - cron: '0 6 * * 1'
@@ -36,13 +38,13 @@ permissions:
 jobs:
   gitleaks:
     name: Scan for secrets
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     steps:
       - name: Checkout (full history)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           # fetch-depth: 0 pulls the ENTIRE history so the scheduled deep scan
-          # and the PR/push diff range both have every commit available.
+          # and the PR diff range both have every commit available.
           fetch-depth: 0
           # No authenticated git after checkout (scan is local-only).
           persist-credentials: false

@@ -19,20 +19,26 @@ run-name: >-
 #
 # Pull requests run only the test classes the affected-test selector says can
 # observe the change (scripts/ci/select-tests.sh, src/test/java/com/beautica/ci).
-# FULL suites run on: push to dev/main, workflow_dispatch (the nightly run dispatches
-# this workflow on `main`, see nightly.yml), PRs labelled `full-ci`, and any PR that touches CI
-# infrastructure. Full runs, and selective runs above 120 classes, are sharded across 3 runners,
+# FULL suites run on: workflow_dispatch (the nightly run dispatches this workflow on `main`, see
+# nightly.yml), the promotion PR dev -> main, PRs labelled `full-ci`, any PR that touches CI
+# infrastructure, and a push to dev/main whenever plan-decide.sh has any doubt (phase 567: a push whose
+# exact tree already passed is `verified`; otherwise it runs the selector on before..after). Full runs, and selective runs above 120 classes, are sharded across 3 runners,
 # balanced by class weight (heavy integration tests spread evenly, see TestSharder).
 #
 #   (promotion-source lives in its own pull_request_target workflow, promotion-source.yml: phase 370 D5)
 #   plan           decides mode + non-empty shards. NO project compile: selector = plain javac of JDK-only classes
 #   plan           (also) th:utext email-template guard: the BASE copy of the script, run AFTER selection
-#   gates          compile + `build -x test`; skipped when mode=none
-#   selector-self-test  only when CI infra changed
-#   test           matrix shard, skipped when mode=none
-#   verify         proves every selected class executed (runs the BASE copy of the script, read-only token)
-#   report         publishes results to the job summary (read-only token, no PR code, no scripts); presentation only, NOT a ci-gate need
-#   ci-gate        the ONLY required status check (if: always(), skipped != failure)
+#   plan           (phase 567) route first, from the trusted scripts/ci/plan-decide.sh: promotion PR main <- dev ->
+#                  full; draft PR -> mode=deferred (no Test, CI Gate RED); push -> mode=verified when the exact tree
+#                  already passed the whole required set in its PR run, else selective on before..after; doubt -> full
+#   gates          compile + `build -x test`; skipped when mode=none|verified (runs on a draft)
+#   selector-self-test  only when CI infra changed (also runs the scripts/ci/tests meta tests)
+#   test           matrix shard, only when mode=full|selective
+#   verify         proves every selected class executed (runs the BASE copy of the script, read-only token),
+#                  then publishes results to the job summary (former `report` job; presentation only)
+#   ci-gate        the ONLY required status check (if: always()); decided by the BASE copy of
+#                  scripts/ci/gate-aggregate.sh (skipped != failure only where the mode allows it)
+#   nightly-report reason=nightly dispatch only: a red nightly opens/updates the `nightly-red` issue (phase 567 L4)
 #
 # TRUST MODEL. A pull_request run executes the PR's own code, so the gate must not be decided by it:
 #   * the selector, its rules and select-tests.sh run from the merge commit's BASE parent
@@ -65,7 +71,9 @@ on:
     # the real run: they get their own concurrency group (below), skip every job, and only the
     # ci-gate job runs, mirroring the real run's conclusion (a bare green no-op gate for the same
     # SHA could satisfy the required check while the real run is still pending or has failed).
-    types: [opened, synchronize, reopened, labeled]
+    # `ready_for_review` (phase 567 L3): a draft run defers Test and its CI Gate is red; marking the PR
+    # ready starts the real run on the same head.
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
   # Defense-in-depth: also compile + test the merged tip of the protected branches.
   # This job is prod-secret-free (test profile + CI dummy JWT only), so it is safe on push.
   push:
@@ -112,8 +120,14 @@ jobs:
     name: Plan
     # Irrelevant-label events do nothing here; ci-gate mirrors the real run instead.
     if: github.event.action != 'labeled' || github.event.label.name == 'full-ci'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 10
+    # actions: read lets the push route (phase 567 L1) read the merged PR's run, check runs and selection artifact.
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      pull-requests: read
     outputs:
       mode: ${{ steps.select.outputs.mode }}
       count: ${{ steps.select.outputs.count }}
@@ -127,12 +141,14 @@ jobs:
       db-backup: ${{ steps.select.outputs.db_backup }}
     steps:
       # A pull_request checkout is the merge commit (parents: base tip, PR head). Depth 2 is exactly
-      # enough to diff it against its base parent; other events need only the tip.
+      # enough to diff it against its base parent. A push needs `github.event.before` for its
+      # before..after diff (phase 567 L1; a rebase merge can put it several commits back): full history.
+      # Dispatch needs only the tip. ('0' is quoted: a bare 0 is falsy in an expression and would fall through to 1.)
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || github.event_name == 'push' && '0' || 1 }}
 
       - name: Set up Java 21
         uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
@@ -149,6 +165,16 @@ jobs:
           FULL_CI_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci') }}
           HEAD_COMMIT: ${{ github.sha }}
           RUN_REASON: ${{ inputs.reason }}
+          # Phase 567 route inputs (plan-decide.sh). Author-controlled values reach the shell only via env.
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          # Only the push route's L1 lookup calls `gh`; pull_request / dispatch never see a token.
+          GH_TOKEN: ${{ github.event_name == 'push' && github.token || '' }}
         run: |
           set -euo pipefail
           # Selector outputs live OUTSIDE the PR tree (a committed build/ci* symlink must not redirect a write).
@@ -156,18 +182,20 @@ jobs:
           trusted="$GITHUB_WORKSPACE"      # tree whose script + selector decide; the PR tree itself except on PRs
           trusted_sha="$HEAD_COMMIT"
           infra=""
+          base_sha=""
           forbid_script="$GITHUB_WORKSPACE/scripts/forbid_th_utext_in_email.sh"   # non-PR events: the pushed/dispatched ref itself
+          # CI-infrastructure guard, deliberately NOT part of the selector: computed from the git
+          # diff in plain shell so no edit to selector/rules/script can switch it off.
+          # Everything SelectorRules treats as ALWAYS_FULL that can alter HOW tests run (build wiring,
+          # test resources, shared test bases/support/config, docker). Kept in step with
+          # SelectorRules + .github/CODEOWNERS by CiInfraCoverageTest. -z + quotepath=false: NUL-separated
+          # raw paths, so non-ASCII file names are matched instead of arriving as "\320\260..." octal.
+          # Push runs (phase 567) apply the same regex to before..after inside plan-decide.sh.
+          infra_re='^(\.github/|scripts/ci/|scripts/forbid_th_utext_in_email\.sh$|src/test/java/com/beautica/ci/|build\.gradle\.kts$|settings\.gradle\.kts$|gradle\.properties$|gradle/|gradlew|docker/|Dockerfile|src/test/resources/|src/test/java/com/beautica/([^/]+\.java$|(.*/)?Abstract[^/]*\.java$|(.*/)?support/|(.*/)?[^/]*Support\.java$|(.*/)?Test[^/]*Config[^/]*\.java$))'
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             read -r -a parents <<<"$(git rev-list --parents -n 1 HEAD)"
             [[ ${#parents[@]} -eq 3 ]] || { echo "::error::pull_request checkout is not a merge commit"; exit 1; }
             base_sha=${parents[1]}
-            # CI-infrastructure guard, deliberately NOT part of the selector: computed from the git
-            # diff in plain shell so no edit to selector/rules/script can switch it off.
-            # Everything SelectorRules treats as ALWAYS_FULL that can alter HOW tests run (build wiring,
-            # test resources, shared test bases/support/config, docker). Kept in step with
-            # SelectorRules + .github/CODEOWNERS by CiInfraCoverageTest. -z + quotepath=false: NUL-separated
-            # raw paths, so non-ASCII file names are matched instead of arriving as "\320\260..." octal.
-            infra_re='^(\.github/|scripts/ci/|scripts/forbid_th_utext_in_email\.sh$|src/test/java/com/beautica/ci/|build\.gradle\.kts$|settings\.gradle\.kts$|gradle\.properties$|gradle/|gradlew|docker/|Dockerfile|src/test/resources/|src/test/java/com/beautica/([^/]+\.java$|(.*/)?Abstract[^/]*\.java$|(.*/)?support/|(.*/)?[^/]*Support\.java$|(.*/)?Test[^/]*Config[^/]*\.java$))'
             infra=$(git -c core.quotepath=false diff -z --no-renames --name-only "$base_sha" HEAD \
               | grep -zE "$infra_re" | tr '\0' '\n' || true)
             if git cat-file -e "$base_sha:scripts/ci/select-tests.sh" 2>/dev/null; then
@@ -193,18 +221,50 @@ jobs:
               infra="${infra:-bootstrap: base has no scripts/ci}"
             fi
           fi
-          if [[ "$EVENT_NAME" != "pull_request" ]]; then
-            "$trusted/scripts/ci/select-tests.sh" --force-full "full run: $EVENT_NAME"
+          # Phase 567 route: promotion PR -> full (Q1), draft -> deferred (L3), push -> verified-tree skip or
+          # selective on before..after (L1); every doubt -> full (Q4). Decided by the TRUSTED copy of
+          # plan-decide.sh; a base without it (the PR that ships it) keeps the pre-567 routes.
+          route_env="$RUNNER_TEMP/route.env"
+          if [[ -f "$trusted/scripts/ci/plan-decide.sh" ]]; then
+            INFRA="$infra" INFRA_RE="$infra_re" BASE_SHA="$base_sha" HEAD_SHA="$(git rev-parse HEAD)" \
+              SHA="$HEAD_COMMIT" BEFORE="${PUSH_BEFORE:-}" bash "$trusted/scripts/ci/plan-decide.sh" >"$route_env" \
+              || printf 'ROUTE=full\nREASON=full run: plan-decide.sh failed\nBASE_SHA=\nHEAD_SHA=\n' >"$route_env"
+          elif [[ "$EVENT_NAME" != "pull_request" ]]; then
+            printf 'ROUTE=full\nREASON=full run: %s\nBASE_SHA=\nHEAD_SHA=\n' "$EVENT_NAME" >"$route_env"
           elif [[ -n "$infra" ]]; then
-            # The self-test job runs com.beautica.ci.* on this path; do not run it a second time in the shards.
-            EXCLUDE_PREFIX=com.beautica.ci. "$trusted/scripts/ci/select-tests.sh" \
-              --force-full "CI infrastructure changed: $(head -1 <<<"$infra")" true
+            printf 'ROUTE=infra\nREASON=CI infrastructure changed: %s\nBASE_SHA=\nHEAD_SHA=\n' "$(head -1 <<<"$infra")" >"$route_env"
           elif [[ "$FULL_CI_LABEL" == "true" ]]; then
-            "$trusted/scripts/ci/select-tests.sh" --force-full "full run: label full-ci"
+            printf 'ROUTE=full\nREASON=full run: label full-ci\nBASE_SHA=\nHEAD_SHA=\n' >"$route_env"
           else
-            # BASE_SHA..HEAD is exactly what the test jobs check out and run (the merge commit).
-            BASE_SHA="$base_sha" HEAD_SHA="$(git rev-parse HEAD)" "$trusted/scripts/ci/select-tests.sh"
+            printf 'ROUTE=selective\nREASON=pull_request diff\nBASE_SHA=%s\nHEAD_SHA=%s\n' "$base_sha" "$(git rev-parse HEAD)" >"$route_env"
           fi
+          route=$(sed -n 's/^ROUTE=//p' "$route_env" | head -1)
+          route_reason=$(sed -n 's/^REASON=//p' "$route_env" | head -1)
+          route_base=$(sed -n 's/^BASE_SHA=//p' "$route_env" | head -1)
+          route_head=$(sed -n 's/^HEAD_SHA=//p' "$route_env" | head -1)
+          echo "route=$route reason=$route_reason"
+          case "$route" in
+            deferred | verified)
+              # plan-decide.sh wrote selection.env itself (MODE=$route, empty lists); the selector is not run.
+              grep -qx "MODE=$route" "$CI_OUT_DIR/selection.env" || { echo "::error::route $route without its selection.env"; exit 1; } ;;
+            infra)
+              # The self-test job runs com.beautica.ci.* on this path; do not run it a second time in the shards.
+              EXCLUDE_PREFIX=com.beautica.ci. "$trusted/scripts/ci/select-tests.sh" --force-full "$route_reason" true ;;
+            selective)
+              # PR: BASE_SHA..HEAD is exactly what the test jobs check out and run (the merge commit).
+              # Push: before..after of the merged tip (phase 567 L1, base moved since the PR run).
+              BASE_SHA="$route_base" HEAD_SHA="$route_head" "$trusted/scripts/ci/select-tests.sh"
+              # A push may only be full|selective|verified (CI Gate): a push diff that selects nothing is a
+              # doubt, run everything instead.
+              if [[ "$EVENT_NAME" == "push" ]] && grep -qx 'MODE=none' "$CI_OUT_DIR/selection.env"; then
+                "$trusted/scripts/ci/select-tests.sh" --force-full "full run: push diff selected no test class"
+              fi ;;
+            *)
+              # full, and fail-safe for an empty/unknown route: never less than a full run (Q4).
+              "$trusted/scripts/ci/select-tests.sh" --force-full "${route_reason:-full run: $EVENT_NAME (no route)}" ;;
+          esac
+          # Phase 567 L1: the tree this run tested; a later push of the identical tree may skip (verified).
+          git rev-parse 'HEAD^{tree}' >"$CI_OUT_DIR/tree.txt"
           # Phase 366: ops/db-backup has its own jobs (shellcheck + DbBackupRoundTripIT). They run on a PR only when
           # that directory or the IT's package (src/test/java/com/beautica/ops/) changed (plain git diff, like `infra`
           # above) and always on the nightly dispatch. `ops/**`
@@ -269,14 +329,17 @@ jobs:
         with:
           name: selection
           path: ${{ runner.temp }}/ci-out/
-          retention-days: 7
+          # 30 d (phase 567): the post-merge push reads tree.txt from the PR run's artifact (L1).
+          retention-days: 30
 
   gates:
     name: Gates
     needs: plan
-    # Nothing to compile when no test class is affected; ci-gate does not require this job then.
-    if: needs.plan.outputs.mode != 'none'
-    runs-on: ubuntu-latest
+    # Nothing to compile when no test class is affected (none) or the identical tree already passed
+    # (verified, push only); ci-gate does not require this job then. A draft (deferred) still compiles.
+    # Allow-list: an unknown/empty mode skips here and fails in ci-gate.
+    if: needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'selective' || needs.plan.outputs.mode == 'deferred'
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - name: Checkout code
@@ -316,7 +379,7 @@ jobs:
     # Only when CI infrastructure changed (the plan forces mode=full then; this job adds the
     # fail-loud falsification and is the only run of com.beautica.ci.*, excluded from the shards).
     if: needs.plan.outputs.ci-changed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - name: Checkout code
@@ -339,6 +402,20 @@ jobs:
         run: ./gradlew test --tests "com.beautica.ci.*"
         env:
           JWT_SECRET: ${{ env.CI_DUMMY_JWT_SECRET }}
+
+      # Phase 567 meta tests (TC-1/TC-13 gate, TC-2/TC-4 route, TC-8/TC-10/TC-11/TC-12 workflow text, Q1/Q2 step parity). This job
+      # runs whenever CI infrastructure (.github/, scripts/ci/) changed, i.e. on every edit they pin.
+      - name: CI Gate aggregation table test
+        run: bash scripts/ci/tests/gate-aggregate-test.sh
+
+      - name: Plan route table test
+        run: bash scripts/ci/tests/plan-decide-test.sh
+
+      - name: Workflow wiring meta test
+        run: bash scripts/ci/tests/workflow-meta-test.sh
+
+      - name: Plan Select-tests step parity test
+        run: bash scripts/ci/tests/plan-select-parity-test.sh
 
       - name: verify-selected-ran.sh accepts classes that ran
         run: |
@@ -384,7 +461,7 @@ jobs:
     name: db-backup shellcheck
     needs: plan
     if: needs.plan.outputs.db-backup == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Checkout code
@@ -412,7 +489,7 @@ jobs:
     name: db-backup image IT
     needs: plan
     if: needs.plan.outputs.db-backup == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -463,7 +540,7 @@ jobs:
     name: Test (shard ${{ matrix.shard }})
     needs: plan
     if: needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'selective'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -536,20 +613,28 @@ jobs:
   # Least privilege: read-only token, and the script comes from the BASE (trusted-sha), never the PR
   # tree. Gradle's failOnNoMatchingTests only fails when the WHOLE filter matches nothing, so prove,
   # across all shards, that each selected class produced a report with tests > 0.
+  # Phase 567 L6: the former `Report` job is the last step here (same downloads, one runner). The reporter
+  # writes the job summary (use-actions-summary), never the Checks API -- v1.9.1's checks.update right after
+  # checks.create hit GitHub's transient 404 (dorny/test-reporter #866) and failed the nightly dispatch run
+  # 43841923539 -- so the token stays read-only. It runs NO repository scripts and stays presentation only:
+  # `if: always()` + continue-on-error, so it never decides this job's result.
   verify:
     name: Verify selection ran
     needs: [plan, test]
     if: always() && (needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'selective')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
+      # Trusted tree only (no PR code): scripts/ci for the verifier, src/test/java for the reporter's `git ls-files`.
       - name: Checkout trusted scripts
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ needs.plan.outputs.trusted-sha }}
-          sparse-checkout: scripts/ci
+          sparse-checkout: |
+            scripts/ci
+            src/test/java
           persist-credentials: false
 
       - name: Download selection
@@ -570,34 +655,9 @@ jobs:
           ./scripts/ci/verify-selected-ran.sh "$RUNNER_TEMP/ci-out/selected-tests.txt" build/merged-results "$RUNNER_TEMP/ci-out/report-aliases.txt"
           echo "Executed test-class reports: $(find build/merged-results -name '*.xml' | wc -l)" >> "$GITHUB_STEP_SUMMARY"
 
-  # Read-only: the reporter writes the job summary (use-actions-summary), never the Checks API --
-  # v1.9.1's checks.update right after checks.create hit GitHub's transient 404 (dorny/test-reporter
-  # #866) and failed the nightly dispatch run 43841923539. Still runs NO repository scripts and checks
-  # out NO pull-request code; the sparse trusted checkout exists only for the reporter's `git ls-files`.
-  report:
-    name: Report
-    needs: [plan, test]
-    if: always() && (needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'selective')
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout trusted tree (no PR code)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ needs.plan.outputs.trusted-sha }}
-          sparse-checkout: src/test/java
-          persist-credentials: false
-
-      - name: Download shard results
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          pattern: test-results-*
-          path: build/merged-results
-          merge-multiple: true
-
       - name: Publish test results
+        if: always()
+        continue-on-error: true
         uses: dorny/test-reporter@d1b5dff021aa968b288b02285a8bf47471c5928a # v3.2.0
         with:
           name: JUnit Tests
@@ -610,12 +670,13 @@ jobs:
     name: CI Gate
     needs: [plan, gates, selector-self-test, test, verify, db-backup-shellcheck, db-backup-it]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     # Normally seconds; an irrelevant-label event waits for the real run it mirrors.
     timeout-minutes: 90
     permissions:
       actions: read
       contents: read
+      pull-requests: read
     steps:
       # An irrelevant label must neither restart the pipeline nor report a bare green: it reports
       # whatever the real run for the same head SHA concludes (and waits for it if still running).
@@ -673,55 +734,101 @@ jobs:
             *) echo "::error::the real run for $HEAD_SHA concluded '$conclusion'"; exit 1 ;;
           esac
 
-      # The single required check. `skipped` is fine ONLY where the plan says the job was not
-      # needed; a failed `plan` makes every dependent skip, which must not read as green. Unknown or
-      # inconsistent plan output fails closed.
+      # The single required check. Phase 567: the aggregation lives in scripts/ci/gate-aggregate.sh and the
+      # BASE copy decides (plan's trusted-sha, like verify). Never the PR tree's copy: an empty trusted-sha
+      # (plan failed) is red before anything is checked out.
+      - name: Require a trusted revision
+        if: github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'full-ci'
+        env:
+          TRUSTED_SHA: ${{ needs.plan.outputs.trusted-sha }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+        run: |
+          set -euo pipefail
+          [[ "$PLAN_RESULT" == "success" ]] || { echo "::error::plan must succeed (got $PLAN_RESULT)"; exit 1; }
+          [[ "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::plan gave no trusted revision ('$TRUSTED_SHA')"; exit 1; }
+
+      - name: Checkout trusted scripts
+        if: github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'full-ci'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.plan.outputs.trusted-sha }}
+          sparse-checkout: scripts/ci
+          path: trusted
+          persist-credentials: false
+
       - name: Aggregate results
         if: github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'full-ci'
         env:
           NEEDS: ${{ toJSON(needs) }}
           EVENT_NAME: ${{ github.event_name }}
+          # Q1: the promotion PR (main <- dev, same repo) must be a full run.
+          IS_PROMOTION: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          script=trusted/scripts/ci/gate-aggregate.sh
+          if [[ -f "$script" ]]; then
+            bash "$script"
+            exit 0
+          fi
+          # Bootstrap only (the PR shipping gate-aggregate.sh): its base has no copy. That PR changes
+          # scripts/ci, so plan forced mode=full + the selector self-test; apply the pre-567 rules inline.
+          echo "::warning::base has no scripts/ci/gate-aggregate.sh (bootstrap): pre-567 inline aggregation"
           fail=0
           result() { jq -r --arg k "$1" '.[$k].result' <<<"$NEEDS"; }
           mode=$(jq -r '.plan.outputs.mode // ""' <<<"$NEEDS")
           count=$(jq -r '.plan.outputs.count // ""' <<<"$NEEDS")
-          ci_changed=$(jq -r '.plan.outputs["ci-changed"] // ""' <<<"$NEEDS")
-          echo "plan=$(result plan) mode=${mode:-?} count=${count:-?} gates=$(result gates) self-test=$(result selector-self-test) test=$(result test) verify=$(result verify)"
-
           require_success() { [[ "$(result "$1")" == "success" ]] || { echo "::error::$1 must succeed (got $(result "$1"))"; fail=1; }; }
           require_success plan
-          # `report` is deliberately not a need: it only publishes a check, it decides nothing.
-          case "$mode" in
-            full | selective) require_success gates; require_success test; require_success verify
-              [[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo "::error::mode=$mode needs a positive class count (got '$count')"; fail=1; } ;;
-            none)
-              [[ "$count" == "0" ]] || { echo "::error::mode=none needs count=0 (got '$count')"; fail=1; } ;;
-            *) echo "::error::unknown mode '$mode'"; fail=1 ;;
-          esac
-          # Only pull requests may be anything but a full run; CI-infra changes are always full.
-          if [[ "$EVENT_NAME" != "pull_request" && "$mode" != "full" ]]; then
-            echo "::error::$EVENT_NAME run must be mode=full (got '$mode')"; fail=1
-          fi
-          if [[ "$ci_changed" == "true" ]]; then
-            require_success selector-self-test
-            [[ "$mode" == "full" ]] || { echo "::error::CI infrastructure changed but mode=$mode"; fail=1; }
-          fi
-
-          # Phase 366: when plan asked for the db-backup jobs they must have passed (never silently skipped).
+          [[ "$mode" == "full" ]] || { echo "::error::bootstrap run must be mode=full (got '$mode')"; fail=1; }
+          require_success gates; require_success test; require_success verify
+          [[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo "::error::mode=$mode needs a positive class count (got '$count')"; fail=1; }
+          if [[ "$(jq -r '.plan.outputs["ci-changed"] // ""' <<<"$NEEDS")" == "true" ]]; then require_success selector-self-test; fi
           if [[ "$(jq -r '.plan.outputs["db-backup"] // ""' <<<"$NEEDS")" == "true" ]]; then
-            require_success db-backup-shellcheck
-            require_success db-backup-it
+            require_success db-backup-shellcheck; require_success db-backup-it
           fi
-
           for job in $(jq -r 'keys[]' <<<"$NEEDS"); do
-            case "$(result "$job")" in
-              failure|cancelled) echo "::error::$job finished as $(result "$job")"; fail=1 ;;
-            esac
+            case "$(result "$job")" in failure|cancelled) echo "::error::$job finished as $(result "$job")"; fail=1 ;; esac
           done
           exit "$fail"
 
+  # Phase 567 L4: nightly.yml only dispatches (no idle watcher). A red nightly must still be loud: this job
+  # opens (or comments on) ONE open issue labelled `nightly-red` and fails. Dispatch-only, so no pull_request
+  # run ever gets `issues: write`; no checkout, no repository code. Not a ci-gate need.
+  nightly-report:
+    name: Nightly report
+    needs: [ci-gate]
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.reason == 'nightly'
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      GATE_RESULT: ${{ needs.ci-gate.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      HEAD_SHA: ${{ github.sha }}
+    steps:
+      - name: Report a red nightly
+        run: |
+          set -euo pipefail
+          if [[ "$GATE_RESULT" == "success" ]]; then
+            echo "Nightly full run on main is green ($HEAD_SHA)."
+            exit 0
+          fi
+          body="Nightly full run on main concluded \`$GATE_RESULT\` at $HEAD_SHA: $RUN_URL"
+          gh label create nightly-red --color B60205 --description "Nightly full regression on main is red" >/dev/null 2>&1 || true
+          issue=$(gh issue list --label nightly-red --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [[ -n "$issue" ]]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "Nightly full regression is red" --label nightly-red --body "$body"
+          fi
+          echo "::error::nightly full run is red (CI Gate: $GATE_RESULT): $RUN_URL"
+          exit 1
 
 # ────────────────────────────────────────────────────────────────────
 # OpenAPI contract artifact (mobile contract-drift source)
