@@ -17,14 +17,23 @@ on:
     branches:
       - main
       - dev
+  # Phase 567 L5: the three self-tests + the parity check read nothing but THIS file, so on pull_request /
+  # push they run only when this file changed (gate_changed below). The weekly run executes all six jobs
+  # anyway, so a runner-image drift (git, awk, bash) that breaks the gate logic still surfaces.
+  schedule:
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
 
 jobs:
   check-migration-immutability:
     name: Check Migration Immutability
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
+    outputs:
+      # 'false' ONLY when the diff provably does not touch this workflow file; anything else runs them.
+      gate_changed: ${{ steps.gate-changed.outputs.gate_changed }}
 
     steps:
       - name: Checkout code
@@ -34,6 +43,37 @@ jobs:
           # ("$BASE_SHA...HEAD") can resolve. Do not lower this.
           fetch-depth: 0
           persist-credentials: false
+
+      # Phase 567 L5 (Q6): exact-file rule, any doubt -> true. Runs first, before the gate steps, so the
+      # output exists even when a later gate step fails. pull_request: the merge commit against its base
+      # parent AND against the event's base sha; push: before..after; zero/unreachable `before`, a diff
+      # error or any other event -> true.
+      - name: Detect a change to this gate workflow
+        id: gate-changed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          gate_file=.github/workflows/migration-immutability.yml
+          zero_sha=0000000000000000000000000000000000000000
+          changed=true
+          names() { git -c core.quotepath=false diff --no-renames --name-only "$1" HEAD; }
+          case "$EVENT_NAME" in
+            pull_request)
+              if a=$(names HEAD^1) && [ -n "$PR_BASE_SHA" ] && b=$(names "$PR_BASE_SHA"); then
+                if printf '%s\n%s\n' "$a" "$b" | grep -qFx "$gate_file"; then changed=true; else changed=false; fi
+              fi ;;
+            push)
+              if [ -n "$PUSH_BEFORE_SHA" ] && [ "$PUSH_BEFORE_SHA" != "$zero_sha" ] \
+                 && git rev-parse --verify --quiet "${PUSH_BEFORE_SHA}^{commit}" >/dev/null \
+                 && a=$(names "$PUSH_BEFORE_SHA"); then
+                if printf '%s\n' "$a" | grep -qFx "$gate_file"; then changed=true; else changed=false; fi
+              fi ;;
+          esac
+          echo "gate_changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "gate workflow changed: $changed (event=$EVENT_NAME)"
 
       # Event-aware base-revision resolution. This is the ONLY place
       # event type is interpreted; the gate step (and its hermetic
@@ -1008,7 +1048,12 @@ jobs:
 
   self-test-immutability-gate:
     name: Self-test Immutability Gate
-    runs-on: ubuntu-latest
+    needs: check-migration-immutability
+    # Phase 567 L5: only when this file changed (or any non-PR/push event, e.g. the weekly schedule). A job
+    # skipped by `if:` reports as passing, which keeps the required parity check satisfied. `!= 'false'`:
+    # an empty output (detection step never ran) runs the job; !cancelled() so a red gate does not skip it.
+    if: ${{ !cancelled() && (needs.check-migration-immutability.outputs.gate_changed != 'false' || (github.event_name != 'pull_request' && github.event_name != 'push')) }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -1351,7 +1396,7 @@ jobs:
 
   check-migration-version-monotonicity:
     name: Check Migration Version Monotonicity
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -1631,7 +1676,12 @@ jobs:
 
   self-test-version-monotonicity-gate:
     name: Self-test Version Monotonicity Gate
-    runs-on: ubuntu-latest
+    needs: check-migration-immutability
+    # Phase 567 L5: only when this file changed (or any non-PR/push event, e.g. the weekly schedule). A job
+    # skipped by `if:` reports as passing, which keeps the required parity check satisfied. `!= 'false'`:
+    # an empty output (detection step never ran) runs the job; !cancelled() so a red gate does not skip it.
+    if: ${{ !cancelled() && (needs.check-migration-immutability.outputs.gate_changed != 'false' || (github.event_name != 'pull_request' && github.event_name != 'push')) }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -1956,7 +2006,12 @@ jobs:
 
   self-test-base-revision-resolution:
     name: Self-test Base Revision Resolution
-    runs-on: ubuntu-latest
+    needs: check-migration-immutability
+    # Phase 567 L5: only when this file changed (or any non-PR/push event, e.g. the weekly schedule). A job
+    # skipped by `if:` reports as passing, which keeps the required parity check satisfied. `!= 'false'`:
+    # an empty output (detection step never ran) runs the job; !cancelled() so a red gate does not skip it.
+    if: ${{ !cancelled() && (needs.check-migration-immutability.outputs.gate_changed != 'false' || (github.event_name != 'pull_request' && github.event_name != 'push')) }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 10
     # Hermetic: no checkout, only throwaway git repos in $TMPDIR, so the token needs no scope at all.
     permissions: {}
@@ -3420,7 +3475,12 @@ jobs:
 
   verify-gate-mirror-parity:
     name: Verify Gate <-> Mirror Parity
-    runs-on: ubuntu-latest
+    needs: check-migration-immutability
+    # Phase 567 L5: only when this file changed (or any non-PR/push event, e.g. the weekly schedule). A job
+    # skipped by `if:` reports as passing, which keeps the required parity check satisfied. `!= 'false'`:
+    # an empty output (detection step never ran) runs the job; !cancelled() so a red gate does not skip it.
+    if: ${{ !cancelled() && (needs.check-migration-immutability.outputs.gate_changed != 'false' || (github.event_name != 'pull_request' && github.event_name != 'push')) }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
