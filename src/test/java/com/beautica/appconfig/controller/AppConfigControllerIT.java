@@ -3,11 +3,13 @@ package com.beautica.appconfig.controller;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
+import com.beautica.support.SpringDocWarmup;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.springdoc.webmvc.api.OpenApiWebMvcResource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpEntity;
@@ -210,9 +212,13 @@ class AppConfigControllerIT extends AbstractIntegrationTest {
         @Autowired
         private ObjectMapper docsObjectMapper;
 
+        @Autowired
+        private OpenApiWebMvcResource docsOpenApiResource;
+
         @Test
         @DisplayName("/api-docs exposes GET /api/v1/app/config with every contract field required")
         void should_markAllFieldsRequired_when_specRendered() throws Exception {
+            SpringDocWarmup.warm(docsOpenApiResource);
             JsonNode spec = docsObjectMapper.readTree(
                     docsRestTemplate.getForEntity("/api-docs", String.class).getBody());
 

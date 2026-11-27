@@ -4,6 +4,7 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.security.PhoneHasher;
 import com.beautica.review.repository.ClientReviewRepository;
 import com.beautica.support.HibernateStatistics;
+import com.beautica.support.SpringDocWarmup;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.EntityManagerFactory;
@@ -13,6 +14,7 @@ import com.beautica.client.provider.ProviderClientFixtures.Salon;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springdoc.webmvc.api.OpenApiWebMvcResource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpEntity;
@@ -67,6 +69,7 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
 
     @Autowired private TestRestTemplate restTemplate;
     @Autowired private ObjectMapper objectMapper;
+    @Autowired private OpenApiWebMvcResource openApiResource;
     @Autowired private PhoneHasher phoneHasher;
     @Autowired private ClientReviewRepository clientReviewRepository;
     @Autowired private TransactionTemplate transactionTemplate;
@@ -1528,6 +1531,7 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
     @DisplayName("B530 case 8: /api-docs publishes ClientCardResponse.nextVisit as a nullable ClientVisitResponse")
     void should_publishNullableNextVisitRef_when_specIsGenerated() throws Exception {
         // Arrange
+        SpringDocWarmup.warm(openApiResource);
         ResponseEntity<String> resp = restTemplate.getForEntity("/api-docs", String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode schema = objectMapper.readTree(resp.getBody()).path("components").path("schemas")
