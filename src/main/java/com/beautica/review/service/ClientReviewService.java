@@ -1,5 +1,6 @@
 package com.beautica.review.service;
 
+import com.beautica.auth.Role;
 import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
@@ -7,12 +8,18 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
+import com.beautica.moderation.entity.ReportTargetType;
+import com.beautica.moderation.service.ModerationService;
 import com.beautica.review.dto.ClientReviewResponse;
 import com.beautica.review.dto.CreateClientReviewRequest;
 import com.beautica.review.entity.ClientReview;
+import com.beautica.review.entity.ModerationStatus;
 import com.beautica.review.event.ClientReviewCreatedEvent;
+import com.beautica.review.event.ClientReviewDeletedEvent;
 import com.beautica.review.repository.ClientReviewRepository;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
@@ -42,15 +49,22 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class ClientReviewService {
 
+    private static final Logger log = LoggerFactory.getLogger(ClientReviewService.class);
+    /** Same 8-char id prefix as the moderation resolve log (no full ids in logs). */
+    private static final int REVIEW_ID_LOG_PREFIX = 8;
+
     private final ClientReviewRepository clientReviewRepository;
     private final BookingRepository bookingRepository;
     private final AuthorizationService authz;
     private final ApplicationEventPublisher eventPublisher;
     private final ClientRatingEligibility eligibility;
+    private final ClientReviewOwnership ownership;
+    private final ModerationService moderationService;
 
     static final String GUEST_DISABLED_MESSAGE = "Cannot review a guest booking — no client account exists";
     static final String NO_IDENTITY_MESSAGE = "Cannot review this booking — it has no client identity";
     static final String DUPLICATE_MESSAGE = "A client review already exists for this booking";
+    static final String REVIEW_NOT_FOUND_MESSAGE = "Client review not found";
 
     // No Clock field here — unlike ReviewService#createReview, this write path's eligibility gate
     // (BookingClosureRule#isProviderReviewEligible) is a pure STATUS check with no TIME half, so
@@ -128,6 +142,32 @@ public class ClientReviewService {
         // 7. Locked product decision: no notification/outbox row is enqueued for this event — a
         // client is never told a master reviewed them.
         return ClientReviewResponse.from(saved);
+    }
+
+    /**
+     * B570 (REV-45, REV-D12) — deletes a visible client rating (stars and comment) that is the caller's own by the
+     * REV-44 {@code own} predicate ({@link ClientReviewOwnership}). Unknown, not own, moderation-hidden and already
+     * deleted are one 404, so existence never leaks. The row is locked first, so a concurrent moderation transition
+     * is either seen here or waits for this delete. Open reports on it close as {@code TARGET_GONE} in the same
+     * transaction; a registered subject's aggregate is recalculated after commit (a guest's moves on read). The
+     * freed {@code UNIQUE(booking_id)} lets the booking be rated again (REV-42). No notification; the comment is
+     * never logged.
+     */
+    @Transactional
+    public void deleteOwn(UUID reviewId, UUID actorUserId, Role actorRole) {
+        ClientReview review = clientReviewRepository.findByIdForUpdate(reviewId)
+                .filter(r -> r.getModerationStatus() == ModerationStatus.VISIBLE)
+                .filter(r -> ownership.isOwn(actorUserId, actorRole, r))
+                .orElseThrow(() -> new NotFoundException(REVIEW_NOT_FOUND_MESSAGE));
+        UUID clientId = review.getSubjectClient() == null ? null : review.getSubjectClient().getId();
+
+        clientReviewRepository.delete(review);
+        clientReviewRepository.flush();
+        int reportsClosed = moderationService.closeReportsOnDeletedTarget(ReportTargetType.CLIENT_REVIEW, reviewId);
+        eventPublisher.publishEvent(new ClientReviewDeletedEvent(clientId));
+        // Audit line: role, id prefix and report count only — never the comment, the client id or a phone.
+        log.info("Client review {} deleted by {} ({} open reports closed as TARGET_GONE)",
+                reviewId.toString().substring(0, REVIEW_ID_LOG_PREFIX), actorRole, reportsClosed);
     }
 
     /** The race backstop's constraint: {@code client_reviews.booking_id} is unique (V128). */

@@ -47,6 +47,18 @@ public class ClientReviewEventListener {
         recalculate(event.clientId());
     }
 
+    /**
+     * B570 (REV-45) — a provider deleted their own rating. Only a registered subject has a stored aggregate; a guest's
+     * phone-keyed rating is computed on read, so a {@code null} client id makes no call.
+     */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void onClientReviewDeleted(ClientReviewDeletedEvent event) {
+        if (event.clientId() != null) {
+            recalculate(event.clientId());
+        }
+    }
+
     private void recalculate(java.util.UUID clientId) {
         try {
             clientReviewRepository.recalculateClientRating(clientId);

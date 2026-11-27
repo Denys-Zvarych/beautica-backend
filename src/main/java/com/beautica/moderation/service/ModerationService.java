@@ -107,6 +107,24 @@ public class ModerationService {
         return new ResolveReportResponse(type, targetId, resolution, resolved);
     }
 
+    /**
+     * B570 (REV-45, MOD-E03) — the author deleted the target: in the caller's transaction every OPEN report on it is
+     * closed as {@code TARGET_GONE}, every report gets {@code target_gone_at} (the D7 one-year clock), and its live
+     * e-mail action links are revoked — the same three writes {@link #resolve} makes for a target found gone. No
+     * outcome notification (REV-45: no email or push).
+     *
+     * @return the number of OPEN reports closed
+     */
+    @Transactional
+    public int closeReportsOnDeletedTarget(ReportTargetType type, UUID targetId) {
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+        int closed = contentReportRepository.resolveOpenOnTarget(
+                type, targetId, ReportResolution.TARGET_GONE, null, now);
+        contentReportRepository.markTargetGone(type, targetId, now);
+        actionTokenRepository.revokeAllForTarget(type, targetId, now);
+        return closed;
+    }
+
     /** Phase 414 D9: the oldest OPEN report on a target, the one an e-mailed action resolves. */
     @Transactional(readOnly = true)
     public Optional<UUID> findOldestOpenReportId(ReportTargetType type, UUID targetId) {
