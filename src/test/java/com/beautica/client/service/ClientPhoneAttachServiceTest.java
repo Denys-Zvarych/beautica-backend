@@ -46,6 +46,7 @@ class ClientPhoneAttachServiceTest {
     @Mock private ApplicationEventPublisher eventPublisher;
     @Mock private org.springframework.transaction.PlatformTransactionManager transactionManager;
     @Mock private com.beautica.client.provider.service.ClientListRemovalService clientListRemovalService;
+    @Mock private com.beautica.review.service.ClientRatingSubjectService clientRatingSubjectService;
 
     private ClientPhoneAttachService service;
 
@@ -53,7 +54,7 @@ class ClientPhoneAttachServiceTest {
     void setUp() {
         service = new ClientPhoneAttachService(bookingRepository, appointmentRepository, userRepository,
                 eventPublisher, Clock.fixed(NOW, ZoneOffset.UTC), transactionManager, Runnable::run,
-                clientListRemovalService);
+                clientListRemovalService, clientRatingSubjectService);
     }
 
     private static User account() {
@@ -109,6 +110,32 @@ class ClientPhoneAttachServiceTest {
 
         assertThat(attached).isZero();
         verify(eventPublisher, never()).publishEvent(any(Object.class));
+    }
+
+    @Test
+    @DisplayName("B546 (REV-39) — after the bookings UPDATE, the attached bookings' phone-keyed ratings move to the account in the same transaction")
+    void should_moveGuestRatingsAfterTheBookingsUpdate_when_guestRowsAreAttached() {
+        User user = accountWithId();
+        when(userRepository.findAttachableClientByVerifiedPhone(PHONE)).thenReturn(Optional.of(user));
+        when(bookingRepository.attachGuestRowsByPhone(PHONE, user.getId(), "PHONE_VERIFIED", NOW)).thenReturn(2);
+
+        service.attachByPhone(PHONE, AttachReason.PHONE_VERIFIED);
+
+        InOrder order = inOrder(bookingRepository, clientRatingSubjectService);
+        order.verify(bookingRepository).attachGuestRowsByPhone(PHONE, user.getId(), "PHONE_VERIFIED", NOW);
+        order.verify(clientRatingSubjectService).moveGuestRatingsToAccount(user.getId());
+    }
+
+    @Test
+    @DisplayName("B546 — nothing attached, no rating move statement")
+    void should_notMoveGuestRatings_when_nothingWasAttached() {
+        User user = accountWithId();
+        when(userRepository.findAttachableClientByVerifiedPhone(PHONE)).thenReturn(Optional.of(user));
+        when(bookingRepository.attachGuestRowsByPhone(any(), any(), any(), any())).thenReturn(0);
+
+        service.attachByPhone(PHONE, AttachReason.PHONE_VERIFIED);
+
+        verify(clientRatingSubjectService, never()).moveGuestRatingsToAccount(any());
     }
 
     @Test
@@ -328,7 +355,7 @@ class ClientPhoneAttachServiceTest {
         ClientPhoneAttachService rejecting = new ClientPhoneAttachService(bookingRepository, appointmentRepository,
                 userRepository, eventPublisher, Clock.fixed(NOW, ZoneOffset.UTC), transactionManager,
                 r -> { throw new org.springframework.core.task.TaskRejectedException("full"); },
-                clientListRemovalService);
+                clientListRemovalService, clientRatingSubjectService);
         User user = verifiedAccount();
 
         org.assertj.core.api.Assertions.assertThatCode(

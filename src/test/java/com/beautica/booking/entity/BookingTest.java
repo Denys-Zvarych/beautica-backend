@@ -73,4 +73,33 @@ class BookingTest {
         assertThat(moved.isReminder2hRearmed()).as("moved row re-armed").isTrue();
         assertThat(unchanged.isReminder2hRearmed()).as("unchanged row not re-armed").isFalse();
     }
+
+    // ── B546 (REV-D04) — isRateableByProvider: client identity = account OR guest phone, any source ──
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0}, client={1}, phone={2} -> {3}")
+    @org.junit.jupiter.params.provider.CsvSource({
+            "APP,   true,  false, true",
+            "APP,   false, false, false",
+            "LINK,  true,  false, true",
+            "LINK,  false, true,  true",
+            "LINK,  false, false, false",
+            "STAFF, true,  false, true",
+            "STAFF, false, true,  true",
+            "STAFF, false, false, false",
+            "LINK,  true,  true,  true",
+            "STAFF, true,  true,  true"
+    })
+    @DisplayName("B546 — rateable exactly when the booking has a client account or a guest phone, whatever its source (STAFF included)")
+    void should_beRateable_when_bookingHasClientOrGuestPhone(
+            com.beautica.booking.enums.BookingSource source, boolean hasClient, boolean hasPhone, boolean expected) {
+        Booking booking = Booking.builder()
+                .bookingSource(source)
+                .client(hasClient ? org.mockito.Mockito.mock(com.beautica.user.User.class) : null)
+                .guestPhone(hasPhone ? "+380509998877" : null)
+                .build();
+
+        boolean rateable = booking.isRateableByProvider();
+
+        assertThat(rateable).isEqualTo(expected);
+    }
 }

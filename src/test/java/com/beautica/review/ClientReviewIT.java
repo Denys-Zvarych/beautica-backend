@@ -242,14 +242,12 @@ class ClientReviewIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Phase 355 — INVERTED from phase 316. The invited {@code SALON_MASTER} may not rate the client,
-     * not even of the booking they performed: the role is out of the controller's role list and
-     * rejected inside {@code canReviewClient}. Owner/admin rate instead.
+     * B547 (REV-11, REV-D06) — INVERTED from phase 355. The {@code SALON_MASTER} who performed the
+     * booking may rate its client; the row is account-keyed and the aggregate recalculates.
      */
     @Test
-    @DisplayName("403 when a SALON_MASTER tries to review the client of the booking THEY performed "
-            + "(phase 355 — reverses 316/320)")
-    void should_return403_when_salonMasterReviewsClientOfOwnPerformedBooking() throws Exception {
+    @DisplayName("201 when a SALON_MASTER reviews the client of the booking THEY performed (B547)")
+    void should_return201_when_salonMasterReviewsClientOfOwnPerformedBooking() throws Exception {
         Salon salon = createSalon("clirev-sm-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("clirev-sm-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "COMPLETED");
@@ -259,11 +257,11 @@ class ClientReviewIT extends AbstractIntegrationTest {
                 URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.masterEmail))), String.class);
 
         assertThat(resp.getStatusCode())
-                .as("a salon master never rates the client at a salon — body=%s", resp.getBody())
-                .isEqualTo(HttpStatus.FORBIDDEN);
+                .as("the performing salon master rates the client — body=%s", resp.getBody())
+                .isEqualTo(HttpStatus.CREATED);
         assertThat(jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
-                .isZero();
+                "SELECT subject_client_id FROM client_reviews WHERE booking_id = ?", UUID.class, bookingId))
+                .isEqualTo(clientId);
     }
 
     /** A salon master is rejected for a colleague's booking too (role gate; unchanged outcome). */

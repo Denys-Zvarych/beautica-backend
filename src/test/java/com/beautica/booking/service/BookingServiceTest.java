@@ -201,7 +201,10 @@ class BookingServiceTest {
                 clientBlockService,
                 bookingBlockGuard,
                 // B504 (D18): an unstubbed mock returns an empty label map, so categoryDisplayName stays null.
-                categoryLabelResolver
+                categoryLabelResolver,
+                // B546: the REAL predicate (guest flag off, the production default), never a mock.
+                new com.beautica.review.service.ClientRatingEligibility(
+                        new com.beautica.review.config.ClientRatingProperties(false))
         );
         // Phase 397: provider-role detail reads ask for the block state; default to "not blockable".
         lenient().when(clientBlockService.blockStateFor(any(), any(), any()))
@@ -5062,6 +5065,71 @@ class BookingServiceTest {
         assertThat(result.clientPhone()).isNull();
         verify(authz).enforceCanViewBooking(eq(providerActorId), any());
         verify(authz, never()).isGuestPhoneAudience();
+    }
+
+    // ── getBooking — B546 scope 10 (BOOK-78, REV-D10): a guest booking carries its phone-keyed rating ───────
+
+    private Booking guestDetailBooking() {
+        Booking guestBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        setField(guestBooking, "client", null);
+        setField(guestBooking, "guestName", "Оксана");
+        setField(guestBooking, "guestPhone", GUEST_PHONE);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(guestBooking));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        return guestBooking;
+    }
+
+    private static com.beautica.review.repository.ClientReviewRepository.GuestRatingProjection guestRating(Integer count, BigDecimal avg) {
+        return new com.beautica.review.repository.ClientReviewRepository.GuestRatingProjection() {
+            @Override
+            public BigDecimal getAvgRating() {
+                return avg;
+            }
+
+            @Override
+            public Integer getReviewCount() {
+                return count;
+            }
+        };
+    }
+
+    @Test
+    @DisplayName("B546 (BOOK-78) — a guest booking detail carries the phone-keyed avg + count (one statement)")
+    void should_fillGuestClientRating_when_guestBookingHasPhone() {
+        guestDetailBooking();
+        when(clientReviewRepository.guestRatingByPhone(GUEST_PHONE))
+                .thenReturn(guestRating(2, new BigDecimal("4.50")));
+
+        BookingDetailResponse result = bookingService.getBooking(UUID.randomUUID(), bookingId);
+
+        assertThat(result.clientAvgRating()).isEqualByComparingTo("4.50");
+        assertThat(result.clientReviewCount()).isEqualTo(2);
+        verify(clientReviewRepository).guestRatingByPhone(GUEST_PHONE);
+    }
+
+    @Test
+    @DisplayName("B546 (BOOK-78) — an unrated guest with a phone gets count 0 and a null average, not null/null")
+    void should_returnZeroCount_when_guestBookingIsUnrated() {
+        guestDetailBooking();
+        when(clientReviewRepository.guestRatingByPhone(GUEST_PHONE)).thenReturn(guestRating(0, null));
+
+        BookingDetailResponse result = bookingService.getBooking(UUID.randomUUID(), bookingId);
+
+        assertThat(result.clientAvgRating()).isNull();
+        assertThat(result.clientReviewCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("B546 (GST-51) — an anonymised guest booking keeps null/null and pays no rating statement")
+    void should_keepNullRating_when_guestPiiAnonymised() {
+        Booking guestBooking = guestDetailBooking();
+        setField(guestBooking, "guestPiiAnonymisedAt", java.time.Instant.parse("2026-11-01T10:00:00Z"));
+
+        BookingDetailResponse result = bookingService.getBooking(UUID.randomUUID(), bookingId);
+
+        assertThat(result.clientAvgRating()).isNull();
+        assertThat(result.clientReviewCount()).isNull();
+        verify(clientReviewRepository, never()).guestRatingByPhone(any());
     }
 
     @Test

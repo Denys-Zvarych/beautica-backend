@@ -1,5 +1,6 @@
 package com.beautica.client.provider;
 
+import com.beautica.common.RatingBucket;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.client.provider.dto.ClientCardResponse;
 import com.beautica.client.provider.dto.ClientKind;
@@ -65,6 +66,8 @@ import static org.mockito.Mockito.when;
 @DisplayName("ProviderClientService — B508 card + visits")
 class ProviderClientServiceTest {
 
+    private static final String GUEST_PHONE = "+380671112233";
+
     private static final Instant NOW = Instant.parse("2026-11-20T10:00:00Z");
     private static final String PHONE = "+380501112233";
 
@@ -87,6 +90,48 @@ class ProviderClientServiceTest {
         service = new ProviderClientService(repository, clientBlockService, phoneHasher,
                 new ClientPhonePolicy(authz), ratingSummaryService, Clock.fixed(NOW, ZoneOffset.UTC), new ObjectMapper(),
                 listRemovalService);
+    }
+
+    @Test
+    @DisplayName("B546 (CLI-43, REV-36) — a guest card takes avg/count from the card row and loads the distribution")
+    void should_carryGuestPhoneRating_when_guestCardIsRead() {
+        List<RatingBucket> buckets = List.of(new RatingBucket(5, 1L), new RatingBucket(4, 1L),
+                new RatingBucket(3, 0L), new RatingBucket(2, 0L), new RatingBucket(1, 0L));
+        when(ratingSummaryService.guestDistributionFor(GUEST_PHONE)).thenReturn(buckets);
+        var row = guestCardRow(2, new BigDecimal("4.50"));
+        when(repository.cardGuestBySalon(eq(salonId), eq(bookingId), any())).thenReturn(row);
+        lenient().when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        var card = service.getCard(new SalonScope(salonId, null), new ClientRef.GuestAnchor(bookingId));
+
+        assertThat(card.ratingAvg()).isEqualByComparingTo("4.50");
+        assertThat(card.ratingCount()).isEqualTo(2);
+        assertThat(card.ratingDistribution()).isEqualTo(buckets);
+    }
+
+    @Test
+    @DisplayName("B546 (CLI-47) — an unrated guest card shows no number, count 0 and pays no distribution statement")
+    void should_skipGuestDistribution_when_guestCardIsUnrated() {
+        var row = guestCardRow(0, null);
+        when(repository.cardGuestBySalon(eq(salonId), eq(bookingId), any())).thenReturn(row);
+        lenient().when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        var card = service.getCard(new SalonScope(salonId, null), new ClientRef.GuestAnchor(bookingId));
+
+        assertThat(card.ratingAvg()).isNull();
+        assertThat(card.ratingCount()).isZero();
+        assertThat(card.ratingDistribution()).extracting(RatingBucket::count).containsOnly(0L);
+        verifyNoInteractions(ratingSummaryService);
+    }
+
+    private ClientCardRowProjection guestCardRow(Integer reviewCount, BigDecimal avg) {
+        ClientCardRowProjection row = cardRow(1, 0, 0);
+        lenient().when(row.getGuestPhone()).thenReturn(GUEST_PHONE);
+        lenient().when(row.getReviewCount()).thenReturn(reviewCount);
+        lenient().when(row.getAvgRating()).thenReturn(avg);
+        return row;
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────
@@ -636,45 +681,49 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("guest in salon scope gets an empty page without a page query")
-    void should_returnEmptyPageWithoutPageQuery_when_guestAnchorInSalonScope() {
-        when(repository.existsGuestBySalon(salonId, bookingId)).thenReturn(true);
+    @DisplayName("B546 — guest in salon scope: the anchor's phone keys the page + count (REV-38)")
+    void should_pageGuestRatingsByAnchorPhone_when_guestAnchorInSalonScope() {
+        when(repository.findGuestAnchorPhoneBySalon(salonId, bookingId)).thenReturn(Optional.of(GUEST_PHONE));
+        when(repository.guestRatingsBySalon(salonId, GUEST_PHONE, 20, 0L)).thenReturn(List.of());
+        when(repository.countGuestRatingsBySalon(salonId, GUEST_PHONE)).thenReturn(3L);
 
         Page<com.beautica.client.provider.dto.ClientOwnRatingResponse> page = service.getOwnRatings(
                 new SalonScope(salonId, null), new ClientRef.GuestAnchor(bookingId), PageRequest.of(0, 20));
 
-        assertThat(page.getContent()).isEmpty();
-        assertThat(page.getTotalElements()).isZero();
-        verify(repository, never()).existsUserBySalon(any(), any());
-        verifyNoMoreInteractions(repository);
+        assertThat(page.getTotalElements()).isEqualTo(3);
+        verify(repository, never()).ratingsBySalon(any(), any(), anyInt(), anyLong());
+        verify(repository, never()).existsGuestBySalon(any(), any());
     }
 
     @Test
-    @DisplayName("guest in salon-and-master scope gets an empty page without a page query")
-    void should_returnEmptyPageWithoutPageQuery_when_guestAnchorInSalonMasterScope() {
-        when(repository.existsGuestBySalonAndMaster(salonId, masterId, bookingId)).thenReturn(true);
+    @DisplayName("B546 — guest in salon-and-master scope: the master-narrowed anchor read, page narrowed to the master")
+    void should_pageGuestRatingsByAnchorPhone_when_guestAnchorInSalonMasterScope() {
+        when(repository.findGuestAnchorPhoneBySalonAndMaster(salonId, masterId, bookingId))
+                .thenReturn(Optional.of(GUEST_PHONE));
+        when(repository.guestRatingsBySalonAndMaster(salonId, masterId, GUEST_PHONE, 20, 0L)).thenReturn(List.of());
+        when(repository.countGuestRatingsBySalonAndMaster(salonId, masterId, GUEST_PHONE)).thenReturn(1L);
 
         Page<com.beautica.client.provider.dto.ClientOwnRatingResponse> page = service.getOwnRatings(
                 new SalonScope(salonId, masterId), new ClientRef.GuestAnchor(bookingId), PageRequest.of(0, 20));
 
-        assertThat(page.getContent()).isEmpty();
-        assertThat(page.getTotalElements()).isZero();
-        verify(repository, never()).existsGuestBySalon(any(), any());
-        verifyNoMoreInteractions(repository);
+        assertThat(page.getTotalElements()).isEqualTo(1);
+        verify(repository, never()).guestRatingsBySalon(any(), any(), anyInt(), anyLong());
+        verify(repository, never()).existsGuestBySalonAndMaster(any(), any(), any());
+        verify(repository, never()).findGuestAnchorPhoneBySalon(any(), any());
     }
 
     @Test
-    @DisplayName("guest in master scope gets an empty page without a page query")
-    void should_returnEmptyPageWithoutPageQuery_when_guestAnchorInMasterScope() {
-        when(repository.existsGuestByMaster(masterId, bookingId)).thenReturn(true);
+    @DisplayName("B546 — guest in master scope: the anchor's phone keys the page + count")
+    void should_pageGuestRatingsByAnchorPhone_when_guestAnchorInMasterScope() {
+        when(repository.findGuestAnchorPhoneByMaster(masterId, bookingId)).thenReturn(Optional.of(GUEST_PHONE));
+        when(repository.guestRatingsByMaster(masterId, GUEST_PHONE, 20, 0L)).thenReturn(List.of());
+        when(repository.countGuestRatingsByMaster(masterId, GUEST_PHONE)).thenReturn(2L);
 
         Page<com.beautica.client.provider.dto.ClientOwnRatingResponse> page = service.getOwnRatings(
                 new MasterScope(masterId, salonId), new ClientRef.GuestAnchor(bookingId), PageRequest.of(0, 20));
 
-        assertThat(page.getContent()).isEmpty();
-        assertThat(page.getTotalElements()).isZero();
-        verify(repository, never()).existsGuestBySalon(any(), any());
-        verifyNoMoreInteractions(repository);
+        assertThat(page.getTotalElements()).isEqualTo(2);
+        verify(repository, never()).existsGuestByMaster(any(), any());
     }
 
     @Test
@@ -712,11 +761,12 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("guest anchor outside every scope is not found")
+    @DisplayName("guest anchor outside every scope (empty anchor phone) is not found, no ratings read")
     void should_throwClientNotFound_when_guestAnchorNotInScope() {
-        when(repository.existsGuestBySalon(salonId, bookingId)).thenReturn(false);
-        when(repository.existsGuestBySalonAndMaster(salonId, masterId, bookingId)).thenReturn(false);
-        when(repository.existsGuestByMaster(masterId, bookingId)).thenReturn(false);
+        when(repository.findGuestAnchorPhoneBySalon(salonId, bookingId)).thenReturn(Optional.empty());
+        when(repository.findGuestAnchorPhoneBySalonAndMaster(salonId, masterId, bookingId))
+                .thenReturn(Optional.empty());
+        when(repository.findGuestAnchorPhoneByMaster(masterId, bookingId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.getOwnRatings(new SalonScope(salonId, null),
                 new ClientRef.GuestAnchor(bookingId), PageRequest.of(0, 20))).isInstanceOf(NotFoundException.class);
@@ -906,6 +956,26 @@ class ProviderClientServiceTest {
         assertThat(rows.get(0).ratingCount()).isZero();
         assertThat(rows.get(1).ratingAvg()).isEqualByComparingTo("3.50");
         assertThat(rows.get(1).ratingCount()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("B546 (CLI-47, REV-36) — a guest list row takes avg/count from the page row, no extra statement")
+    void should_mapGuestRatingFromRow_when_guestRowIsListed() {
+        var ratedGuest = listRow(null, PHONE, null);
+        when(ratedGuest.getReviewCount()).thenReturn(3);
+        when(ratedGuest.getAvgRating()).thenReturn(new BigDecimal("4.33"));
+        var unratedGuest = listRow(null, GUEST_PHONE, null);
+        when(unratedGuest.getReviewCount()).thenReturn(0);
+        when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        var rows = list(ratedGuest, unratedGuest);
+
+        assertThat(rows.get(0).ratingAvg()).isEqualByComparingTo("4.33");
+        assertThat(rows.get(0).ratingCount()).isEqualTo(3);
+        assertThat(rows.get(1).ratingAvg()).isNull();
+        assertThat(rows.get(1).ratingCount()).isZero();
+        verifyNoInteractions(ratingSummaryService);
     }
 
     // ── B550: phone mode for q + name parts on the card ──────────────────────

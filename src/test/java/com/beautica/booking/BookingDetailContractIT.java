@@ -578,9 +578,9 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /bookings/{id} — a guest (no client account) booking serves "
-            + "clientAvgRating null and clientReviewCount null")
-    void should_serveNullClientRatingAndCount_when_bookingIsGuestBooking() throws Exception {
+    @DisplayName("GET /bookings/{id} — B546 scope 10 (REV-D10): an unrated guest booking with a phone serves "
+            + "clientAvgRating null and clientReviewCount 0 (its phone-keyed rating, not 'unknown')")
+    void should_serveNullAvgAndZeroCount_when_guestBookingWithPhoneIsUnrated() throws Exception {
         Fixture fx = seedSalonBookingWithDivergentAddresses();
         UUID bookingId = insertGuestBooking(fx);
         String masterToken = tokenFor(jdbcTemplate.queryForObject(
@@ -589,12 +589,12 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
         JsonNode detail = getBookingDetail(bookingId, masterToken);
 
         assertThat(detail.get("clientAvgRating").isNull())
-                .as("guest clientAvgRating must be an explicit null, actual=%s", detail.get("clientAvgRating"))
+                .as("unrated guest clientAvgRating must be an explicit null, actual=%s", detail.get("clientAvgRating"))
                 .isTrue();
-        assertThat(detail.get("clientReviewCount").isNull())
-                .as("guest clientReviewCount must be an explicit null (unknown, not zero), actual=%s",
-                        detail.get("clientReviewCount"))
+        assertThat(detail.get("clientReviewCount").isInt())
+                .as("a guest with a phone has a count (0), not null, actual=%s", detail.get("clientReviewCount"))
                 .isTrue();
+        assertThat(detail.get("clientReviewCount").asInt()).isZero();
     }
 
     @Test

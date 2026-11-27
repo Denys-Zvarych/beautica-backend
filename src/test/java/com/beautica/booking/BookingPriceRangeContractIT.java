@@ -1131,16 +1131,14 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     /**
      * Statement count for a {@code SALON_MASTER} page of REVIEW-ELIGIBLE bookings.
      *
-     * <p><b>Phase 355 — a salon master never rates the client</b> (reverses phases 316/320):
-     * {@code AuthorizationService#filterBookingIdsWithProviderAuthority} answers the empty set for
-     * the role WITHOUT issuing a statement, so {@code loadProviderReviewBatch} stops at
-     * {@code withAuthority.isEmpty()} and neither the salon-ownership lookup nor the
-     * {@code client_reviews} probe fires. 6 = exactly {@link #SALON_MASTER_PAGE_STATEMENTS}: the
-     * review flag costs a salon master NOTHING. A rise means an authority or {@code client_reviews}
-     * lookup is being paid on a branch whose answer cannot change any row's flag. RE-DERIVED FROM A
-     * RUN, measured at TWO row counts (2 and 5): flat reads 6 and 6.
+     * <p><b>B547 (REV-11, REV-D06) — the performing salon master rates the client</b> (reverses
+     * phase 355): the master holds provider authority over the bookings they performed, so
+     * {@code loadProviderReviewBatch} passes {@code withAuthority.isEmpty()} and the
+     * {@code client_reviews} probe fires ONCE for the whole page. 7 = {@link #SALON_MASTER_PAGE_STATEMENTS}
+     * (6) + 1 flat batch probe. A rise means an authority or {@code client_reviews} lookup is being
+     * paid per row. RE-DERIVED FROM A RUN, measured at TWO row counts (2 and 5): flat reads 7 and 7.
      */
-    private static final long SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS = 6L;
+    private static final long SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS = 7L;
 
     /**
      * Statement count for an {@code INDEPENDENT_MASTER} page of REVIEW-ELIGIBLE bookings (unchanged
@@ -1438,14 +1436,14 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     /**
      * Phase 355 — the viewer-aware {@code providerCanReviewClient} on BOTH surfaces, per role, through
      * the service (the flag and the {@code POST /client-reviews} 403 share one predicate; the HTTP
-     * journey is {@code SalonClientFeedbackAuthorityIT}). Owner true, performing salon master false,
+     * journey is {@code SalonClientFeedbackAuthorityIT}). Owner true, performing salon master true (B547),
      * independent own true. The assigned admin is observable on the salon board only: {@code GET
      * /bookings/{id}} and {@code GET /bookings/me} deliberately 403 / reject {@code SALON_ADMIN}
      * (pre-existing view-gate decision, untouched here).
      */
     @Test
     @DisplayName("providerCanReviewClient is viewer-aware on detail AND /bookings/me (phase 355): "
-            + "owner true, admin true (salon board), performing salon master false, independent own true")
+            + "owner true, admin true (salon board), performing salon master true (B547), independent own true")
     void should_agreeOnProviderCanReviewClient_when_detailAndListAreReadPerRole() {
         var salon = fixtures.createSalon("bprc-355-" + System.nanoTime() + "@beautica.test");
         UUID ownerId = jdbcTemplate.queryForObject(
@@ -1473,11 +1471,11 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isTrue());
 
         assertThat(asRole(Role.SALON_MASTER, () -> bookingService.getBooking(masterUserId, salonBookingId))
-                .providerCanReviewClient()).as("performing salon master, detail").isFalse();
+                .providerCanReviewClient()).as("performing salon master, detail").isTrue();
         assertThat(asRole(Role.SALON_MASTER, () -> bookingService.getMyBookings(
                 masterUserId, authFor(Role.SALON_MASTER), null, null, null, null, pageable)).data())
                 .as("performing salon master, list").hasSize(1)
-                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isFalse());
+                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isTrue());
 
         UUID indepId = fixtures.createIndependentMaster("bprc-355-indep-" + System.nanoTime() + "@beautica.test");
         UUID indepUserId = jdbcTemplate.queryForObject(
@@ -1518,9 +1516,9 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("SALON_MASTER scope, REVIEW-ELIGIBLE page — phase 355: the role is answered the empty "
-            + "authority set with NO statement, so neither the salon lookup nor the client_reviews "
-            + "probe fires and the flag is false on every row, pinned at TWO row counts")
+    @DisplayName("SALON_MASTER scope, REVIEW-ELIGIBLE page — B547: the performing master holds authority, "
+            + "so the client_reviews probe fires ONCE for the whole page (+1 flat, one batch probe) and "
+            + "the flag is true on every row, pinned at TWO row counts")
     void should_notScaleStatementCount_when_salonMasterPageIsFullOfReviewEligibleBookings() {
         var salon = fixtures.createSalon(
                 "bprc-qcount-master-reviewable-" + System.nanoTime() + "@beautica.test");
@@ -1547,11 +1545,8 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
 
         assertThat(twoRowPage.data()).hasSize(2);
         assertThat(fiveRowPage.data()).hasSize(5);
-        // THE PREMISE, and it cannot be read off providerCanReviewClient here the way the owner gate
-        // reads it: on this branch the flag is false whether the page short-circuited at
-        // candidates.isEmpty() (+0) or ran the salon lookup and found no authority (+1), so the flag
-        // is blind to exactly the distinction this gate pins. What separates them is the candidate
-        // filter's own two conjuncts, both observable on the row: a registered client, and
+        // THE PREMISE: the probe only fires when every row clears the candidate filter's own two
+        // conjuncts, both observable on the row: a registered client, and
         // review-eligibility — which BookingClosureRule#isProviderReviewEligible grants on
         // COMPLETED by status alone, without consulting endsAt. If a future fixture change flipped
         // either, this
@@ -1572,21 +1567,22 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                     assertThat(b.clientId()).isNotNull();
                     assertThat(b.status()).isEqualTo(BookingStatus.COMPLETED);
                 });
-        // The other half of the premise: the salon master gets NO rate-client flag (phase 355), so
-        // withAuthority is empty and the batch stops at the second early return having issued
-        // nothing. A TRUE here would mean a salon-master arm was re-added to the authority filter.
+        // The other half of the premise: the performing salon master rates the client (B547,
+        // REV-11/REV-D06), so withAuthority is the whole page and the batch runs its ONE
+        // client_reviews probe. A FALSE here would mean the salon-master arm was dropped from the
+        // authority filter and the page fell back onto the +0 empty-authority branch.
         assertThat(fiveRowPage.data())
-                .as("premise — a SALON_MASTER never rates the client, so the page takes the empty-"
-                        + "authority branch")
-                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isFalse());
+                .as("premise — the performing SALON_MASTER rates the client, so the page takes the "
+                        + "one-batch-probe branch")
+                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isTrue());
         assertThat(twoRowPage.data())
                 .as("premise — same, on the smaller page")
-                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isFalse());
+                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isTrue());
 
         assertThat(statementsForFiveRows)
                 .as("absolute JDBC statement count for a 5-row review-eligible SALON_MASTER page — "
-                        + "the +0 branch: neither the salon lookup nor the client_reviews probe "
-                        + "fires. A rise means an authority lookup was re-added for this role.")
+                        + "+1 flat, one batch probe: the client_reviews probe fires once for the page. "
+                        + "A rise means an authority or client_reviews lookup is paid per row.")
                 .isEqualTo(SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS);
         assertThat(statementsForTwoRows)
                 .as("the SAME absolute count on a 2-row page. Pinning one row count cannot "

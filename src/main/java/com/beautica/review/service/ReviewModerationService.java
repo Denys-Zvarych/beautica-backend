@@ -116,7 +116,7 @@ public class ReviewModerationService {
 
     /**
      * Moves a provider&rarr;client review to {@code target}; publishes {@link ClientReviewModerationChangedEvent}
-     * only when the status actually changed.
+     * only when the status actually changed and the subject is an account (a phone-keyed subject has no aggregate).
      *
      * @return {@code false} when the review no longer exists
      * @throws BusinessException 409 when the review is {@code REMOVED} and {@code target} is not (REMOVED is final)
@@ -129,8 +129,11 @@ public class ReviewModerationService {
         }
         ClientReview review = found.get();
         requireNotRemoved(review.getModerationStatus(), target);
-        if (review.moderate(target)) {
-            eventPublisher.publishEvent(new ClientReviewModerationChangedEvent(review.getSubjectClient().getId()));
+        // B546 (REV-38): a phone-keyed guest / walk-in rating has no account and no stored aggregate — its readout is
+        // computed on read from VISIBLE rows (REV-D10), so there is nothing to recalculate.
+        User subject = review.getSubjectClient();
+        if (review.moderate(target) && subject != null) {
+            eventPublisher.publishEvent(new ClientReviewModerationChangedEvent(subject.getId()));
         }
         return true;
     }

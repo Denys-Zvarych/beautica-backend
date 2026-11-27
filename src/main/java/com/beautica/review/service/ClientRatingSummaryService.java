@@ -40,9 +40,22 @@ public class ClientRatingSummaryService {
     /** The grouped bucket query, zero-filled 5 down to 1 (one statement). */
     @Transactional(readOnly = true)
     public List<RatingBucket> distributionFor(UUID clientUserId) {
-        Map<Integer, Long> countsByRating = clientReviewRepository.countBySubjectClientIdGroupByRating(clientUserId)
-                .stream()
-                .collect(Collectors.toMap(RatingCountProjection::getRating, RatingCountProjection::getCount));
+        return zeroFilled(clientReviewRepository.countBySubjectClientIdGroupByRating(clientUserId).stream()
+                .collect(Collectors.toMap(RatingCountProjection::getRating, RatingCountProjection::getCount)));
+    }
+
+    /**
+     * B546 (REV-D10, CLI-43) — a guest phone's visible 5-to-1 star counts, zero-filled (one statement). The guest's
+     * average and count are NOT computed here: they ride the caller's statement through
+     * {@link com.beautica.review.repository.GuestRatingSql} (REV-36, one computation for card, list and detail).
+     */
+    @Transactional(readOnly = true)
+    public List<RatingBucket> guestDistributionFor(String phone) {
+        return zeroFilled(clientReviewRepository.countByGuestPhoneGroupByRating(phone).stream()
+                .collect(Collectors.toMap(RatingCountProjection::getRating, RatingCountProjection::getCount)));
+    }
+
+    private static List<RatingBucket> zeroFilled(Map<Integer, Long> countsByRating) {
         return IntStream.rangeClosed(1, 5)
                 .boxed()
                 .sorted(Comparator.reverseOrder())

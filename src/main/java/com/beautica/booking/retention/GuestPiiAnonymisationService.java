@@ -14,6 +14,7 @@ import com.beautica.common.util.UkrainianPhoneNormalizer;
 import com.beautica.moderation.service.ClientBlockService;
 import com.beautica.notification.telegram.link.TelegramLinkRetentionService;
 import com.beautica.review.invite.service.GuestReviewRetentionService;
+import com.beautica.review.service.ClientRatingSubjectService;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.PessimisticLockingFailureException;
@@ -105,6 +106,7 @@ public class GuestPiiAnonymisationService {
     private final GuestReviewRetentionService guestReviewRetentionService;
     private final TelegramLinkRetentionService telegramLinkRetentionService;
     private final ClientListRemovalService clientListRemovalService;
+    private final ClientRatingSubjectService clientRatingSubjectService;
     private final GuestPiiRetentionProperties properties;
     private final MeterRegistry meterRegistry;
     private final Clock clock;
@@ -120,6 +122,7 @@ public class GuestPiiAnonymisationService {
             GuestReviewRetentionService guestReviewRetentionService,
             TelegramLinkRetentionService telegramLinkRetentionService,
             ClientListRemovalService clientListRemovalService,
+            ClientRatingSubjectService clientRatingSubjectService,
             GuestPiiRetentionProperties properties,
             MeterRegistry meterRegistry,
             Clock clock,
@@ -133,6 +136,7 @@ public class GuestPiiAnonymisationService {
         this.guestReviewRetentionService = guestReviewRetentionService;
         this.telegramLinkRetentionService = telegramLinkRetentionService;
         this.clientListRemovalService = clientListRemovalService;
+        this.clientRatingSubjectService = clientRatingSubjectService;
         this.properties = properties;
         this.meterRegistry = meterRegistry;
         this.clock = clock;
@@ -243,6 +247,9 @@ public class GuestPiiAnonymisationService {
      * transaction: the review update clears the persistence context (phase 399 audit).
      */
     private void anonymiseGuestReviewData(Collection<UUID> bookingIds, Collection<UUID> headerIds) {
+        // B546 (REV-40) — a provider's phone-keyed rating of these guests dies with their PII (privacy 188). First: the
+        // review-author label update below clears the persistence context.
+        clientRatingSubjectService.deleteGuestRatingsOfBookings(bookingIds);
         Set<UUID> appointmentIds = new LinkedHashSet<>(headerIds);
         List<UUID> singleBookingIds = new ArrayList<>();
         if (!bookingIds.isEmpty()) {

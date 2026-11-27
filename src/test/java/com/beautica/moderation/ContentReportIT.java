@@ -490,6 +490,32 @@ class ContentReportIT extends AbstractModerationIT {
         assertThat(countReportsOnTarget("CLIENT_REVIEW", clientReviewId)).isEqualTo(1);
     }
 
+    @Test
+    @DisplayName("B546: phone-keyed CLIENT_REVIEW — an unrelated provider → 404 (not 500); a provider with a guest "
+            + "booking of that phone → 201; the author → 400")
+    void should_enforceGuestPhoneVisibility_when_reportingPhoneKeyedClientReview() throws Exception {
+        SalonFixture salon = createSalon();
+        String phone = uniqueGuestPhone();
+        UUID walkIn = insertGuestBooking(salon, "STAFF", phone);
+        UUID clientReviewId = insertGuestClientReview(walkIn, phone, salon, 2);
+        String seesEmail = unique("indep-sees");
+        insertIndependentGuestBooking(createIndependentMaster(seesEmail).masterId(), phone);
+        String unrelatedEmail = unique("indep-unrelated");
+        insertIndependentGuestBooking(createIndependentMaster(unrelatedEmail).masterId(), uniqueGuestPhone());
+        String body = reportBody("CLIENT_REVIEW", clientReviewId, "FALSE_INFO", null);
+
+        ResponseEntity<String> byUnrelated = postReport(tokenFor(unrelatedEmail), body);
+        ResponseEntity<String> bySees = postReport(tokenFor(seesEmail), body);
+        ResponseEntity<String> byAuthor = postReport(tokenFor(salon.masterEmail()), body);
+
+        assertThat(byUnrelated.getStatusCode()).as("unrelated — body: %s", byUnrelated.getBody())
+                .isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(bySees.getStatusCode()).as("sees the phone — body: %s", bySees.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        assertThat(byAuthor.getStatusCode()).as("author").isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(countReportsOnTarget("CLIENT_REVIEW", clientReviewId)).isEqualTo(1);
+    }
+
     // ── QA: D6 rate limit is per user, a 429 sends nothing ───────────────────────────────────
 
     @Test

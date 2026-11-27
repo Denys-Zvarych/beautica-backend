@@ -1816,17 +1816,27 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("enforceCanReviewClient THROWS for a SALON_MASTER, even on the booking they performed — "
-            + "rejected by role before any repository call (phase 355, reverses 316/320)")
-    void should_throwForbidden_when_salonMasterReviewsClientOfOwnPerformedBooking() {
+    @DisplayName("B547 — enforceCanReviewClient does not throw for the SALON_MASTER who performed the booking in a live salon")
+    void should_notThrow_when_performingSalonMasterReviewsClient() {
         UUID actorId = UUID.randomUUID();
-        Booking booking = mock(Booking.class);
+        Booking booking = pageBooking(UUID.randomUUID(), liveSalonStaffMaster(actorId, true));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_MASTER"));
+
+        assertThatCode(() -> authorizationService.enforceCanReviewClient(actorId, booking))
+                .doesNotThrowAnyException();
+        verifyNoInteractions(salonRepository, userRepository);
+    }
+
+    @Test
+    @DisplayName("B547 — enforceCanReviewClient THROWS for a SALON_MASTER on a colleague's booking")
+    void should_throwForbidden_when_salonMasterReviewsClientOfColleaguesBooking() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = pageBooking(UUID.randomUUID(), liveSalonStaffMaster(UUID.randomUUID(), true));
         SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_MASTER"));
 
         assertThatThrownBy(() -> authorizationService.enforceCanReviewClient(actorId, booking))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessage("Access denied");
-        verifyNoInteractions(salonRepository, userRepository);
     }
 
     @Test
@@ -2514,16 +2524,65 @@ class AuthorizationServiceTest {
     // ── canReviewClient (SpEL predicate; Phase 355 — owner/admin/independent, never SALON_MASTER) ──
 
     @Test
-    @DisplayName("canReviewClient returns false without DB hit for a SALON_MASTER, even on a booking they performed (phase 355)")
-    void should_returnFalseWithoutDbHit_when_salonMasterCallsCanReviewClient() {
+    @DisplayName("B547 — canReviewClient returns TRUE for the SALON_MASTER who performed the booking in a live salon, with no ownership query")
+    void should_returnTrue_when_performingSalonMasterCallsCanReviewClient() {
         UUID actorId = UUID.randomUUID();
         UUID bookingId = UUID.randomUUID();
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+        when(bookingRepository.findReviewAccessById(bookingId)).thenReturn(Optional.of(
+                new BookingReviewAccess(actorId, true, UUID.randomUUID(), MasterType.SALON_MASTER, true)));
 
-        boolean result = authorizationService.canReviewClient(auth, bookingId);
+        boolean result = authorizationService.canReviewClient(mockAuth(actorId, "ROLE_SALON_MASTER"), bookingId);
 
-        assertThat(result).isFalse();
-        verifyNoInteractions(bookingRepository, salonRepository, userRepository);
+        assertThat(result).isTrue();
+        verifyNoInteractions(salonRepository, userRepository);
+    }
+
+    @Test
+    @DisplayName("B547 — canReviewClient returns FALSE for a SALON_MASTER on a colleague's booking (B547 D2)")
+    void should_returnFalse_when_salonMasterCallsCanReviewClientOnColleaguesBooking() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        when(bookingRepository.findReviewAccessById(bookingId)).thenReturn(Optional.of(
+                new BookingReviewAccess(UUID.randomUUID(), true, UUID.randomUUID(), MasterType.SALON_MASTER, true)));
+
+        assertThat(authorizationService.canReviewClient(mockAuth(actorId, "ROLE_SALON_MASTER"), bookingId)).isFalse();
+    }
+
+    @Test
+    @DisplayName("B547 — canReviewClient returns FALSE for the performing SALON_MASTER once the salon is inactive")
+    void should_returnFalse_when_performingSalonMasterCallsCanReviewClientInInactiveSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        when(bookingRepository.findReviewAccessById(bookingId)).thenReturn(Optional.of(
+                new BookingReviewAccess(actorId, true, UUID.randomUUID(), MasterType.SALON_MASTER, false)));
+
+        assertThat(authorizationService.canReviewClient(mockAuth(actorId, "ROLE_SALON_MASTER"), bookingId)).isFalse();
+    }
+
+    @Test
+    @DisplayName("B546 1b — canReviewClient derives the independent arm from master_type: an INDEPENDENT_MASTER-typed master with a salon id may rate")
+    void should_returnTrue_when_independentTypedMasterWithSalonIdCallsCanReviewClient() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        when(bookingRepository.findReviewAccessById(bookingId)).thenReturn(Optional.of(
+                new BookingReviewAccess(actorId, true, UUID.randomUUID(), MasterType.INDEPENDENT_MASTER, true)));
+
+        assertThat(authorizationService.canReviewClient(mockAuth(actorId, "ROLE_INDEPENDENT_MASTER"), bookingId))
+                .isTrue();
+        verifyNoInteractions(salonRepository, userRepository);
+    }
+
+    @Test
+    @DisplayName("B546 1b — canReviewClient denies the owner of the salon id an INDEPENDENT_MASTER-typed master still carries")
+    void should_returnFalse_when_ownerCallsCanReviewClientOnIndependentTypedMasterWithSalonId() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(bookingRepository.findReviewAccessById(bookingId)).thenReturn(Optional.of(
+                new BookingReviewAccess(UUID.randomUUID(), true, salonId, MasterType.INDEPENDENT_MASTER, true)));
+        lenient().when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+
+        assertThat(authorizationService.canReviewClient(mockAuth(actorId, "ROLE_SALON_OWNER"), bookingId)).isFalse();
     }
 
     @Test
@@ -2544,7 +2603,7 @@ class AuthorizationServiceTest {
         UUID bookingId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         when(bookingRepository.findReviewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingReviewAccess(UUID.randomUUID(), true, salonId)));
+                .thenReturn(Optional.of(new BookingReviewAccess(UUID.randomUUID(), true, salonId, MasterType.SALON_MASTER, true)));
         when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
 
         boolean result = authorizationService.canReviewClient(mockAuth(actorId, "ROLE_SALON_OWNER"), bookingId);
@@ -2559,7 +2618,7 @@ class AuthorizationServiceTest {
         UUID bookingId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         when(bookingRepository.findReviewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingReviewAccess(actorId, true, salonId)));
+                .thenReturn(Optional.of(new BookingReviewAccess(actorId, true, salonId, MasterType.SALON_MASTER, true)));
         when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
 
         assertThat(authorizationService.canReviewClient(mockAuth(actorId, "ROLE_SALON_OWNER"), bookingId)).isTrue();
@@ -2572,7 +2631,7 @@ class AuthorizationServiceTest {
         UUID bookingId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         when(bookingRepository.findReviewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingReviewAccess(UUID.randomUUID(), true, salonId)));
+                .thenReturn(Optional.of(new BookingReviewAccess(UUID.randomUUID(), true, salonId, MasterType.SALON_MASTER, true)));
         when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
 
         assertThat(authorizationService.canReviewClient(mockAuth(actorId, "ROLE_SALON_ADMIN"), bookingId)).isTrue();
@@ -2585,7 +2644,7 @@ class AuthorizationServiceTest {
         UUID bookingId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         when(bookingRepository.findReviewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingReviewAccess(UUID.randomUUID(), true, salonId)));
+                .thenReturn(Optional.of(new BookingReviewAccess(UUID.randomUUID(), true, salonId, MasterType.SALON_MASTER, true)));
         when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(false);
 
         assertThat(authorizationService.canReviewClient(mockAuth(actorId, "ROLE_SALON_OWNER"), bookingId)).isFalse();
@@ -2597,7 +2656,7 @@ class AuthorizationServiceTest {
         UUID actorId = UUID.randomUUID();
         UUID bookingId = UUID.randomUUID();
         when(bookingRepository.findReviewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingReviewAccess(UUID.randomUUID(), true, UUID.randomUUID())));
+                .thenReturn(Optional.of(new BookingReviewAccess(UUID.randomUUID(), true, UUID.randomUUID(), MasterType.SALON_MASTER, true)));
         when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(UUID.randomUUID()));
 
         assertThat(authorizationService.canReviewClient(mockAuth(actorId, "ROLE_SALON_ADMIN"), bookingId)).isFalse();
@@ -2609,7 +2668,7 @@ class AuthorizationServiceTest {
         UUID actorId = UUID.randomUUID();
         UUID bookingId = UUID.randomUUID();
         when(bookingRepository.findReviewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingReviewAccess(actorId, true, null)));
+                .thenReturn(Optional.of(new BookingReviewAccess(actorId, true, null, MasterType.INDEPENDENT_MASTER, null)));
 
         assertThat(authorizationService.canReviewClient(mockAuth(actorId, "ROLE_INDEPENDENT_MASTER"), bookingId)).isTrue();
     }
@@ -2620,7 +2679,7 @@ class AuthorizationServiceTest {
         UUID actorId = UUID.randomUUID();
         UUID bookingId = UUID.randomUUID();
         when(bookingRepository.findReviewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingReviewAccess(UUID.randomUUID(), true, null)));
+                .thenReturn(Optional.of(new BookingReviewAccess(UUID.randomUUID(), true, null, MasterType.INDEPENDENT_MASTER, null)));
 
         assertThat(authorizationService.canReviewClient(mockAuth(actorId, "ROLE_INDEPENDENT_MASTER"), bookingId)).isFalse();
     }
@@ -2631,7 +2690,7 @@ class AuthorizationServiceTest {
         UUID actorId = UUID.randomUUID();
         UUID bookingId = UUID.randomUUID();
         when(bookingRepository.findReviewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingReviewAccess(actorId, false, null)));
+                .thenReturn(Optional.of(new BookingReviewAccess(actorId, false, null, MasterType.INDEPENDENT_MASTER, null)));
 
         assertThat(authorizationService.canReviewClient(mockAuth(actorId, "ROLE_INDEPENDENT_MASTER"), bookingId)).isFalse();
     }
@@ -3968,15 +4027,34 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("filterBookingIdsWithProviderAuthority gives a SALON_MASTER nothing and issues no statement, even for own rows")
-    void should_returnEmptyWithoutStatements_when_salonMasterFiltersPage() {
+    @DisplayName("B547 — filterBookingIdsWithProviderAuthority gives a SALON_MASTER only the rows they performed in a live salon, with no statement")
+    void should_returnOwnLiveRowsWithoutStatements_when_salonMasterFiltersPage() {
         UUID actorId = UUID.randomUUID();
-        List<Booking> page = List.of(mock(Booking.class), mock(Booking.class));
+        UUID own = UUID.randomUUID();
+        List<Booking> page = List.of(
+                pageBooking(own, liveSalonStaffMaster(actorId, true)),
+                pageBooking(UUID.randomUUID(), liveSalonStaffMaster(actorId, false)),
+                pageBooking(UUID.randomUUID(), liveSalonStaffMaster(UUID.randomUUID(), true)));
 
         Set<UUID> result = authorizationService.filterBookingIdsWithProviderAuthority(Role.SALON_MASTER, actorId, page);
 
-        assertThat(result).isEmpty();
+        assertThat(result).containsExactly(own);
         verifyNoInteractions(salonRepository, userRepository);
+    }
+
+    /** A SALON_MASTER-typed, active master of a salon whose {@code is_active} is {@code salonActive}. */
+    private Master liveSalonStaffMaster(UUID userId, boolean salonActive) {
+        Salon salon = mock(Salon.class);
+        lenient().when(salon.getId()).thenReturn(UUID.randomUUID());
+        lenient().when(salon.isActive()).thenReturn(salonActive);
+        User user = mock(User.class);
+        lenient().when(user.getId()).thenReturn(userId);
+        Master master = mock(Master.class);
+        lenient().when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        lenient().when(master.getSalon()).thenReturn(salon);
+        lenient().when(master.getUser()).thenReturn(user);
+        lenient().when(master.isActive()).thenReturn(true);
+        return master;
     }
 
     @Test
@@ -4080,5 +4158,76 @@ class AuthorizationServiceTest {
 
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> authorizationService.isGuestPhoneAudience())
                 .isInstanceOf(com.beautica.common.exception.ForbiddenException.class);
+    }
+
+    // ── B547 canRateClient matrix: 5 roles x own/other x live/inactive salon; SpEL, entity and page forms agree ──
+
+    static java.util.stream.Stream<org.junit.jupiter.params.provider.Arguments> rateClientMatrix() {
+        List<org.junit.jupiter.params.provider.Arguments> cases = new java.util.ArrayList<>();
+        for (Role role : List.of(Role.CLIENT, Role.SALON_OWNER, Role.SALON_ADMIN, Role.SALON_MASTER,
+                Role.INDEPENDENT_MASTER)) {
+            for (boolean own : List.of(true, false)) {
+                for (boolean salonLive : List.of(true, false)) {
+                    boolean expected = switch (role) {
+                        case CLIENT -> false;
+                        case SALON_OWNER, SALON_ADMIN, INDEPENDENT_MASTER -> own;
+                        case SALON_MASTER -> own && salonLive;
+                    };
+                    cases.add(org.junit.jupiter.params.provider.Arguments.of(role, own, salonLive, expected));
+                }
+            }
+        }
+        return cases.stream();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0} own={1} salonLive={2} -> {3}")
+    @org.junit.jupiter.params.provider.MethodSource("rateClientMatrix")
+    @DisplayName("B547 — canReviewClient (SpEL), canProviderReviewClient (entity) and filterBookingIdsWithProviderAuthority (page) agree on every role x ownership x salon liveness")
+    void should_agreeAcrossAllForms_when_ratingAuthorityIsEvaluated(
+            Role role, boolean own, boolean salonLive, boolean expected) {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        boolean independent = role == Role.INDEPENDENT_MASTER;
+        UUID masterUserId = (own && (role == Role.SALON_MASTER || independent)) ? actorId : UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        lenient().when(salon.getId()).thenReturn(salonId);
+        lenient().when(salon.isActive()).thenReturn(salonLive);
+        User salonOwner = mock(User.class);
+        lenient().when(salonOwner.getId()).thenReturn(own && role == Role.SALON_OWNER ? actorId : UUID.randomUUID());
+        lenient().when(salon.getOwner()).thenReturn(salonOwner);
+        User masterUser = mock(User.class);
+        lenient().when(masterUser.getId()).thenReturn(masterUserId);
+        Master master = mock(Master.class);
+        MasterType masterType = independent ? MasterType.INDEPENDENT_MASTER : MasterType.SALON_MASTER;
+        lenient().when(master.getMasterType()).thenReturn(masterType);
+        lenient().when(master.getSalon()).thenReturn(independent ? null : salon);
+        lenient().when(master.getUser()).thenReturn(masterUser);
+        lenient().when(master.isActive()).thenReturn(true);
+        Booking booking = mock(Booking.class);
+        lenient().when(booking.getId()).thenReturn(bookingId);
+        lenient().when(booking.getMaster()).thenReturn(master);
+
+        lenient().when(bookingRepository.findReviewAccessById(bookingId)).thenReturn(Optional.of(new BookingReviewAccess(
+                masterUserId, true, independent ? null : salonId, masterType,
+                independent ? null : salonLive)));
+        lenient().when(salonRepository.existsByIdAndOwnerId(salonId, actorId))
+                .thenReturn(own && role == Role.SALON_OWNER);
+        lenient().when(salonRepository.findIdsByIdInAndOwnerId(any(), eq(actorId)))
+                .thenReturn(own && role == Role.SALON_OWNER ? List.of(salonId) : List.of());
+        lenient().when(userRepository.findSalonIdById(actorId))
+                .thenReturn(Optional.of(own && role == Role.SALON_ADMIN ? salonId : UUID.randomUUID()));
+        Authentication auth = mockAuth(actorId, "ROLE_" + role.name());
+        SecurityContextHolder.getContext().setAuthentication(auth);
+
+        boolean spel = authorizationService.canReviewClient(auth, bookingId);
+        boolean entity = authorizationService.canProviderReviewClient(actorId, booking);
+        boolean page = authorizationService.filterBookingIdsWithProviderAuthority(role, actorId, List.of(booking))
+                .contains(bookingId);
+
+        assertThat(spel).as("SpEL form").isEqualTo(expected);
+        assertThat(entity).as("entity form").isEqualTo(expected);
+        assertThat(page).as("page form").isEqualTo(expected);
     }
 }

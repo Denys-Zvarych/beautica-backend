@@ -174,6 +174,19 @@ class ReviewModerationServiceTest {
     }
 
     @Test
+    @DisplayName("B546: phone-keyed guest rating REMOVED → status moves, no recalculation event, no NPE")
+    void should_removeWithoutEvent_when_clientReviewIsPhoneKeyed() {
+        ClientReview review = ClientReview.builder().subjectGuestPhone("+380671112233").build();
+        when(clientReviewRepository.findByIdForUpdate(REVIEW_ID)).thenReturn(Optional.of(review));
+
+        boolean found = service.moderateClientReview(REVIEW_ID, ModerationStatus.REMOVED);
+
+        assertThat(found).isTrue();
+        assertThat(review.getModerationStatus()).isEqualTo(ModerationStatus.REMOVED);
+        verifyNoInteractions(eventPublisher);
+    }
+
+    @Test
     @DisplayName("missing client review → false, no event")
     void should_returnFalse_when_clientReviewMissing() {
         when(clientReviewRepository.findByIdForUpdate(REVIEW_ID)).thenReturn(Optional.empty());

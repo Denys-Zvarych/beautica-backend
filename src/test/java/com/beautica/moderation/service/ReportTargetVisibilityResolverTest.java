@@ -52,6 +52,7 @@ class ReportTargetVisibilityResolverTest {
     private static final UUID REPORTER_ID = UUID.randomUUID();
     private static final UUID OTHER_USER_ID = UUID.randomUUID();
     private static final UUID TARGET_ID = UUID.randomUUID();
+    private static final String GUEST_PHONE = "+380671234567";
 
     @Mock private ReviewRepository reviewRepository;
     @Mock private ClientReviewRepository clientReviewRepository;
@@ -242,6 +243,59 @@ class ReportTargetVisibilityResolverTest {
             Optional<ReportTarget> result = resolve(ReportTargetType.CLIENT_REVIEW, Role.INDEPENDENT_MASTER);
 
             assertThat(result).isEmpty();
+        }
+
+        @Test
+        @DisplayName("B546: phone-keyed rating, provider with a guest booking of the phone → visible, no NPE")
+        void should_beVisible_when_providerSeesGuestPhoneOfSubject() {
+            when(clientReviewRepository.findById(TARGET_ID))
+                    .thenReturn(Optional.of(guestClientReview(OTHER_USER_ID, GUEST_PHONE)));
+            when(bookingRepository.existsGuestPhoneBookingVisibleToProvider(GUEST_PHONE, REPORTER_ID, true))
+                    .thenReturn(true);
+
+            Optional<ReportTarget> result = resolve(ReportTargetType.CLIENT_REVIEW, Role.SALON_MASTER);
+
+            assertThat(result).contains(new ReportTarget(false));
+            verify(bookingRepository, never()).existsClientBookingVisibleToProvider(any(), any(), anyBoolean());
+        }
+
+        @Test
+        @DisplayName("B546: phone-keyed rating, unrelated provider → empty (the uniform 404), no NPE")
+        void should_beEmpty_when_providerDoesNotSeeGuestPhone() {
+            when(clientReviewRepository.findById(TARGET_ID))
+                    .thenReturn(Optional.of(guestClientReview(OTHER_USER_ID, GUEST_PHONE)));
+            when(bookingRepository.existsGuestPhoneBookingVisibleToProvider(GUEST_PHONE, REPORTER_ID, false))
+                    .thenReturn(false);
+
+            Optional<ReportTarget> result = resolve(ReportTargetType.CLIENT_REVIEW, Role.INDEPENDENT_MASTER);
+
+            assertThat(result).isEmpty();
+        }
+
+        @Test
+        @DisplayName("B546: phone-keyed rating, assigned admin → checked at the admin's salon")
+        void should_checkAdminSalon_when_guestPhoneSubjectAndReporterIsSalonAdmin() {
+            UUID salonId = UUID.randomUUID();
+            when(clientReviewRepository.findById(TARGET_ID))
+                    .thenReturn(Optional.of(guestClientReview(OTHER_USER_ID, GUEST_PHONE)));
+            when(userRepository.findSalonIdById(REPORTER_ID)).thenReturn(Optional.of(salonId));
+            when(bookingRepository.existsGuestPhoneBookingAtSalon(GUEST_PHONE, salonId)).thenReturn(true);
+
+            Optional<ReportTarget> result = resolve(ReportTargetType.CLIENT_REVIEW, Role.SALON_ADMIN);
+
+            assertThat(result).contains(new ReportTarget(false));
+        }
+
+        @Test
+        @DisplayName("B546: phone-keyed rating, CLIENT reporter → empty, no booking lookup")
+        void should_beEmpty_when_guestPhoneSubjectAndReporterIsClient() {
+            when(clientReviewRepository.findById(TARGET_ID))
+                    .thenReturn(Optional.of(guestClientReview(OTHER_USER_ID, GUEST_PHONE)));
+
+            Optional<ReportTarget> result = resolve(ReportTargetType.CLIENT_REVIEW, Role.CLIENT);
+
+            assertThat(result).isEmpty();
+            verifyNoInteractions(bookingRepository);
         }
 
         @Test
@@ -508,6 +562,10 @@ class ReportTargetVisibilityResolverTest {
     private static ClientReview clientReview(UUID authorUserId, UUID subjectClientId) {
         Master author = masterOf(user(authorUserId));
         return ClientReview.builder().authorMaster(author).subjectClient(user(subjectClientId)).build();
+    }
+
+    private static ClientReview guestClientReview(UUID authorUserId, String phone) {
+        return ClientReview.builder().authorMaster(masterOf(user(authorUserId))).subjectGuestPhone(phone).build();
     }
 
     private static ClientReview salonClientReview(UUID authorUserId, UUID subjectClientId, UUID salonId) {

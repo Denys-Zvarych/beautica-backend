@@ -4,6 +4,8 @@ import static com.beautica.client.provider.repository.ClientListSql.MASTER_WHERE
 import static com.beautica.client.provider.repository.ClientListSql.SALON_MASTER_WHERE;
 import static com.beautica.client.provider.repository.ClientListSql.SALON_WHERE;
 
+import com.beautica.review.repository.GuestRatingSql;
+
 /**
  * B508 — the native statements behind the provider client card and visit history (CLI-42..45). The scope variants
  * reuse B507's {@link ClientListSql} WHERE blocks verbatim (no nullable-UUID OR bind); the identity variants are:
@@ -117,9 +119,14 @@ final class ClientCardSql {
             + """
             CAST(NULL AS text) AS verifiedPhone, CAST(NULL AS text) AS firstName,
                    CAST(NULL AS text) AS lastName, CAST(NULL AS text) AS avatarUrl,
-                   CAST(NULL AS numeric) AS avgRating, CAST(NULL AS integer) AS reviewCount,
+                   gr.avg_rating AS avgRating, gr.review_count AS reviewCount,
                    """;
-    private static final String CARD_GUEST_FROM = "\n  FROM (" + CARD_AGG + ") a\n";
+    // B546 (CLI-43, REV-36) — the guest's cross-provider rating rides the card statement: the shared
+    // GuestRatingSql aggregate keyed on the anchor's phone (always one row; NULL / 0 when unrated or the anchor is
+    // invalid, which the service turns into the uniform 404 anyway).
+    private static final String CARD_GUEST_FROM = "\n  FROM (" + CARD_AGG + ") a\n"
+            + "  CROSS JOIN LATERAL (" + GuestRatingSql.AGGREGATE
+            + "   AND cr.subject_guest_phone = (SELECT guest_phone FROM anchor)) gr\n";
 
     // B518 (GST-80): the registered phone rides the existing users join (no extra statement) and is NULL unless the
     // number is SMS-verified (V244 phone_verified_at) - the unverified number never leaves the database.

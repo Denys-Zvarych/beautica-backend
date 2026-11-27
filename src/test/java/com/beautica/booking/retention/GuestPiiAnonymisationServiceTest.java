@@ -59,6 +59,7 @@ class GuestPiiAnonymisationServiceTest {
     @Mock private GuestReviewRetentionService guestReviewRetentionService;
     @Mock private TelegramLinkRetentionService telegramLinkRetentionService;
     @Mock private ClientListRemovalService clientListRemovalService;
+    @Mock private com.beautica.review.service.ClientRatingSubjectService clientRatingSubjectService;
     @Mock private PlatformTransactionManager transactionManager;
 
     private GuestPiiAnonymisationService service;
@@ -67,7 +68,8 @@ class GuestPiiAnonymisationServiceTest {
     void setUp() {
         service = new GuestPiiAnonymisationService(bookingRepository, appointmentRepository,
                 bookingCancellationService, guestVisitCancellationService, phoneOtpService, clientBlockService,
-                guestReviewRetentionService, telegramLinkRetentionService, clientListRemovalService, null, new SimpleMeterRegistry(),
+                guestReviewRetentionService, telegramLinkRetentionService, clientListRemovalService, clientRatingSubjectService,
+                null, new SimpleMeterRegistry(),
                 Clock.fixed(NOW, ZoneOffset.UTC), transactionManager);
         lenient().when(telegramLinkRetentionService.eraseForPhone(anyString()))
                 .thenReturn(new TelegramLinkRetentionService.Erasure(0, 0));
@@ -96,6 +98,20 @@ class GuestPiiAnonymisationServiceTest {
         InOrder order = inOrder(guestReviewRetentionService, telegramLinkRetentionService);
         order.verify(guestReviewRetentionService).expireSentInvitesOfPhone("+380501234567", NOW);
         order.verify(telegramLinkRetentionService).eraseForPhone("+380501234567");
+    }
+
+    @Test
+    @DisplayName("B546 (REV-40): erase deletes the phone-keyed provider ratings of exactly the bookings it anonymised")
+    void should_deleteGuestRatingsOfAnonymisedBookings_when_erasingByPhone() {
+        UUID anonymised = UUID.randomUUID();
+        when(bookingRepository.anonymiseGuestBookingsByPhone("+380501234567", GuestPii.ANONYMISED_NAME))
+                .thenReturn(List.of(anonymised));
+
+        service.eraseByPhone("050 123 45 67", "SUP-5");
+
+        InOrder order = inOrder(bookingRepository, clientRatingSubjectService);
+        order.verify(bookingRepository).anonymiseGuestBookingsByPhone("+380501234567", GuestPii.ANONYMISED_NAME);
+        order.verify(clientRatingSubjectService).deleteGuestRatingsOfBookings(List.of(anonymised));
     }
 
     @Test

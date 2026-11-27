@@ -9,6 +9,7 @@ import com.beautica.common.observability.ExternalCallSentryLimitProperties;
 import com.beautica.moderation.config.ModerationActionLinkProperties;
 import com.beautica.moderation.config.ModerationProperties;
 import com.beautica.notification.crypto.OutboxCipherProperties;
+import com.beautica.review.config.ClientRatingProperties;
 import com.beautica.review.invite.config.ReviewInviteProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
@@ -49,7 +50,8 @@ import org.springframework.context.annotation.Configuration;
         AppCheckProperties.class,
         InviteSmsPolicyConfig.class,
         AuthLimitsProperties.class,
-        CatalogIconProperties.class
+        CatalogIconProperties.class,
+        ClientRatingProperties.class
 })
 public class AppConfigProperties {
 }

@@ -31,6 +31,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -1579,56 +1580,76 @@ public class AuthorizationService {
     /**
      * SpEL {@code @PreAuthorize} predicate for {@code POST /client-reviews}.
      *
-     * <p><b>Phase 355 — at a salon only the booking's OWNER/ADMIN may rate the client; the invited
-     * {@code SALON_MASTER} may not.</b> Reverses phase 320 (performing master as sole rater). The
-     * decision is {@link #hasProviderAuthorityOverBooking} — the same kernel completion uses, so
-     * "who may complete" and "who may rate after completing" are one rule — evaluated over the
-     * {@link BookingCompletionAccess} projection. That kernel is untouched (it also gates decline /
-     * cancel / reschedule). An independent master rates their own booking; an owner/admin of a
-     * DIFFERENT salon is denied; an owner who also performed the booking is still the owner.
+     * <p><b>B547 (REV-11, REV-D06)</b> — the INDEPENDENT_MASTER on their own booking, the salon's OWNER / assigned
+     * ADMIN, or the SALON_MASTER who performed the booking may rate the client; one salon-side rating per booking is
+     * enforced by {@code uq_client_reviews_booking} (REV-42). The decision is {@link #canRateClient}, the one helper
+     * the entity form ({@link #canProviderReviewClient}) and the page-scoped form
+     * ({@link #filterBookingIdsWithProviderAuthority}) also call, so the flag and the write cannot drift.
      *
-     * <p>{@code ROLE_CLIENT} and {@code ROLE_SALON_MASTER} are rejected up front with no DB round
-     * trip (mirrors {@link #canCompleteBooking}). A missing booking maps to {@code false} (403, no
-     * existence oracle). Must stay the same decision as {@link #canProviderReviewClient}, which the
-     * service-layer guard and the {@code providerCanReviewClient} flag both call.
+     * <p><b>B546 1b</b> — the independent arm is derived from {@code masters.master_type} (as the entity form always
+     * did), never from {@code salonId == null}: an INDEPENDENT_MASTER-typed master that still carries a salon id used
+     * to see the CTA and get a 403 here, while the owner of that salon passed here and was denied by the service.
+     *
+     * <p>{@code ROLE_CLIENT} is rejected up front with no DB round trip. A missing booking maps to {@code false}
+     * (403, no existence oracle).
      */
     public boolean canReviewClient(Authentication auth, UUID bookingId) {
-        boolean cannotReview = auth.getAuthorities().stream().anyMatch(a ->
-                a.getAuthority().equals("ROLE_SALON_MASTER")
-                        || a.getAuthority().equals("ROLE_CLIENT"));
-        if (cannotReview) return false;
+        boolean isClient = auth.getAuthorities().stream().anyMatch(a -> a.getAuthority().equals("ROLE_CLIENT"));
+        if (isClient) return false;
         UUID actorId = principalId(auth);
         Role actorRole = roleFromAuthentication(auth);
-        // Independent-master arm additionally requires a LIVE master row (masters.is_active): a
-        // deactivated independent master keeps login and role, so liveness is checked here.
         return bookingRepository.findReviewAccessById(bookingId)
-                .map(v -> (v.salonId() != null || v.masterIsActive())
-                        && hasProviderAuthorityOverBooking(
-                                v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole))
+                .map(v -> canRateClient(actorRole, actorId,
+                        v.masterType() == MasterType.INDEPENDENT_MASTER, v.masterUserId(), v.masterIsActive(),
+                        v.salonId(), () -> Boolean.TRUE.equals(v.salonIsActive()),
+                        sid -> hasManagementAccess(sid, actorId, actorRole)))
                 .orElse(false);
     }
 
     /**
-     * The ONE entity-level provider-review-authority predicate (Phase 355): {@code
-     * !SALON_MASTER && !CLIENT && hasProviderAuthorityOverBooking(actor, booking)}. Called by
-     * {@link #enforceCanReviewClient} (the 403) and by {@code BookingService}'s detail-view {@code
-     * providerCanReviewClient} flag, so the flag and the permission can never drift.
-     *
-     * <p>The role comes from the {@code SecurityContext}; with no authenticated principal it fails
-     * closed ({@code false}). The explicit {@code SALON_MASTER} rejection is defence in depth: the
-     * kernel does not know roles for a salon master who is also a salon member.
+     * The ONE provider-to-client rating authority decision (B547 scope 1; B546 1b). Every form funnels through it:
+     * <ul>
+     *   <li>INDEPENDENT_MASTER-typed master: the master's own (live) account only;</li>
+     *   <li>SALON_MASTER actor: only the performing master — {@code booking.master.user == actor}, the master row
+     *       live and its salon live ({@code salons.is_active}); other salon masters get nothing (B547 D2);</li>
+     *   <li>any other provider actor: owner / assigned admin of the master's salon, via the shared kernel
+     *       {@link #hasProviderAuthorityOverRow} (completion's rule, BOOK-D08 unchanged).</li>
+     * </ul>
+     * {@code CLIENT} (and a missing role) is always {@code false}. {@code salonActive} is a supplier so the owner /
+     * admin forms never pay for it.
+     */
+    private boolean canRateClient(
+            @Nullable Role actorRole, UUID actorId, boolean independentMaster, @Nullable UUID masterUserId,
+            boolean masterActive, @Nullable UUID liveSalonId, BooleanSupplier salonActive,
+            Predicate<UUID> managementAccess) {
+        if (actorRole == null || actorRole == Role.CLIENT || actorId == null) {
+            return false;
+        }
+        if (actorRole == Role.SALON_MASTER) {
+            return !independentMaster && liveSalonId != null && masterActive
+                    && actorId.equals(masterUserId) && salonActive.getAsBoolean();
+        }
+        return (!independentMaster || masterActive)
+                && hasProviderAuthorityOverRow(independentMaster, masterUserId, liveSalonId, actorId, managementAccess);
+    }
+
+    /**
+     * Entity form of {@link #canRateClient} (B547). Called by {@link #enforceCanReviewClient} (the 403) and by
+     * {@code BookingService}'s detail-view {@code providerCanReviewClient} flag, so the flag and the permission can
+     * never drift. The role comes from the {@code SecurityContext}; with no authenticated principal it fails closed.
+     * The owner / admin arm is {@link #hasProviderAuthorityOverBooking(UUID, Booking)} (in-memory owner check first).
      */
     public boolean canProviderReviewClient(UUID actorUserId, Booking booking) {
         Role actorRole = currentRoleOrNull();
-        if (actorRole == null || actorRole == Role.SALON_MASTER || actorRole == Role.CLIENT) {
+        if (actorRole == null || actorRole == Role.CLIENT) {
             return false;
         }
-        return isLiveIfIndependent(booking.getMaster()) && hasProviderAuthorityOverBooking(actorUserId, booking);
-    }
-
-    /** An INDEPENDENT_MASTER's master row must be active; salon-typed masters are not liveness-gated. */
-    private static boolean isLiveIfIndependent(Master master) {
-        return master.getMasterType() != MasterType.INDEPENDENT_MASTER || master.isActive();
+        Master master = booking.getMaster();
+        Salon salon = master.getSalon();
+        return canRateClient(actorRole, actorUserId,
+                master.getMasterType() == MasterType.INDEPENDENT_MASTER, masterUserId(master), master.isActive(),
+                salon == null ? null : salon.getId(), () -> salon != null && salon.isActive(),
+                sid -> hasProviderAuthorityOverBooking(actorUserId, booking));
     }
 
     /**
@@ -1650,14 +1671,14 @@ public class AuthorizationService {
      * admin: the memoised assigned-salon lookup) — never one per row (anti-bug §E).
      *
      * <p>Same decision as the per-row twin: the independent-master arm, plus the master's LIVE
-     * salon being one the actor owns/administers. {@code SALON_MASTER}/{@code CLIENT} (and any
-     * other role) short-circuit to an empty set with no statement. Takes the role explicitly and
+     * salon being one the actor owns/administers; B547 — a {@code SALON_MASTER} gets the bookings they performed in a
+     * live salon (no statement). {@code CLIENT} (and any other role) short-circuits to an empty set with no statement. Takes the role explicitly and
      * reads no {@code SecurityContext}, so it can be driven directly without one.
      */
     public Set<UUID> filterBookingIdsWithProviderAuthority(
             Role actorRole, UUID actorId, List<Booking> bookings) {
         if (actorRole != Role.SALON_OWNER && actorRole != Role.SALON_ADMIN
-                && actorRole != Role.INDEPENDENT_MASTER) {
+                && actorRole != Role.INDEPENDENT_MASTER && actorRole != Role.SALON_MASTER) {
             return Set.of();
         }
         Set<UUID> liveSalonIds = bookings.stream()
@@ -1680,12 +1701,12 @@ public class AuthorizationService {
         }
         Set<UUID> managed = managedSalonIds;
         return bookings.stream()
-                .filter(b -> isLiveIfIndependent(b.getMaster()))
-                .filter(b -> hasProviderAuthorityOverRow(
+                .filter(b -> canRateClient(actorRole, actorId,
                         b.getMaster().getMasterType() == MasterType.INDEPENDENT_MASTER,
                         masterUserId(b.getMaster()),
+                        b.getMaster().isActive(),
                         liveSalonId(b.getMaster()),
-                        actorId,
+                        () -> b.getMaster().getSalon() != null && b.getMaster().getSalon().isActive(),
                         managed::contains))
                 .map(Booking::getId)
                 .collect(Collectors.toSet());

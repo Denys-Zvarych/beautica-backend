@@ -7,6 +7,7 @@ import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.client.provider.service.ClientListRemovalService;
 import com.beautica.client.event.ClientBookingsAttachedEvent;
+import com.beautica.review.service.ClientRatingSubjectService;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import org.slf4j.Logger;
@@ -65,6 +66,7 @@ public class ClientPhoneAttachService {
     private final PlatformTransactionManager transactionManager;
     private final TaskExecutor attachExecutor;
     private final ClientListRemovalService clientListRemovalService;
+    private final ClientRatingSubjectService clientRatingSubjectService;
 
     public ClientPhoneAttachService(BookingRepository bookingRepository,
                                     AppointmentRepository appointmentRepository,
@@ -73,7 +75,8 @@ public class ClientPhoneAttachService {
                                     Clock clock,
                                     PlatformTransactionManager transactionManager,
                                     @Qualifier("clientPhoneAttachExecutor") TaskExecutor attachExecutor,
-                                    ClientListRemovalService clientListRemovalService) {
+                                    ClientListRemovalService clientListRemovalService,
+                                    ClientRatingSubjectService clientRatingSubjectService) {
         this.bookingRepository = bookingRepository;
         this.appointmentRepository = appointmentRepository;
         this.userRepository = userRepository;
@@ -82,6 +85,7 @@ public class ClientPhoneAttachService {
         this.transactionManager = transactionManager;
         this.attachExecutor = attachExecutor;
         this.clientListRemovalService = clientListRemovalService;
+        this.clientRatingSubjectService = clientRatingSubjectService;
     }
 
     /**
@@ -255,6 +259,10 @@ public class ClientPhoneAttachService {
         // account), so no list-removal row may keep the plain phone; the account's row was never removed.
         clientListRemovalService.purgeGuestPhones(List.of(phoneE164));
         if (attached > 0) {
+            // B546 (REV-39, REV-D11) — same transaction: each just-attached booking's phone-keyed rating follows it to the
+            // account (keyed on the attached bookings, not the phone), comment included; the aggregate recalculates
+            // after commit. Anonymised / detached bookings never attach, so their ratings never move.
+            clientRatingSubjectService.moveGuestRatingsToAccount(clientId);
             log.info("Attached {} guest booking row(s) to client {} ({})", attached, clientId, reason);
             eventPublisher.publishEvent(new ClientBookingsAttachedEvent(clientId));
         }

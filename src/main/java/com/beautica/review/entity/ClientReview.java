@@ -28,6 +28,7 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 
+import java.util.Objects;
 import java.util.UUID;
 
 /**
@@ -52,7 +53,9 @@ import java.util.UUID;
 @Table(
         name = "client_reviews",
         indexes = {
-                // Backs "reviews I've received" reads and the recalculateClientRating aggregate.
+                // Backs "reviews I've received" reads and the recalculateClientRating aggregate. PARTIAL in the DB
+                // since V270 (WHERE subject_client_id IS NOT NULL — phone-keyed guest rows carry NULL); @Index cannot
+                // declare the predicate, the name is mirrored for drift checks.
                 @Index(name = "idx_client_reviews_subject_client", columnList = "subject_client_id"),
                 // V159 (phase 295 audit HIGH-3). Mirrors the DB index so ddl-auto=validate catches
                 // drift. Backs both the third EXISTS arm of
@@ -77,10 +80,23 @@ public class ClientReview extends AuditableEntity {
     @JoinColumn(name = "booking_id", nullable = false, unique = true)
     private Booking booking;
 
-    /** The client being reviewed. */
+    /**
+     * The registered client being reviewed, or {@code null} for a guest / walk-in subject (B546, REV-38): exactly one of
+     * this and {@link #subjectGuestPhone} is set (V269 {@code chk_client_reviews_one_subject}).
+     */
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "subject_client_id", nullable = false)
+    @JoinColumn(name = "subject_client_id")
     private User subjectClient;
+
+    /**
+     * B546 (REV-38) — the E.164 guest phone of a rated guest / walk-in booking that has no account. Moves to
+     * {@link #subjectClient} when the phone is attached (REV-39, a native UPDATE); deleted with the guest PII (REV-40).
+     * Backed by the partial index {@code idx_client_reviews_subject_guest_phone} (V269), which {@code @Index} cannot
+     * express. Personal data: never logged, never in a response.
+     */
+    @Size(max = 20)
+    @Column(name = "subject_guest_phone", length = 20)
+    private String subjectGuestPhone;
 
     /** The provider (master) who wrote the review. */
     @ManyToOne(fetch = FetchType.LAZY)
@@ -110,6 +126,22 @@ public class ClientReview extends AuditableEntity {
     @Enumerated(EnumType.STRING)
     @Column(name = "moderation_status", nullable = false, length = 16)
     private ModerationStatus moderationStatus = ModerationStatus.VISIBLE;
+
+    /**
+     * B546 (REV-38) — a rating of a guest / walk-in booking with no account, keyed to its E.164 phone. The registered
+     * form stays the builder with {@code subjectClient}.
+     */
+    public static ClientReview forGuest(Booking booking, String guestPhone, Master authorMaster, Salon salon,
+                                        short rating, String comment) {
+        return ClientReview.builder()
+                .booking(Objects.requireNonNull(booking, "booking"))
+                .subjectGuestPhone(Objects.requireNonNull(guestPhone, "guestPhone"))
+                .authorMaster(Objects.requireNonNull(authorMaster, "authorMaster"))
+                .salon(salon)
+                .rating(rating)
+                .comment(comment)
+                .build();
+    }
 
     /**
      * Moves this review to {@code target}. {@link ModerationStatus#REMOVED} is terminal: a late RESTORE / DISMISS

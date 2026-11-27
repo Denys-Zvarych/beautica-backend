@@ -20,9 +20,9 @@ import java.util.UUID;
  * @param avatarUrl      REGISTERED only
  * @param phone          E.164, only for the independent master / salon owner / assigned salon admin (GST-D14); never
  *                       for a SALON_MASTER. A GUEST's phone, or a REGISTERED client's SMS-VERIFIED phone (B518, GST-80); null otherwise
- * @param ratingAvg      REGISTERED only; null when unrated, always null for a guest
- * @param ratingCount    visible ratings received; 0 when unrated and always 0 for a guest
- * @param ratingDistribution always 5 buckets (5 down to 1), zero-filled; all zeros for a guest
+ * @param ratingAvg      null when unrated; a guest's is the cross-provider rating of its phone (B546, CLI-43)
+ * @param ratingCount    visible ratings received; 0 when unrated
+ * @param ratingDistribution always 5 buckets (5 down to 1), zero-filled; all zeros when unrated
  * @param firstVisitAt   earliest booking start in scope, any status
  * @param servedByMasters CLI-73: SALON scope only — the salon's masters with at least one booking of this client (any
  *                       status), most recent booking first, salon-wide whatever {@code ?masterId=}; always empty for
