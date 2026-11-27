@@ -483,14 +483,15 @@ public record BookingDetailResponse(
                 description = "The booking client's aggregate rating from providers' reviews of "
                         + "them, 1.00-5.00, read off the denormalized users.avg_rating column. NULL "
                         + "when clientReviewCount is 0 (the unreviewed state is not a rating — "
-                        + "render 'no reviews yet', never 0) and NULL for a guest/no-client "
-                        + "booking. Number only: review comments are never exposed here. Intended "
+                        + "render 'no reviews yet', never 0). A guest booking with a phone carries the "
+                        + "phone-keyed rating (the client card's computation, REV-D10); NULL only for a "
+                        + "guest whose PII was anonymised or who has no phone. Number only: review comments are never exposed here. Intended "
                         + "for provider viewers; a client viewer only ever receives their own.")
         BigDecimal clientAvgRating,
         @Schema(types = {"integer", "null"}, nullable = true,
                 description = "How many provider reviews clientAvgRating is computed from. 0 for "
-                        + "an unreviewed registered client; NULL for a guest/no-client booking "
-                        + "(no account, so 'unknown' rather than 'zero').")
+                        + "an unreviewed client (registered, or a guest with a phone); NULL only for a "
+                        + "guest whose PII was anonymised or who has no phone ('unknown', not 'zero').")
         Integer clientReviewCount,
         // Phase 386 field, retired by GST-80 / CLI-D08 (2026-11-21): always null, kept for old app builds.
         @Schema(types = {"string", "null"}, nullable = true, format = "phone",
@@ -601,6 +602,26 @@ public record BookingDetailResponse(
                 appointmentId, clientAvatarUrl, awaitingClosure, masterAvgRating, masterReviewCount, salonId,
                 categoryKey, reviewByClient, clientAvgRating, clientReviewCount, guestPhone,
                 blockId != null, blockId, blockable, clientPhone, categoryDisplayName);
+    }
+
+    /**
+     * B546 (BOOK-78, REV-D10, REV-36) — a guest booking's client rating, the phone-keyed computation the provider
+     * client card shows ({@code GuestRatingSql}). Populated only by {@code BookingService#getBooking} for a guest
+     * booking that still carries its phone; same zero-review normalisation as the registered arm.
+     *
+     * @param reviewCount visible ratings keyed to the guest's phone
+     * @param avgRating   their average, ignored when {@code reviewCount} is 0
+     */
+    public BookingDetailResponse withGuestClientRating(int reviewCount, BigDecimal avgRating) {
+        return new BookingDetailResponse(
+                id, clientId, masterId, masterServiceId, serviceName, status, startsAt, endsAt, priceAtBooking,
+                priceMaxAtBooking, durationMinutesAtBooking, createdAt, clientFirstName, clientLastName,
+                masterFirstName, masterLastName, masterProfessionalTitle, clientComment, providerComment,
+                clientCancellationNote, masterAvatarUrl, masterType, salonName, cityLabel,
+                districtLabel, street, buildingNo, locationNote, categoryName, canReview, providerCanReviewClient,
+                appointmentId, clientAvatarUrl, awaitingClosure, masterAvgRating, masterReviewCount, salonId,
+                categoryKey, reviewByClient, masterAvgRatingOrNull(reviewCount, avgRating), reviewCount, guestPhone,
+                clientBlocked, clientBlockId, clientBlockable, clientPhone, categoryDisplayName);
     }
 
     /**

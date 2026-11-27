@@ -1512,8 +1512,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     Optional<BookingCompletionAccess> findCompletionAccessById(@Param("bookingId") UUID bookingId);
 
     /**
-     * Review-authorization projection (Phase 355) — {@link #findCompletionAccessById}'s pair plus
-     * {@code masters.is_active}, for {@code AuthorizationService.canReviewClient} alone, so the
+     * Review-authorization projection (Phase 355; B546 1b / B547 add master type + salon liveness) —
+     * {@link #findCompletionAccessById}'s pair plus {@code masters.is_active}, for {@code AuthorizationService.canReviewClient} alone, so the
      * independent-master arm can require a live master row. Kept separate from the completion
      * projection (see {@link BookingReviewAccess}). {@code bm.user} stays a LEFT JOIN (detached masters).
      */
@@ -1521,7 +1521,9 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             SELECT new com.beautica.booking.repository.BookingReviewAccess(
                 bm.user.id,
                 bm.isActive,
-                bs.id
+                bs.id,
+                bm.masterType,
+                bs.isActive
             )
             FROM Booking b
             JOIN b.master bm
@@ -1530,6 +1532,38 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             WHERE b.id = :bookingId
             """)
     Optional<BookingReviewAccess> findReviewAccessById(@Param("bookingId") UUID bookingId);
+
+    /**
+     * B546 — re-read, under the per-phone attach lock, that a guest / walk-in booking is still unattached, still
+     * carries {@code phone} and is not anonymised, and LOCK its row ({@code FOR UPDATE}) for the rest of the rating
+     * transaction. A native scalar query: always a fresh read, never the persistence-context copy, so an attach that
+     * committed after the booking was loaded is seen ({@code ClientReviewService} guest arm).
+     *
+     * <p>The row lock closes the GST-51 race: the retention sweep claims rows {@code FOR UPDATE SKIP LOCKED}, so it
+     * skips this booking until the rating commits (and deletes the rating on its next run, REV-40); the erase-by-phone
+     * UPDATE waits for it and then deletes the committed rating in a later statement. If the sweep or the erase holds
+     * the row first, this waits (bounded by the advisory lock's transaction-local 3 s {@code lock_timeout}) and then
+     * re-checks the predicate against the anonymised row: no match, no phone-keyed row written.
+     */
+    @Query(value = """
+            SELECT COUNT(*) > 0 FROM (
+                SELECT 1 FROM bookings b
+                 WHERE b.id = :bookingId AND b.client_id IS NULL AND b.guest_phone = :phone
+                   AND b.guest_pii_anonymised_at IS NULL
+                   FOR UPDATE OF b
+            ) locked
+            """, nativeQuery = true)
+    boolean existsUnattachedGuestBooking(@Param("bookingId") UUID bookingId, @Param("phone") String phone);
+
+    /**
+     * B546 — the miss arm of {@link #existsUnattachedGuestBooking}: was the booking's guest PII anonymised (GST-51
+     * sweep / erase) while the rating waited on the lock? Read fresh from the row, never the loaded entity (stale).
+     */
+    @Query(value = """
+            SELECT EXISTS (
+                SELECT 1 FROM bookings b WHERE b.id = :bookingId AND b.guest_pii_anonymised_at IS NOT NULL)
+            """, nativeQuery = true)
+    boolean isGuestPiiAnonymised(@Param("bookingId") UUID bookingId);
 
     /**
      * All-rows visit-level (BE-4 reschedule) analogue of {@link #findCompletionAccessById}, backing
@@ -3116,4 +3150,49 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 SELECT 1 FROM bookings b WHERE b.client_id = :clientId AND b.salon_id = :salonId)
             """, nativeQuery = true)
     boolean existsByClientIdAndSalonId(@Param("clientId") UUID clientId, @Param("salonId") UUID salonId);
+
+    /**
+     * B546 (REV-38) — the phone-keyed twin of {@link #existsClientBookingVisibleToProvider}, for a {@code CLIENT_REVIEW}
+     * whose subject is a guest / walk-in phone: does {@code actorUserId} see a guest booking of {@code phone} (no
+     * account, PII not anonymised — the guest card's anchor guard) as its performing master or salon owner? Same
+     * {@code requireActiveMaster} rule. Bounded by the phone's bookings via {@code idx_bookings_guest_phone_open}
+     * (V199): the {@code client_detached_at IS NULL} term changes no result ({@code chk_bookings_guest_fields} keeps a
+     * phone off detached rows) but lets the planner prove the partial index's predicate.
+     */
+    @Query(value = GUEST_PHONE_BOOKING_VISIBLE_TO_PROVIDER_SQL, nativeQuery = true)
+    boolean existsGuestPhoneBookingVisibleToProvider(
+            @Param("phone") String phone,
+            @Param("actorUserId") UUID actorUserId,
+            @Param("requireActiveMaster") boolean requireActiveMaster);
+
+    /**
+     * B546 — the assigned {@code SALON_ADMIN} arm of {@link #existsGuestPhoneBookingVisibleToProvider}; same
+     * {@code idx_bookings_guest_phone_open} predicate.
+     */
+    @Query(value = GUEST_PHONE_BOOKING_AT_SALON_SQL, nativeQuery = true)
+    boolean existsGuestPhoneBookingAtSalon(@Param("phone") String phone, @Param("salonId") UUID salonId);
+
+    /** SQL of {@link #existsGuestPhoneBookingVisibleToProvider}; shared with its plan-pinning test. */
+    String GUEST_PHONE_BOOKING_VISIBLE_TO_PROVIDER_SQL = """
+            SELECT EXISTS (
+                SELECT 1
+                  FROM bookings b
+                  JOIN masters m ON m.id = b.master_id
+                  LEFT JOIN salons s ON s.id = b.salon_id
+                 WHERE b.guest_phone = :phone
+                   AND b.client_id IS NULL
+                   AND b.guest_pii_anonymised_at IS NULL
+                   AND b.client_detached_at IS NULL
+                   AND ((m.user_id = :actorUserId AND (m.is_active = true OR :requireActiveMaster = false))
+                        OR s.owner_id = :actorUserId))
+            """;
+
+    /** SQL of {@link #existsGuestPhoneBookingAtSalon}; shared with its plan-pinning test. */
+    String GUEST_PHONE_BOOKING_AT_SALON_SQL = """
+            SELECT EXISTS (
+                SELECT 1 FROM bookings b
+                 WHERE b.guest_phone = :phone AND b.salon_id = :salonId
+                   AND b.client_id IS NULL AND b.guest_pii_anonymised_at IS NULL
+                   AND b.client_detached_at IS NULL)
+            """;
 }

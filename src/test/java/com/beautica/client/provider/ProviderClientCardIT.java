@@ -415,6 +415,38 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("13b (B546 perf): guest own-ratings never cost more statements than registered, salon-wide and "
+            + "?masterId= alike — the anchor phone read is the gate, no separate EXISTS")
+    void should_spendNoMoreStatementsForGuestOwnRatings_when_comparedWithRegistered() throws Exception {
+        Salon s = fx.salon();
+        UUID c = fx.client("Бюджет", "Оцінки");
+        UUID registeredBooking = fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-9));
+        clientReview(registeredBooking, c, s.masterId(), s.salonId(), 4, "VISIBLE");
+        UUID anchor = fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Гість", "Оцінки", "COMPLETED",
+                fx.at(-8));
+        jdbcTemplate.update("INSERT INTO client_reviews (id, booking_id, subject_client_id, subject_guest_phone, "
+                        + "author_master_id, salon_id, rating, comment, created_at, updated_at) "
+                        + "VALUES (?, ?, NULL, ?, ?, ?, 3, NULL, NOW(), NOW())",
+                UUID.randomUUID(), anchor, GUEST_PHONE, s.masterId(), s.salonId());
+        String owner = fx.token(s.ownerEmail());
+        String chip = "?masterId=" + s.masterId();
+        String userRatings = userCard(s.salonId(), c) + "/ratings";
+        String guestRatings = guestCard(s.salonId(), anchor) + "/ratings";
+        for (String url : List.of(userRatings, guestRatings, userRatings + chip, guestRatings + chip)) {
+            fx.get(owner, url); // warm one-off lookups (authz memo, query plans)
+        }
+
+        long registered = statementsFor(owner, userRatings);
+        long guest = statementsFor(owner, guestRatings);
+        long registeredChip = statementsFor(owner, userRatings + chip);
+        long guestChip = statementsFor(owner, guestRatings + chip);
+
+        assertThat(guest).as("guest: anchor phone + page + count (+ authz)").isLessThanOrEqualTo(registered);
+        assertThat(guestChip).as("guest ?masterId=").isLessThanOrEqualTo(registeredChip);
+        assertThat(ok(fx.get(owner, guestRatings)).path("totalElements").asLong()).isEqualTo(1);
+    }
+
+    @Test
     @DisplayName("14: rating = average + count of other providers' VISIBLE reviews; no reviewCount / comment key")
     void should_exposeRatingNumberOnly_when_otherProvidersReviewedTheClient() throws Exception {
         Salon s = fx.salon();

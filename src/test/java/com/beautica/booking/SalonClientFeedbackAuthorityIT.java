@@ -2,6 +2,7 @@ package com.beautica.booking;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.review.config.ClientRatingProperties;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -16,6 +17,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -48,6 +50,9 @@ class SalonClientFeedbackAuthorityIT extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private ClientRatingProperties clientRatingProperties;
 
     private BookingTestFixtures fx;
 
@@ -102,27 +107,31 @@ class SalonClientFeedbackAuthorityIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("SALON_MASTER (performing): complete 403, flag false on detail and list, rate 403")
-    void should_denyEverything_when_salonMasterRunsTheJourney() throws Exception {
+    @DisplayName("B547 — SALON_MASTER (performing): complete 403 (BOOK-D08), flag true on detail and list, rate 201; "
+            + "the owner then sees no CTA and a second rating is 409 (REV-42)")
+    void should_rateButNotComplete_when_salonMasterRunsTheJourney() throws Exception {
         var salon = fx.createSalon("sfa-sm-owner-" + System.nanoTime() + "@beautica.test");
         UUID bookingId = insertConfirmedSalonBooking(salon);
         String token = fx.tokenFor(salon.masterEmail());
+        String ownerToken = fx.tokenFor(salon.ownerEmail());
 
         assertThat(patchComplete(bookingId, token)).isEqualTo(HttpStatus.FORBIDDEN);
         assertThat(dbStatus(bookingId)).as("the denied complete changed nothing").isEqualTo("CONFIRMED");
 
         // The owner (who alone may) closes it, so the read/rate half below runs on a COMPLETED booking.
-        assertThat(patchComplete(bookingId, fx.tokenFor(salon.ownerEmail()))).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(patchComplete(bookingId, ownerToken)).isEqualTo(HttpStatus.NO_CONTENT);
 
         boolean detail = detailFlag(bookingId, token);
         boolean list = listFlag(bookingId, token).orElseThrow();
         HttpStatus rate = rate(bookingId, token);
 
-        assertThat(detail).as("detail flag").isFalse();
-        assertThat(list).as("list flag").isFalse();
-        assertThat(rate).as("rate").isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(detail).as("detail flag").isTrue();
+        assertThat(list).as("list flag").isTrue();
+        assertThat(rate).as("rate").isEqualTo(HttpStatus.CREATED);
+        assertThat(detailFlag(bookingId, ownerToken)).as("owner flag once the master rated").isFalse();
+        assertThat(rate(bookingId, ownerToken)).as("second salon-side rating").isEqualTo(HttpStatus.CONFLICT);
         assertThat(jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId)).isZero();
+                "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId)).isEqualTo(1);
     }
 
     @Test
@@ -292,14 +301,14 @@ class SalonClientFeedbackAuthorityIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("SALON_MASTER who is ALSO the salon's owner row (role-blind kernel would admit): detail and list "
-            + "flag false on their own completed unrated booking")
-    void should_keepFlagFalse_when_salonMasterRoleHoldsOwnershipOfTheSalon() throws Exception {
+    @DisplayName("B547 — SALON_MASTER who is ALSO the salon's owner row: detail and list flag true on their own "
+            + "completed unrated booking (the performer arm admits them; ownership is never consulted for this role)")
+    void should_showFlag_when_salonMasterRoleHoldsOwnershipOfTheSalon() throws Exception {
         var salon = fx.createSalon("sfa-smown-owner-" + System.nanoTime() + "@beautica.test");
         UUID masterUserId = jdbcTemplate.queryForObject(
                 "SELECT user_id FROM masters WHERE id = ?", UUID.class, salon.masterId());
-        // The kernel (hasProviderAuthorityOverBooking) admits by ownership and is role-blind, so only the
-        // explicit SALON_MASTER rejection in canProviderReviewClient keeps this actor out.
+        // B547: a SALON_MASTER actor is decided by the performer arm (booking.master.user == actor), never by the
+        // role-blind ownership kernel.
         jdbcTemplate.update("UPDATE salons SET owner_id = ? WHERE id = ?", masterUserId, salon.salonId());
         UUID bookingId = insertConfirmedSalonBooking(salon);
         jdbcTemplate.update("UPDATE bookings SET status = 'COMPLETED' WHERE id = ?", bookingId);
@@ -308,8 +317,136 @@ class SalonClientFeedbackAuthorityIT extends AbstractIntegrationTest {
         boolean detail = detailFlag(bookingId, token);
         Optional<Boolean> list = listFlag(bookingId, token);
 
-        assertThat(detail).as("detail flag").isFalse();
-        assertThat(list).as("list flag").contains(false);
+        assertThat(detail).as("detail flag").isTrue();
+        assertThat(list).as("list flag").contains(true);
+    }
+
+    @Test
+    @DisplayName("B547 (REV-42) race — the owner and the performing master POST concurrently: exactly one 201 and one "
+            + "409, one row (uq_client_reviews_booking)")
+    void should_admitExactlyOneSalonSideRating_when_ownerAndMasterRateConcurrently() throws Exception {
+        var salon = fx.createSalon("sfa-race-owner-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = insertConfirmedSalonBooking(salon);
+        jdbcTemplate.update("UPDATE bookings SET status = 'COMPLETED' WHERE id = ?", bookingId);
+        String ownerToken = fx.tokenFor(salon.ownerEmail());
+        String masterToken = fx.tokenFor(salon.masterEmail());
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            java.util.concurrent.Future<HttpStatus> owner = pool.submit(() -> {
+                start.await();
+                return rate(bookingId, ownerToken);
+            });
+            java.util.concurrent.Future<HttpStatus> master = pool.submit(() -> {
+                start.await();
+                return rate(bookingId, masterToken);
+            });
+
+            start.countDown();
+            List<HttpStatus> outcomes = List.of(owner.get(30, java.util.concurrent.TimeUnit.SECONDS),
+                    master.get(30, java.util.concurrent.TimeUnit.SECONDS));
+
+            assertThat(outcomes).containsExactlyInAnyOrder(HttpStatus.CREATED, HttpStatus.CONFLICT);
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId)).isEqualTo(1);
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    @DisplayName("B547 (NTF-D07) — the owner completes: no feed row (so no push) for the performing master")
+    void should_notNotifyThePerformingMaster_when_ownerCompletes() throws Exception {
+        var salon = fx.createSalon("sfa-ntf-owner-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = insertConfirmedSalonBooking(salon);
+        UUID masterUserId = jdbcTemplate.queryForObject(
+                "SELECT user_id FROM masters WHERE id = ?", UUID.class, salon.masterId());
+
+        assertThat(patchComplete(bookingId, fx.tokenFor(salon.ownerEmail()))).isEqualTo(HttpStatus.NO_CONTENT);
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM in_app_notification WHERE recipient_user_id = ?", Integer.class, masterUserId))
+                .as("no completion notification to the master (push mirrors the feed, NTF-12)")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("B546 1b — an INDEPENDENT_MASTER-typed master that still carries a salon_id: flag true and POST 201 for "
+            + "the master; the owner of that salon is denied on both")
+    void should_agreeOnTheIndependentArm_when_independentMasterCarriesASalonId() throws Exception {
+        var salon = fx.createSalon("sfa-1b-owner-" + System.nanoTime() + "@beautica.test");
+        String email = "sfa-1b-im-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fx.createIndependentMaster(email);
+        UUID masterServiceId = fx.createIndependentMasterService(masterId);
+        jdbcTemplate.update("UPDATE masters SET salon_id = ? WHERE id = ?", salon.salonId(), masterId);
+        UUID clientId = fx.createUser("sfa-1b-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertConfirmedBooking(clientId, masterId, masterServiceId, null);
+        jdbcTemplate.update("UPDATE bookings SET status = 'COMPLETED' WHERE id = ?", bookingId);
+        String masterToken = fx.tokenFor(email);
+        String ownerToken = fx.tokenFor(salon.ownerEmail());
+
+        assertThat(listFlag(bookingId, ownerToken)).as("owner list flag (row absent or false)")
+                .satisfiesAnyOf(f -> assertThat(f).isEmpty(), f -> assertThat(f).contains(false));
+        assertThat(rate(bookingId, ownerToken)).as("owner rate").isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(detailFlag(bookingId, masterToken)).as("master detail flag").isTrue();
+        assertThat(listFlag(bookingId, masterToken)).as("master list flag").contains(true);
+        assertThat(rate(bookingId, masterToken)).as("master rate").isEqualTo(HttpStatus.CREATED);
+    }
+
+    @Test
+    @DisplayName("B547 D2 — a COLLEAGUE SALON_MASTER (same salon, not the performer): POST /client-reviews 403, no "
+            + "detail (so no CTA) and no list row, nothing written; the performer can still rate afterwards")
+    void should_denyRating_when_colleagueSalonMasterOfTheSameSalonPosts() throws Exception {
+        var salon = fx.createSalon("sfa-colleague-owner-" + System.nanoTime() + "@beautica.test");
+        UUID colleagueMasterId = fx.createExtraSalonMaster(salon.salonId(), "sfa-colleague");
+        String colleagueEmail = jdbcTemplate.queryForObject(
+                "SELECT u.email FROM users u JOIN masters m ON m.user_id = u.id WHERE m.id = ?",
+                String.class, colleagueMasterId);
+        UUID bookingId = insertConfirmedSalonBooking(salon);
+        jdbcTemplate.update("UPDATE bookings SET status = 'COMPLETED' WHERE id = ?", bookingId);
+        String colleagueToken = fx.tokenFor(colleagueEmail);
+
+        HttpStatus colleagueRate = rate(bookingId, colleagueToken);
+        HttpStatus colleagueDetail = getStatus(BOOKINGS_URL + "/" + bookingId, colleagueToken);
+        Optional<Boolean> colleagueListFlag = listFlag(bookingId, colleagueToken);
+        int rowsAfterDenied = reviewCount(bookingId);
+
+        assertThat(colleagueRate).as("colleague rate").isEqualTo(HttpStatus.FORBIDDEN);
+        // Fix M1: a SALON_MASTER views only the bookings they performed, so the colleague is never served the
+        // detail (and so never the CTA) and the booking is not on their /bookings/me page.
+        assertThat(colleagueDetail).as("colleague detail").isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(colleagueListFlag).as("colleague list row").isEmpty();
+        assertThat(rowsAfterDenied).as("the denied rate wrote nothing").isZero();
+        assertThat(rate(bookingId, fx.tokenFor(salon.masterEmail()))).as("performer rate after the denial")
+                .isEqualTo(HttpStatus.CREATED);
+    }
+
+    @Test
+    @DisplayName("B546 (REV-41) flag OFF (APP_GUEST_CLIENT_RATING_ENABLED=false, the default) — a LINK guest and a "
+            + "STAFF walk-in with a phone: detail and list flag false, POST 400 (genericised body), nothing written")
+    void should_keepGuestsUnrateable_when_guestRatingFlagIsOff() throws Exception {
+        assertThat(clientRatingProperties.guestEnabled()).as("premise: this context runs with the flag off").isFalse();
+        var salon = fx.createSalon("sfa-flagoff-owner-" + System.nanoTime() + "@beautica.test");
+        String ownerToken = fx.tokenFor(salon.ownerEmail());
+
+        for (String source : List.of("LINK", "STAFF")) {
+            UUID bookingId = insertCompletedGuestBooking(salon, source);
+
+            boolean detail = detailFlag(bookingId, ownerToken);
+            Optional<Boolean> list = listFlag(bookingId, ownerToken);
+            ResponseEntity<String> write = rateResponse(bookingId, ownerToken);
+
+            assertThat(detail).as("%s detail flag", source).isFalse();
+            assertThat(list.orElse(false)).as("%s list flag", source).isFalse();
+            assertThat(write.getStatusCode()).as("%s write body=%s", source, write.getBody())
+                    .isEqualTo(HttpStatus.BAD_REQUEST);
+            // The business-400 message is genericised on the wire (GlobalExceptionHandler#handleBusiness); the
+            // flag-off vs no-identity distinction is pinned by ClientReviewServiceTest.
+            JsonNode error = objectMapper.readTree(write.getBody());
+            assertThat(error.path("success").asBoolean(true)).as("%s success", source).isFalse();
+            assertThat(error.path("message").asText()).as("%s message", source).isEqualTo("Invalid request");
+            assertThat(reviewCount(bookingId)).as("%s: nothing written", source).isZero();
+        }
     }
 
     // ── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -355,11 +492,20 @@ class SalonClientFeedbackAuthorityIT extends AbstractIntegrationTest {
     }
 
     private HttpStatus rate(UUID bookingId, String token) throws Exception {
-        return HttpStatus.valueOf(restTemplate.exchange(
+        return HttpStatus.valueOf(rateResponse(bookingId, token).getStatusCode().value());
+    }
+
+    private ResponseEntity<String> rateResponse(UUID bookingId, String token) throws Exception {
+        return restTemplate.exchange(
                 CLIENT_REVIEWS_URL, HttpMethod.POST,
                 new HttpEntity<>(objectMapper.writeValueAsString(Map.of("bookingId", bookingId.toString(), "rating", 5)),
                         fixtures().bearerHeaders(token)),
-                String.class).getStatusCode().value());
+                String.class);
+    }
+
+    private int reviewCount(UUID bookingId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId);
     }
 
     // ── seeding ──────────────────────────────────────────────────────────────────
@@ -380,6 +526,21 @@ class SalonClientFeedbackAuthorityIT extends AbstractIntegrationTest {
                         + "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', NOW() - interval '2 hours', "
                         + "NOW() - interval '1 hour', 500.00, 60, 0, 'APP', NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId, salonId);
+        return bookingId;
+    }
+
+    /** COMPLETED guest ({@code LINK}) or walk-in ({@code STAFF}) booking with a phone and no account, in the past. */
+    private UUID insertCompletedGuestBooking(BookingTestFixtures.SalonFixture salon, String source) {
+        UUID masterServiceId = fx.createSalonService(salon.salonId(), salon.masterId());
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, guest_name, guest_surname, guest_phone, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'COMPLETED', NOW() - interval '2 hours', NOW() - interval '1 hour', "
+                        + "500.00, 60, 0, ?, 'Гість', 'Тестовий', ?, NOW(), NOW())",
+                bookingId, salon.masterId(), masterServiceId, salon.salonId(), source,
+                "+38050" + String.format("%07d", Math.floorMod(System.nanoTime(), 10_000_000L)));
         return bookingId;
     }
 

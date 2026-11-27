@@ -42,7 +42,8 @@ import java.util.UUID;
  *   <li>{@code SALON_PROFILE} — {@code GET /salons/{id}}: any active salon.</li>
  *   <li>{@code CLIENT_PROFILE} / {@code CLIENT_REVIEW} — only a provider who has a booking with that client
  *       (performing master, salon owner, or the salon's assigned admin), see
- *       {@link BookingRepository#existsClientBookingVisibleToProvider}.</li>
+ *       {@link BookingRepository#existsClientBookingVisibleToProvider}. A phone-keyed {@code CLIENT_REVIEW} (B546)
+ *       uses the guest form, {@link BookingRepository#existsGuestPhoneBookingVisibleToProvider}.</li>
  * </ul>
  * Anything else resolves to {@link Optional#empty()}, which the service turns into the SAME 404 as a missing id
  * (no existence oracle).
@@ -106,9 +107,10 @@ public class ReportTargetVisibilityResolver {
             return Optional.of(new ReportTarget(true));
         }
         User subject = review.getSubjectClient();
-        return providerSeesClient(subject.getId(), reporterId, reporterRole)
-                ? Optional.of(new ReportTarget(false))
-                : Optional.empty();
+        boolean visible = subject != null
+                ? providerSeesClient(subject.getId(), reporterId, reporterRole)
+                : providerSeesGuestPhone(review.getSubjectGuestPhone(), reporterId, reporterRole);
+        return visible ? Optional.of(new ReportTarget(false)) : Optional.empty();
     }
 
     /**
@@ -178,6 +180,24 @@ public class ReportTargetVisibilityResolver {
         }
         return bookingRepository.existsClientBookingVisibleToProvider(
                 clientUserId, reporterId, reporterRole == Role.SALON_MASTER);
+    }
+
+    /**
+     * B546 (REV-38) — the phone-keyed arm of {@link #providerSeesClient}: a guest / walk-in rating is visible to a
+     * provider who can open that guest's card, i.e. who has a non-anonymised, unattached booking of the phone in their
+     * scope (performing master, salon owner, or the salon's assigned admin). Anyone else gets the uniform 404.
+     */
+    private boolean providerSeesGuestPhone(String phone, UUID reporterId, Role reporterRole) {
+        if (phone == null || !PROVIDER_ROLES.contains(reporterRole)) {
+            return false;
+        }
+        if (reporterRole == Role.SALON_ADMIN) {
+            return userRepository.findSalonIdById(reporterId)
+                    .map(salonId -> bookingRepository.existsGuestPhoneBookingAtSalon(phone, salonId))
+                    .orElse(false);
+        }
+        return bookingRepository.existsGuestPhoneBookingVisibleToProvider(
+                phone, reporterId, reporterRole == Role.SALON_MASTER);
     }
 
     private boolean managesSalon(UUID salonId, UUID reporterId, Role reporterRole) {

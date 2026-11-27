@@ -138,6 +138,33 @@ public interface ProviderClientRepository extends Repository<Booking, UUID> {
     @Query(value = ClientRatingSql.COUNT_MASTER, nativeQuery = true)
     long countRatingsByMaster(@Param("masterId") UUID masterId, @Param("userId") UUID userId);
 
+    // ── B546: the guest arm of the own-ratings page, keyed to the anchor's phone (REV-38) ──
+
+    @Query(value = ClientRatingSql.PAGE_GUEST_SALON, nativeQuery = true)
+    List<ClientOwnRatingProjection> guestRatingsBySalon(
+            @Param("salonId") UUID salonId, @Param("phone") String phone, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientRatingSql.PAGE_GUEST_SALON_MASTER, nativeQuery = true)
+    List<ClientOwnRatingProjection> guestRatingsBySalonAndMaster(
+            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("phone") String phone,
+            @Param("limit") int limit, @Param("offset") long offset);
+
+    @Query(value = ClientRatingSql.PAGE_GUEST_MASTER, nativeQuery = true)
+    List<ClientOwnRatingProjection> guestRatingsByMaster(
+            @Param("masterId") UUID masterId, @Param("phone") String phone, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientRatingSql.COUNT_GUEST_SALON, nativeQuery = true)
+    long countGuestRatingsBySalon(@Param("salonId") UUID salonId, @Param("phone") String phone);
+
+    @Query(value = ClientRatingSql.COUNT_GUEST_SALON_MASTER, nativeQuery = true)
+    long countGuestRatingsBySalonAndMaster(
+            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("phone") String phone);
+
+    @Query(value = ClientRatingSql.COUNT_GUEST_MASTER, nativeQuery = true)
+    long countGuestRatingsByMaster(@Param("masterId") UUID masterId, @Param("phone") String phone);
+
     // B526 existence checks (the uniform 404 gate) — registered by client_id, guest by a valid anchor booking
 
     @Query(value = ClientRatingSql.EXISTS_USER_SALON, nativeQuery = true)
@@ -164,6 +191,10 @@ public interface ProviderClientRepository extends Repository<Booking, UUID> {
 
     @Query(value = ClientRatingSql.ANCHOR_PHONE_SALON, nativeQuery = true)
     Optional<String> findGuestAnchorPhoneBySalon(@Param("salonId") UUID salonId, @Param("bookingId") UUID bookingId);
+
+    @Query(value = ClientRatingSql.ANCHOR_PHONE_SALON_MASTER, nativeQuery = true)
+    Optional<String> findGuestAnchorPhoneBySalonAndMaster(
+            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("bookingId") UUID bookingId);
 
     @Query(value = ClientRatingSql.ANCHOR_PHONE_MASTER, nativeQuery = true)
     Optional<String> findGuestAnchorPhoneByMaster(

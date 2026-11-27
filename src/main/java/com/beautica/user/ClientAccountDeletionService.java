@@ -17,6 +17,7 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.review.repository.ClientReviewRepository;
+import com.beautica.review.service.ClientRatingSubjectService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -95,6 +96,7 @@ public class ClientAccountDeletionService {
     private final AppointmentRepository appointmentRepository;
     private final BookingService bookingService;
     private final ClientReviewRepository clientReviewRepository;
+    private final ClientRatingSubjectService clientRatingSubjectService;
     private final MediaRepository mediaRepository;
     private final TokensValidAfterCache tokensValidAfterCache;
     private final UserProfileCacheEvictor userProfileCacheEvictor;
@@ -220,6 +222,10 @@ public class ClientAccountDeletionService {
         // Master#detach: the whole-row CHECK (chk_bookings_guest_fields, V162) is evaluated against
         // the result, so splitting this into two statements would leave an intermediate row no arm
         // of the CHECK accepts.
+        // B546 (CLI-66, REV-40) — first, while the bookings still carry client_id: a phone-keyed rating left on one of
+        // the account's bookings (only a rating that raced the attach move) is deleted with the account's data, never
+        // stranded on the detached row. Account-keyed ratings go in step 7.
+        clientRatingSubjectService.deleteGuestRatingsOfAccountBookings(clientUserId);
         List<Booking> remainingBookings = bookingRepository.findByClientId(clientUserId);
         for (Booking booking : remainingBookings) {
             booking.detachClient(DETACHED_CLIENT_LABEL, now);

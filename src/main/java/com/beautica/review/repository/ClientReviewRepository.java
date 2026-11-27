@@ -9,6 +9,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -153,6 +154,86 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
     @Modifying
     @Query("DELETE FROM ClientReview cr WHERE cr.subjectClient.id = :subjectClientId")
     void deleteBySubjectClientId(@Param("subjectClientId") UUID subjectClientId);
+
+    /**
+     * B546 (REV-39, REV-D11) — moves the phone-keyed ratings of the account's bookings to the account: every
+     * {@code client_reviews} row anchored to a booking now owned by {@code clientId} that is still phone-keyed. Keyed on
+     * the BOOKINGS (through {@code bookings.client_id}), never on the bare phone, so an anonymised (GST-51) or detached
+     * (CLI-66) booking, which never attaches, keeps its rating off the account, and a walk-in on an old phone after a
+     * phone change stays phone-keyed (AUTH-D22). The comment moves with the row. Runs in the attach transaction right
+     * after the bookings UPDATE, so the just-attached bookings are exactly the new matches; idempotent otherwise.
+     *
+     * @return rows moved
+     */
+    @Modifying(flushAutomatically = true)
+    @Query(value = """
+            UPDATE client_reviews cr
+               SET subject_client_id = :clientId,
+                   subject_guest_phone = NULL,
+                   updated_at = now()
+              FROM bookings b
+             WHERE b.id = cr.booking_id
+               AND b.client_id = :clientId
+               AND cr.subject_guest_phone IS NOT NULL
+            """, nativeQuery = true)
+    int moveGuestRatingsToAccount(@Param("clientId") UUID clientId);
+
+    /**
+     * B546 (REV-40) — deletes the phone-keyed ratings of the given (just anonymised) bookings; a rating dies with its
+     * subject's data (privacy 188). Account-keyed rows are untouched: they belong to an account, not to guest PII.
+     *
+     * @return rows deleted
+     */
+    @Modifying(flushAutomatically = true)
+    @Query(value = """
+            DELETE FROM client_reviews
+             WHERE booking_id IN (:bookingIds)
+               AND subject_guest_phone IS NOT NULL
+            """, nativeQuery = true)
+    int deleteGuestRatingsOfBookings(@Param("bookingIds") Collection<UUID> bookingIds);
+
+    /**
+     * B546 (CLI-66) — the phone-keyed ratings of the bookings an account still owns, deleted before the account's
+     * self-delete detaches them: such a row exists only when a rating raced the attach move, and it would otherwise
+     * outlive its subject on a detached booking.
+     */
+    @Modifying(flushAutomatically = true)
+    @Query(value = """
+            DELETE FROM client_reviews cr
+             USING bookings b
+             WHERE b.id = cr.booking_id
+               AND b.client_id = :clientId
+               AND cr.subject_guest_phone IS NOT NULL
+            """, nativeQuery = true)
+    int deleteGuestRatingsOfAccountBookings(@Param("clientId") UUID clientId);
+
+    /**
+     * B546 (REV-D10, CLI-43) — a guest phone's visible star counts (the card's 5-to-1 distribution), computed on read
+     * (guests have no stored aggregate). Served by {@code idx_client_reviews_subject_guest_phone} (V269).
+     */
+    @Query(value = """
+            SELECT CAST(cr.rating AS integer) AS rating, COUNT(*) AS count
+              FROM client_reviews cr
+             WHERE cr.subject_guest_phone = :phone
+               AND cr.moderation_status = 'VISIBLE'
+             GROUP BY cr.rating
+            """, nativeQuery = true)
+    List<RatingCountProjection> countByGuestPhoneGroupByRating(@Param("phone") String phone);
+
+    /** B546 — a guest phone's computed rating: {@code avgRating} null and {@code reviewCount} 0 when unrated. */
+    interface GuestRatingProjection {
+        java.math.BigDecimal getAvgRating();
+
+        Integer getReviewCount();
+    }
+
+    /**
+     * B546 (BOOK-78, REV-D10, REV-36) — the provider booking detail's guest rating: the SAME {@link GuestRatingSql}
+     * computation as the client card and list. Always exactly one row.
+     */
+    @Query(value = "SELECT g.avg_rating AS avgRating, g.review_count AS reviewCount FROM ("
+            + GuestRatingSql.AGGREGATE + "   AND cr.subject_guest_phone = :phone) g", nativeQuery = true)
+    GuestRatingProjection guestRatingByPhone(@Param("phone") String phone);
 
     /**
      * Phase 415 — the parties of a client review: who answers for it (the salon when the review's own {@code salon_id}

@@ -1,6 +1,7 @@
 package com.beautica.client.provider.repository;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.booking.repository.BookingRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -119,6 +120,42 @@ class V263GuestPhoneScopeIndexMigrationTest extends AbstractIntegrationTest {
                 .contains("Index Cond: ((guest_phone)::text = ").doesNotContain("Seq Scan on bookings");
     }
 
+    @Test
+    @DisplayName("the CLIENT_REVIEW guest-phone visibility probe (master / owner) reads idx_bookings_guest_phone_open")
+    void should_applyOpenPhoneIndex_when_guestPhoneVisibleToProviderExplained() {
+        // Act
+        String plan = explain(BookingRepository.GUEST_PHONE_BOOKING_VISIBLE_TO_PROVIDER_SQL, true);
+
+        // Assert
+        assertThat(plan).as(plan).contains("Bitmap Index Scan on " + SURVIVOR)
+                .contains("Index Cond: ((guest_phone)::text = ").doesNotContain("Seq Scan on bookings");
+    }
+
+    @Test
+    @DisplayName("the CLIENT_REVIEW guest-phone visibility probe (salon admin) reads idx_bookings_guest_phone_open")
+    void should_applyOpenPhoneIndex_when_guestPhoneAtSalonExplained() {
+        // Act
+        String plan = explain(BookingRepository.GUEST_PHONE_BOOKING_AT_SALON_SQL, true);
+
+        // Assert
+        assertThat(plan).as(plan).contains("Bitmap Index Scan on " + SURVIVOR)
+                .contains("Index Cond: ((guest_phone)::text = ").doesNotContain("Seq Scan on bookings");
+    }
+
+    @Test
+    @DisplayName("control: the salon-admin guest-phone probe without client_detached_at cannot use the open phone index")
+    void should_notApplyOpenPhoneIndex_when_guestPhoneAtSalonLacksDetachedTerm() {
+        // Arrange
+        assertThat(BookingRepository.GUEST_PHONE_BOOKING_AT_SALON_SQL).contains(DETACHED_TERM);
+        String withoutTerm = BookingRepository.GUEST_PHONE_BOOKING_AT_SALON_SQL.replace(DETACHED_TERM, ")");
+
+        // Act
+        String plan = explain(withoutTerm, true);
+
+        // Assert
+        assertThat(plan).as(plan).doesNotContain(SURVIVOR);
+    }
+
     private Integer countIndex(String index) {
         return jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM pg_indexes WHERE tablename = 'bookings' AND indexname = ?", Integer.class, index);
@@ -134,6 +171,9 @@ class V263GuestPhoneScopeIndexMigrationTest extends AbstractIntegrationTest {
                 .addValue("salonId", UUID.randomUUID())
                 .addValue("masterId", UUID.randomUUID())
                 .addValue("bookingId", UUID.randomUUID())
+                .addValue("phone", "+380501234567")
+                .addValue("actorUserId", UUID.randomUUID())
+                .addValue("requireActiveMaster", true)
                 .addValue("now", OffsetDateTime.parse("2026-06-02T09:00:00Z"));
         NamedParameterJdbcTemplate named = new NamedParameterJdbcTemplate(jdbcTemplate);
         return new TransactionTemplate(transactionManager).execute(status -> {

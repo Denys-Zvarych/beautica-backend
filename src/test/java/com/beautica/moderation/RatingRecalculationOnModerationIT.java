@@ -1,13 +1,19 @@
 package com.beautica.moderation;
 
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.review.event.ClientReviewEventListener;
+import com.beautica.review.event.ClientReviewModerationChangedEvent;
 import com.beautica.review.service.RatingRecalculationService;
 import com.beautica.review.repository.ClientReviewRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
+import org.springframework.test.util.AopTestUtils;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
@@ -15,6 +21,9 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 
 /**
  * Phase 396 D3 — every moderation transition recalculates the VISIBLE-only aggregates after commit: master + salon on
@@ -33,6 +42,13 @@ class RatingRecalculationOnModerationIT extends AbstractModerationIT {
 
     @Autowired
     private TransactionTemplate transactionTemplate;
+
+    /**
+     * Observes {@link ClientReviewModerationChangedEvent} delivery (AFTER_COMMIT, on the request thread, before the
+     * response). Verified on the AOP target: the injected field is the transaction proxy wrapping the spy.
+     */
+    @MockitoSpyBean
+    private ClientReviewEventListener clientReviewEventListener;
 
     @Test
     @DisplayName("5★ + 1★: auto-hide the 1★ → master/salon 5.00 (1 review); RESTORE → 3.00 (2 reviews)")
@@ -84,6 +100,41 @@ class RatingRecalculationOnModerationIT extends AbstractModerationIT {
                 "SELECT avg_rating, review_count FROM users WHERE id = ?", clientId);
         assertThat(((Number) user.get("review_count")).intValue()).isZero();
         assertThat(user.get("avg_rating")).isNull();
+        verify(listenerSpy()).onClientReviewModerationChanged(new ClientReviewModerationChangedEvent(clientId));
+    }
+
+    @Test
+    @DisplayName("B546 (REV-D11 remedy): REMOVE a phone-keyed walk-in rating → 200 REMOVED, row REMOVED, the guest "
+            + "card's computed aggregate drops it (no account, no recalculation event, no NPE)")
+    void should_removeGuestRatingAndDropItFromGuestAggregate_when_phoneKeyedRatingRemoved() throws Exception {
+        SalonFixture salon = createSalon();
+        String phone = uniqueGuestPhone();
+        UUID walkIn = insertGuestBooking(salon, "STAFF", phone);
+        UUID clientReviewId = insertGuestClientReview(walkIn, phone, salon, 1);
+        String indepEmail = unique("indep");
+        IndependentMaster indep = createIndependentMaster(indepEmail);
+        insertIndependentGuestBooking(indep.masterId(), phone);
+        String ownerToken = tokenFor(salon.ownerEmail());
+        String guestCard = "/api/v1/salons/" + salon.salonId() + "/clients/guests/" + walkIn;
+        assertThat(data(exchange(HttpMethod.GET, guestCard, ownerToken)).path("ratingCount").asInt())
+                .as("precondition: the guest card counts the phone-keyed rating").isEqualTo(1);
+        ResponseEntity<String> reported = postReport(tokenFor(indepEmail),
+                reportBody("CLIENT_REVIEW", clientReviewId, "FALSE_INFO", null));
+        assertThat(reported.getStatusCode()).as("report body: %s", reported.getBody()).isEqualTo(HttpStatus.CREATED);
+
+        ResponseEntity<String> removed = resolve(reportIdOn(indep.userId(), clientReviewId), "REMOVE");
+
+        assertThat(removed.getStatusCode()).as("body: %s", removed.getBody()).isEqualTo(HttpStatus.OK);
+        assertThat(data(removed).path("resolution").asText()).isEqualTo("REMOVED");
+        assertThat(jdbcTemplate.queryForObject("SELECT moderation_status FROM client_reviews WHERE id = ?",
+                String.class, clientReviewId)).isEqualTo("REMOVED");
+        assertThat(data(exchange(HttpMethod.GET, guestCard, ownerToken)).path("ratingCount").asInt())
+                .as("the guest aggregate is computed on read from VISIBLE rows").isZero();
+        verify(listenerSpy(), never()).onClientReviewModerationChanged(any());
+    }
+
+    private ClientReviewEventListener listenerSpy() {
+        return AopTestUtils.getTargetObject(clientReviewEventListener);
     }
 
     private void assertRatings(SalonFixture salon, String avg, int count) {

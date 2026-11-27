@@ -4,6 +4,7 @@ import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.review.dto.ClientReviewResponse;
@@ -45,6 +46,11 @@ public class ClientReviewService {
     private final BookingRepository bookingRepository;
     private final AuthorizationService authz;
     private final ApplicationEventPublisher eventPublisher;
+    private final ClientRatingEligibility eligibility;
+
+    static final String GUEST_DISABLED_MESSAGE = "Cannot review a guest booking — no client account exists";
+    static final String NO_IDENTITY_MESSAGE = "Cannot review this booking — it has no client identity";
+    static final String DUPLICATE_MESSAGE = "A client review already exists for this booking";
 
     // No Clock field here — unlike ReviewService#createReview, this write path's eligibility gate
     // (BookingClosureRule#isProviderReviewEligible) is a pure STATUS check with no TIME half, so
@@ -76,52 +82,93 @@ public class ClientReviewService {
                     "This booking must be marked completed before you can review the client");
         }
 
-        // 4. 400 if the booking has no client (guest/LINK booking, V89 chk_bookings_guest_fields)
-        // — there is no account to review. Not a 403: the actor IS an authorized provider over
-        // this booking (step 2 already confirmed that); the booking is simply structurally
-        // ineligible, the same class of rejection as the status check above.
-        if (booking.getClient() == null) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "Cannot review a guest booking — no client account exists");
+        // 4. 400 unless the booking has a rateable client identity (B546, REV-D04 / REV-16 / REV-41). Not a 403: the
+        // actor IS an authorized provider (step 2); the booking is structurally ineligible, like the status check.
+        boolean guestSubject = booking.getClient() == null;
+        if (guestSubject) {
+            requireRateableGuest(booking);
         }
 
-        // 4b. REV-D04 / REV-E04 (B527 audit): a STAFF walk-in is never rateable by the provider, even once attached to
-        // the account that owns its phone — the phone was typed by staff, so a fake walk-in on a victim's number would
-        // otherwise plant a rating. Only LINK / APP bookings are rateable. Same 400 and wording as the guest case.
-        if (!booking.isRateableByProvider()) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "Cannot review a guest booking — no client account exists");
-        }
-
-        // 5. 409 on a duplicate review for this booking.
+        // 5. 409 on a duplicate review for this booking — one salon-side rating per booking, first writer wins
+        // (B547, REV-42); the unique constraint below is the race backstop.
         if (clientReviewRepository.existsByBookingId(booking.getId())) {
-            throw new BusinessException(HttpStatus.CONFLICT,
-                    "A client review already exists for this booking");
+            throw new ConflictException(DUPLICATE_MESSAGE);
         }
 
-        ClientReview review = ClientReview.builder()
-                .booking(booking)
-                .subjectClient(booking.getClient())
-                .authorMaster(booking.getMaster())
-                .salon(booking.getSalon())
-                .rating(request.rating().shortValue())
-                .comment(request.comment())
-                .build();
+        ClientReview review = guestSubject
+                ? ClientReview.forGuest(booking, booking.getGuestPhone(), booking.getMaster(), booking.getSalon(),
+                        request.rating().shortValue(), request.comment())
+                : ClientReview.builder()
+                        .booking(booking)
+                        .subjectClient(booking.getClient())
+                        .authorMaster(booking.getMaster())
+                        .salon(booking.getSalon())
+                        .rating(request.rating().shortValue())
+                        .comment(request.comment())
+                        .build();
 
         ClientReview saved;
         try {
             saved = clientReviewRepository.saveAndFlush(review);
         } catch (DataIntegrityViolationException e) {
-            throw new BusinessException(HttpStatus.CONFLICT,
-                    "A client review already exists for this booking");
+            // Only the one-rating-per-booking race (REV-42) is a 409; any other violation is a bug and propagates.
+            if (isDuplicateBookingViolation(e)) {
+                throw new ConflictException(DUPLICATE_MESSAGE);
+            }
+            throw e;
         }
 
         // 6. Rating recalculation happens AFTER commit, in its own transaction — never inline
         // here (Anti-Bug §F.2/§F.8). See ClientReviewEventListener.
-        eventPublisher.publishEvent(new ClientReviewCreatedEvent(booking.getClient().getId()));
+        // A guest subject has no users row and no stored aggregate: its readout is computed on read (REV-D10).
+        if (!guestSubject) {
+            eventPublisher.publishEvent(new ClientReviewCreatedEvent(booking.getClient().getId()));
+        }
 
         // 7. Locked product decision: no notification/outbox row is enqueued for this event — a
         // client is never told a master reviewed them.
         return ClientReviewResponse.from(saved);
+    }
+
+    /** The race backstop's constraint: {@code client_reviews.booking_id} is unique (V128). */
+    static final String DUPLICATE_BOOKING_CONSTRAINT = "uq_client_reviews_booking";
+
+    /**
+     * Matches only Hibernate's structured {@code getConstraintName()} — never a message substring (the PgJDBC detail
+     * line can echo row values). Same rationale as {@code CategoryRequestService#isNameUniqueViolation}.
+     */
+    private static boolean isDuplicateBookingViolation(DataIntegrityViolationException e) {
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause instanceof org.hibernate.exception.ConstraintViolationException hce
+                    && DUPLICATE_BOOKING_CONSTRAINT.equals(hce.getConstraintName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * B546 guest arm. One gate, {@link ClientRatingEligibility#guestGate} (the CTA flag's own predicate): flag off is
+     * today's 400 (REV-41); no phone (a walk-in without one, an anonymised row) is 400, there is no identity to rate
+     * (D2). Then the per-phone attach lock (the one {@code ClientPhoneAttachService} takes), and a re-read that also
+     * row-locks the booking: an attach that committed after this booking was loaded has already moved this phone's
+     * ratings, so writing a phone-keyed row now would strand it on an attached booking — 409, the client retries and
+     * the booking is then account-keyed; a re-read miss caused by the anonymisation sweep is the NO_IDENTITY 400. The row lock keeps the GST-51 anonymisation from interleaving (see
+     * {@link BookingRepository#existsUnattachedGuestBooking}).
+     */
+    private void requireRateableGuest(Booking booking) {
+        switch (eligibility.guestGate(booking)) {
+            case DISABLED -> throw new BusinessException(HttpStatus.BAD_REQUEST, GUEST_DISABLED_MESSAGE);
+            case NO_IDENTITY -> throw new BusinessException(HttpStatus.BAD_REQUEST, NO_IDENTITY_MESSAGE);
+            case RATEABLE -> { }
+        }
+        bookingRepository.acquireWalkInPhoneLock(booking.getGuestPhone());
+        if (!bookingRepository.existsUnattachedGuestBooking(booking.getId(), booking.getGuestPhone())) {
+            // Lost to the anonymisation sweep: no identity left to rate (same 400 as the gate). Else an attach.
+            if (bookingRepository.isGuestPiiAnonymised(booking.getId())) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST, NO_IDENTITY_MESSAGE);
+            }
+            throw new ConflictException("This booking was just linked to a client account. Try again");
+        }
     }
 }

@@ -140,6 +140,8 @@ public class BookingService {
     private final BookingBlockGuard bookingBlockGuard;
     /** B504 (track D18) — category display names (hidden included) for {@code categoryDisplayName}. */
     private final com.beautica.service.service.PlatformCategoryLabelResolver categoryLabelResolver;
+    /** B546 (REV-D04, REV-41) — the one rateable-client predicate the write path also uses (flag + guest phone). */
+    private final com.beautica.review.service.ClientRatingEligibility clientRatingEligibility;
 
     /**
      * Creates a booking (or replays an idempotent one) and returns the <b>enriched</b> detail view.
@@ -254,7 +256,25 @@ public class BookingService {
         // GST-80 / GST-D14 / CLI-D08 / BOOK-78 (user 2026-11-21): booking detail carries NO phone for any role - the
         // client's phone lives only on the provider client card (ClientPhonePolicy). guestPhone / clientPhone stay on
         // the DTO (always null) so old app builds keep parsing the same OpenAPI shape.
-        return withClientBlockState(actorUserId, booking, detail);
+        return withClientBlockState(actorUserId, booking, withGuestClientRating(booking, detail));
+    }
+
+    /**
+     * B546 scope 10 (BOOK-77, BOOK-78, REV-D10, REV-36) — a guest booking's client rating on the detail read: the
+     * phone-keyed computation the provider client card shows, one statement, only for a guest booking that still
+     * carries its phone (no account, phone set, PII not anonymised, GST-51). Every other booking keeps the values
+     * {@link BookingDetailResponse#from} set (registered: users.avg_rating; anonymised / no phone: null) with no
+     * statement. Not gated by the guest-rating write flag: the readout shows whatever visible ratings exist.
+     */
+    private BookingDetailResponse withGuestClientRating(Booking booking, BookingDetailResponse detail) {
+        if (booking.getClient() != null || booking.getGuestPhone() == null
+                || booking.getGuestPiiAnonymisedAt() != null) {
+            return detail;
+        }
+        ClientReviewRepository.GuestRatingProjection rating =
+                clientReviewRepository.guestRatingByPhone(booking.getGuestPhone());
+        int count = rating == null || rating.getReviewCount() == null ? 0 : rating.getReviewCount();
+        return detail.withGuestClientRating(count, rating == null ? null : rating.getAvgRating());
     }
 
     /**
@@ -371,7 +391,7 @@ public class BookingService {
                 && authz.canProviderReviewClient(actorUserId, booking);
         return providerCanReviewClient(
                 hasProviderAuthority, booking.getStatus(),
-                booking.isRateableByProvider(),
+                clientRatingEligibility.isRateable(booking),
                 () -> clientReviewRepository.existsByBookingId(booking.getId()));
     }
 
@@ -1291,7 +1311,7 @@ public class BookingService {
         // have flipped a response field. It can only REMOVE a statement, never add one: an actor
         // with no provider authority over any row of the page now skips the query outright.
         List<UUID> reviewCandidateIds = hydrated.stream()
-                .filter(b -> b.isRateableByProvider() && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
+                .filter(b -> clientRatingEligibility.isRateable(b) && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
                 .map(Booking::getId)
                 .filter(withProviderAuthority::contains)
                 .toList();
@@ -1315,7 +1335,7 @@ public class BookingService {
                     // see resolveSalonPageProviderAuthority for why each conjunct is there.
                     boolean hasProviderAuthority = withProviderAuthority.contains(b.getId());
                     boolean providerCanReviewClient = providerCanReviewClient(
-                            hasProviderAuthority, b.getStatus(), b.isRateableByProvider(),
+                            hasProviderAuthority, b.getStatus(), clientRatingEligibility.isRateable(b),
                             () -> alreadyReviewedByProvider.contains(b.getId()));
                     return BookingDetailResponse.from(
                             b, canReview, providerCanReviewClient,
@@ -1356,7 +1376,7 @@ public class BookingService {
      */
     private Set<UUID> resolveSalonPageProviderAuthority(UUID actorUserId, List<Booking> page) {
         List<Booking> candidates = page.stream()
-                .filter(b -> b.isRateableByProvider()
+                .filter(b -> clientRatingEligibility.isRateable(b)
                         && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
                 .toList();
         if (candidates.isEmpty()) {
@@ -1880,7 +1900,7 @@ public class BookingService {
                     // field, because a client that maps it faithfully can never clear the CTA.
                     boolean providerCanReviewClient = providerCanReviewClient(
                             providerReview.withAuthority().contains(b.getId()),
-                            b.getStatus(), b.isRateableByProvider(),
+                            b.getStatus(), clientRatingEligibility.isRateable(b),
                             () -> providerReview.alreadyReviewed().contains(b.getId()));
                     return BookingDetailResponse.from(
                             b, canReview, providerCanReviewClient,
@@ -1956,7 +1976,7 @@ public class BookingService {
         // pre-filter, so the conjunct is load-bearing there) and for the mutation that proved a
         // listing test can never detect its removal.
         List<Booking> candidates = page.stream()
-                .filter(b -> b.isRateableByProvider()
+                .filter(b -> clientRatingEligibility.isRateable(b)
                         && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
                 .toList();
         if (candidates.isEmpty()) {
@@ -1964,9 +1984,9 @@ public class BookingService {
         }
         // Phase 355 — the page-scoped form of the SAME predicate computeProviderCanReviewClient
         // uses (AuthorizationService#canProviderReviewClient): independent master on their own
-        // booking, or owner of the master's salon. SALON_MASTER yields an empty set with no
-        // statement; the owner pays one findIdsByIdInAndOwnerId for the WHOLE page (flat in page
-        // size). SALON_ADMIN never reaches here (listProviderBookings rejects it earlier).
+        // booking, owner of the master's salon, or (B547) the SALON_MASTER who performed it in a live
+        // salon (no statement; one salon proxy load at most — every row shares the master's salon);
+        // the owner pays one findIdsByIdInAndOwnerId for the WHOLE page (flat in page size). SALON_ADMIN never reaches here (listProviderBookings rejects it earlier).
         Set<UUID> withAuthority = authz.filterBookingIdsWithProviderAuthority(role, actorUserId, candidates);
         if (withAuthority.isEmpty()) {
             return ProviderReviewBatch.EMPTY;

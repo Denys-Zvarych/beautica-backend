@@ -517,12 +517,14 @@ public class Booking extends AuditableEntity {
     }
 
     /**
-     * REV-D04 — a provider may rate only a booking whose client is a registered account AND that was not a STAFF
-     * walk-in: a walk-in is keyed by a phone the staff typed, so rating it (even once attached to the account that owns
-     * that phone) would let a fake walk-in on a victim's number plant a rating. LINK / APP bookings are rateable.
+     * REV-D04 (B546, reverses B527's STAFF exclusion) — a booking has a client identity a provider rating can anchor
+     * to: a registered account, or else the E.164 guest phone (LINK guest or STAFF walk-in alike). A walk-in with no
+     * phone, and an anonymised guest row (GST-51 nulls the phone), have none. The single structural predicate behind
+     * both the {@code POST /client-reviews} write and the {@code providerCanReviewClient} flag, via
+     * {@code ClientRatingEligibility}, which adds the guest feature flag on top.
      */
     public boolean isRateableByProvider() {
-        return client != null && bookingSource != BookingSource.STAFF;
+        return client != null || guestPhone != null;
     }
 
     /** {@code true} when this booking was attached to a client account by phone (even if later detached). */

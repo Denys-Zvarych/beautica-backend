@@ -377,6 +377,38 @@ abstract class AbstractModerationIT extends AbstractIntegrationTest {
         return id;
     }
 
+    /** A fresh E.164 Ukrainian mobile number (V89 format) so guest-phone predicates never match another test's rows. */
+    protected static String uniqueGuestPhone() {
+        return String.format("+38067%07d", Math.floorMod(UUID.randomUUID().getLeastSignificantBits(), 10_000_000L));
+    }
+
+    /** B546 (REV-38) — a phone-keyed provider rating of a guest / walk-in booking (no account subject). */
+    protected UUID insertGuestClientReview(UUID guestBookingId, String phone, SalonFixture salon, int rating) {
+        UUID id = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO client_reviews (id, booking_id, subject_client_id, subject_guest_phone, author_master_id, "
+                        + "salon_id, rating, comment, created_at, updated_at) "
+                        + "VALUES (?, ?, NULL, ?, ?, ?, ?, 'Не прийшла вчасно', NOW(), NOW())",
+                id, guestBookingId, phone, salon.masterId(), salon.salonId(), rating);
+        return id;
+    }
+
+    /** B546 — a COMPLETED guest (LINK) booking of {@code phone} with an independent master (no salon). */
+    protected UUID insertIndependentGuestBooking(UUID masterId, String phone) {
+        UUID seed = insertIndependentBooking(createUser(unique("seed"), "CLIENT", null), masterId);
+        UUID masterServiceId = jdbcTemplate.queryForObject(
+                "SELECT master_service_id FROM bookings WHERE id = ?", UUID.class, seed);
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, guest_name, guest_surname, guest_phone, created_at, updated_at) "
+                        + "VALUES (?, NULL, ?, ?, NULL, 'COMPLETED', NOW() - interval '6 hours', "
+                        + "NOW() - interval '5 hours', 500.00, 60, 0, 'LINK', 'Марія', 'Шевченко', ?, NOW(), NOW())",
+                bookingId, masterId, masterServiceId, phone);
+        return bookingId;
+    }
+
     protected UUID insertMasterPortfolioPhoto(UUID masterId) {
         UUID id = UUID.randomUUID();
         String r2Key = "portfolio/independent/" + masterId + "/" + id + ".jpg";

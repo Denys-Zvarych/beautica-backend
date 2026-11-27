@@ -248,13 +248,13 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Phase 355 — INVERTED back to FALSE (phase 316 had made it true). The invited salon master can
-     * VIEW the booking they performed but is never offered the rate-client CTA.
+     * B547 (REV-11, REV-D06) — INVERTED to TRUE (phase 355 had made it false). The performing salon
+     * master is offered the rate-client CTA on the booking they performed.
      */
     @Test
-    @DisplayName("FALSE — SALON_MASTER viewing the COMPLETED booking they themselves performed "
-            + "(phase 355: the salon master never rates the client)")
-    void should_returnFalse_when_salonMasterViewsOwnPerformedBooking() throws Exception {
+    @DisplayName("TRUE — SALON_MASTER viewing the COMPLETED booking they themselves performed "
+            + "(B547: the performing master may rate the client)")
+    void should_returnTrue_when_salonMasterViewsOwnPerformedBooking() throws Exception {
         Salon salon = createSalon("pcrc-sm-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("pcrc-sm-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
@@ -263,8 +263,8 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
         JsonNode detail = getBookingDetail(bookingId, tokenFor(salon.masterEmail()));
 
         assertThat(detail.path("providerCanReviewClient").asBoolean())
-                .as("the salon master PERFORMED this booking and can view it, yet the CTA is owner/admin-only")
-                .isFalse();
+                .as("B547 — the salon master PERFORMED this booking, so the CTA is offered")
+                .isTrue();
     }
 
     /**
@@ -404,13 +404,13 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Phase 355 — the list twin of {@link #should_returnFalse_when_salonMasterViewsOwnPerformedBooking}:
-     * a salon master's page carries the row but never the CTA, with no authority statement at all.
+     * B547 — the list twin of {@link #should_returnTrue_when_salonMasterViewsOwnPerformedBooking}:
+     * a salon master's page carries the row with the CTA, with no authority statement at all.
      */
     @Test
-    @DisplayName("LIST false — SALON_MASTER listing the COMPLETED booking they themselves performed "
-            + "is NOT offered the client-review CTA, matching the detail path (phase 355)")
-    void should_returnFalseOnListRow_when_salonMasterListsOwnPerformedBooking() throws Exception {
+    @DisplayName("LIST true — SALON_MASTER listing the COMPLETED booking they themselves performed "
+            + "is offered the client-review CTA, matching the detail path (B547)")
+    void should_returnTrueOnListRow_when_salonMasterListsOwnPerformedBooking() throws Exception {
         Salon salon = createSalon("pcrc-list-sm-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("pcrc-list-sm-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
@@ -419,8 +419,8 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
         JsonNode row = listRow(bookingId, tokenFor(salon.masterEmail()));
 
         assertThat(row.path("providerCanReviewClient").asBoolean())
-                .as("the salon master never rates the client — list agrees with detail")
-                .isFalse();
+                .as("B547 — the performing salon master may rate the client — list agrees with detail")
+                .isTrue();
         assertThat(row.path("canReview").asBoolean())
                 .as("canReview is the viewer-agnostic client-side flag and stays true on this row")
                 .isTrue();
@@ -510,8 +510,8 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
      */
     @Test
     @DisplayName("LIST — after the performing master rotates to another owner's salon the NEW owner "
-            + "(owner of the master's LIVE salon) gets the client-review CTA, the salon master does "
-            + "not, and the row leaves the OLD owner's page entirely (phase 355)")
+            + "(owner of the master's LIVE salon) gets the client-review CTA, so does the performing "
+            + "salon master (B547), and the row leaves the OLD owner's page entirely (phase 355)")
     void should_followTheLiveSalon_when_performingMasterRotatesAway() throws Exception {
         Salon salonA = createSalon("pcrc-rot-a-" + System.nanoTime() + "@beautica.test");
         Salon salonB = createSalon("pcrc-rot-b-" + System.nanoTime() + "@beautica.test");
@@ -534,8 +534,8 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
                 .isTrue();
 
         assertThat(listRow(bookingId, tokenFor(salonA.masterEmail())).path("providerCanReviewClient").asBoolean())
-                .as("the performing SALON_MASTER never gets the CTA, rotation or not")
-                .isFalse();
+                .as("B547 — the performing SALON_MASTER keeps the CTA across the rotation (booking.master.user_id, live salon B)")
+                .isTrue();
 
         assertThat(listRowIfPresent(bookingId, tokenFor(salonA.ownerEmail())))
                 .as("the old salon's owner must not see a booking whose master has rotated away — "

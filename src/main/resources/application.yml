@@ -369,6 +369,10 @@ app:
       min-version-code: ${APP_ANDROID_MIN_VERSION_CODE:0}
       latest-version-code: ${APP_ANDROID_LATEST_VERSION_CODE:0}
       store-url: ${APP_ANDROID_STORE_URL:https://play.google.com/store/apps/details?id=com.beautica.app}
+  # B546 (REV-41) — providers rate guest / walk-in clients by phone. Default OFF; staging true; prod true only once the
+  # privacy bump (website W051) is live (SUP-33). Bound by ClientRatingProperties.
+  client-rating:
+    guest-enabled: ${APP_GUEST_CLIENT_RATING_ENABLED:false}
   firebase:
     service-account: ${FIREBASE_SERVICE_ACCOUNT:}
     connect-timeout: 5s

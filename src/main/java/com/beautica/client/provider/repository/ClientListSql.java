@@ -1,5 +1,7 @@
 package com.beautica.client.provider.repository;
 
+import com.beautica.review.repository.GuestRatingSql;
+
 /**
  * B507 — the shared text blocks of the provider client list (D1, CLI-39..41). Three scope variants differ ONLY in
  * {@link #SALON_WHERE} / {@link #SALON_MASTER_WHERE} / {@link #MASTER_WHERE}; there is no nullable-UUID OR bind.
@@ -128,6 +130,13 @@ final class ClientListSql {
                              AND rb.salon_id = :salonId AND rb.created_at > r.removed_at)))
             """;
 
+    // B546 (CLI-47, REV-36) — a guest row's cross-provider rating, the shared GuestRatingSql aggregate keyed on the
+    // row's phone, evaluated only for the LIMITed page rows (never over `filtered`). A registered row (and the
+    // empty-page row, whose p.* is NULL) matches no review and keeps its users.avg_rating / review_count.
+    private static final String GUEST_RATING_JOIN = "  LEFT JOIN LATERAL (" + GuestRatingSql.AGGREGATE + """
+               AND p.client_id IS NULL AND cr.subject_guest_phone = p.guest_phone) gr ON TRUE
+            """;
+
     private static final String FILTERED_TAIL = """
                  AND (CAST(:q AS text) IS NULL
                       OR CASE WHEN g.client_id IS NOT NULL THEN concat_ws(' ', u.first_name, u.last_name)
@@ -144,12 +153,15 @@ final class ClientListSql {
                    p.next_visit_at AS nextVisitAt, p.completed_visits AS completedVisits,
                    p.anchor_booking_id AS anchorBookingId, p.guest_name AS guestName,
                    p.guest_surname AS guestSurname, p.first_name AS firstName, p.last_name AS lastName,
-                   p.avatar_url AS avatarUrl, p.avg_rating AS avgRating, p.review_count AS reviewCount,
+                   p.avatar_url AS avatarUrl,
+                   CASE WHEN p.client_id IS NULL THEN gr.avg_rating ELSE p.avg_rating END AS avgRating,
+                   CASE WHEN p.client_id IS NULL THEN gr.review_count ELSE p.review_count END AS reviewCount,
                    p.verified_phone AS verifiedPhone
               FROM (SELECT 1) one
               LEFT JOIN (SELECT * FROM filtered
                           ORDER BY last_activity_at DESC, anchor_booking_id DESC
                           LIMIT :limit OFFSET :offset) p ON TRUE
+            """ + GUEST_RATING_JOIN + """
              ORDER BY p.last_activity_at DESC, p.anchor_booking_id DESC
             """;
 

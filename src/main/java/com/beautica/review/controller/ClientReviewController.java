@@ -34,15 +34,13 @@ public class ClientReviewController {
      * load — the established double-check pattern for booking provider actions in this codebase
      * (Anti-Bug §D), not an accidental duplication.
      *
-     * <p><b>Phase 355 — only the booking's {@code SALON_OWNER}/{@code SALON_ADMIN} (or the
-     * {@code INDEPENDENT_MASTER} on their own booking) may rate the client.</b> The invited
-     * {@code SALON_MASTER} is out of the role list (reverses phases 316/320) and is also rejected
-     * inside {@code canReviewClient}. {@code @authz.canReviewClient} then checks the actor has
-     * authority over THIS booking ({@code hasProviderAuthorityOverBooking}, the completion
-     * kernel), so an owner/admin of another salon still gets 403. A booking already rated under
-     * phase 320 by its salon master answers 409 to a second rating.
+     * <p><b>B547 (REV-11, REV-D06)</b> — the booking's {@code SALON_OWNER} / {@code SALON_ADMIN}, the
+     * {@code INDEPENDENT_MASTER} on their own booking, or the {@code SALON_MASTER} who performed it may rate the
+     * client (reverses phase 355's master exclusion). {@code @authz.canReviewClient} checks the actor's authority over
+     * THIS booking, so a colleague master or another salon's owner/admin gets 403. One salon-side rating per booking:
+     * the first writer wins, the second gets 409 (REV-42, {@code uq_client_reviews_booking}).
      */
-    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER') "
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER','SALON_MASTER') "
             + "and @authz.canReviewClient(authentication, #request.bookingId)")
     @PostMapping
     public ResponseEntity<ApiResponse<ClientReviewResponse>> create(

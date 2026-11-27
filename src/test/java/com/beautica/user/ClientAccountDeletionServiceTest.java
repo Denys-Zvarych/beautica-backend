@@ -17,6 +17,7 @@ import com.beautica.media.entity.EntityType;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.media.repository.MediaFileKey;
 import com.beautica.review.repository.ClientReviewRepository;
+import com.beautica.review.service.ClientRatingSubjectService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -86,6 +87,9 @@ class ClientAccountDeletionServiceTest {
 
     @Mock
     private MediaRepository mediaRepository;
+
+    @Mock
+    private ClientRatingSubjectService clientRatingSubjectService;
 
     @Mock
     private AccountBlobPurgeRegistrar accountBlobPurgeRegistrar;
@@ -369,6 +373,27 @@ class ClientAccountDeletionServiceTest {
         InOrder order = inOrder(mediaRepository, userRepository);
         order.verify(mediaRepository).deleteAccountMedia(List.of(clientId), List.of());
         order.verify(userRepository).deleteAllByIdInBatch(List.of(clientId));
+    }
+
+    @Test
+    @DisplayName("B546 (CLI-66): stray phone-keyed ratings go through ClientRatingSubjectService, before the "
+            + "bookings detach, never the review repository directly")
+    void should_deleteGuestRatingsThroughSubjectService_before_bookingsDetach() {
+        UUID clientId = UUID.randomUUID();
+        User client = buildClient(clientId);
+        when(userRepository.findByIdForUpdate(clientId)).thenReturn(Optional.of(client));
+        when(mediaRepository.findAccountMediaKeys(List.of(clientId), List.of())).thenReturn(List.of());
+        lenient().when(clock.instant()).thenReturn(Instant.EPOCH);
+        when(bookingService.findFutureConfirmedBookingCandidatesForClient(clientId)).thenReturn(List.of());
+        when(appointmentRepository.findByClientId(clientId)).thenReturn(List.of());
+        when(bookingRepository.findByClientId(clientId)).thenReturn(List.of());
+
+        service.deleteOwnAccount(clientId, null);
+
+        InOrder order = inOrder(clientRatingSubjectService, bookingRepository);
+        order.verify(clientRatingSubjectService).deleteGuestRatingsOfAccountBookings(clientId);
+        order.verify(bookingRepository).findByClientId(clientId);
+        verify(clientReviewRepository, never()).deleteGuestRatingsOfAccountBookings(any());
     }
 
     @Test
