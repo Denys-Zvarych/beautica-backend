@@ -31,6 +31,9 @@ import java.util.UUID;
  *                       booking (the same booking as {@code lastName}); null when blank. Added last: additive only
  * @param lastName       B550 (CLI-79): REGISTERED = the account last name; GUEST = the guest surname of that same
  *                       booking; null when blank
+ * @param nextVisit      B530 (CLI-89): the visit (visit-history row shape) holding the earliest CONFIRMED booking
+ *                       that starts after now in the caller's scope ({@code ?masterId=} honoured); null when none.
+ *                       Added last: additive only
  */
 public record ClientCardResponse(
         ClientKind kind,
@@ -49,7 +52,10 @@ public record ClientCardResponse(
         Stats stats,
         List<ServedMaster> servedByMasters,
         String firstName,
-        String lastName
+        String lastName,
+        @Schema(nullable = true, description = "Visit holding the earliest CONFIRMED booking starting after now in "
+                + "the caller's scope (masterId honoured); null when none")
+        ClientVisitResponse nextVisit
 ) {
 
     public ClientCardResponse {

@@ -20,6 +20,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.test.context.TestPropertySource;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.data.domain.PageRequest;
 import com.beautica.client.provider.dto.ClientCardResponse;
@@ -50,6 +51,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>Seeding and login helpers live in {@link ProviderClientFixtures}.
  */
+// B530 case 8 reads /api-docs: the same @TestPropertySource as the *ApiDocsContractIT classes, so the cached
+// Spring context is shared. Read-only assertion; never used to dump the spec.
+@TestPropertySource(properties = {
+        "springdoc.api-docs.enabled=true",
+        "springdoc.api-docs.path=/api-docs"
+})
 @DisplayName("ProviderClient card + visits — B508")
 class ProviderClientCardIT extends AbstractIntegrationTest {
 
@@ -412,6 +419,62 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
         assertThat(smallPage).as("page + items + salon-access lookup").isLessThanOrEqualTo(3);
         assertThat(largePage).isEqualTo(smallPage);
         assertThat(guestVisits).isLessThanOrEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("13b (B530): card WITH an upcoming CONFIRMED visit -> salon and independent-master cards <= 4 "
+            + "statements (13's budget + 1 items statement), whatever the next visit's item count")
+    void should_stayWithinStatementBudget_when_cardHasUpcomingVisit() throws Exception {
+        // Arrange
+        Salon s = fx.salon();
+        Independent indep = fx.independent();
+        UUID c = fx.client("Бюджет", "Наступна");
+        fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-10));
+        UUID visit = fx.appointment(c, s.salonId());
+        for (int i = 0; i < 3; i++) {
+            fx.bookingInVisit(s.masterId(), s.salonId(), c, "CONFIRMED", fx.at(2).plus(i, ChronoUnit.HOURS), visit);
+        }
+        UUID anchor = fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Гість", "Бюджет", "CONFIRMED", fx.at(3));
+        fx.booking(indep.masterId(), null, c, "COMPLETED", fx.at(-6));
+        fx.booking(indep.masterId(), null, c, "CONFIRMED", fx.at(4));
+        UUID indepGuest = fx.guestBooking(indep.masterId(), null, GUEST_PHONE, "Гість", "Соло", "CONFIRMED", fx.at(5));
+        String owner = fx.token(s.ownerEmail());
+        String im = fx.token(indep.email());
+        String userCard = userCard(s.salonId(), c);
+        String guestCard = guestCard(s.salonId(), anchor);
+        String imUserCard = ME_URL + "/users/" + c;
+        String imGuestCard = ME_URL + "/guests/" + indepGuest;
+        for (String url : List.of(userCard, guestCard)) {
+            fx.get(owner, url); // warm one-off lookups (authz memo, query plans)
+        }
+        fx.get(im, imUserCard);
+        fx.get(im, imGuestCard);
+
+        // Act
+        JsonNode userCardBody = ok(fx.get(owner, userCard));
+        JsonNode guestCardBody = ok(fx.get(owner, guestCard));
+        JsonNode imUserCardBody = ok(fx.get(im, imUserCard));
+        JsonNode imGuestCardBody = ok(fx.get(im, imGuestCard));
+        long userCardStatements = statementsFor(owner, userCard);
+        long guestCardStatements = statementsFor(owner, guestCard);
+        long imUserCardStatements = statementsFor(im, imUserCard);
+        long imGuestCardStatements = statementsFor(im, imGuestCard);
+
+        // Assert
+        assertThat(userCardBody.path("nextVisit").path("items").size())
+                .as("precondition: the next-visit path ran with a multi-item visit").isEqualTo(3);
+        assertThat(guestCardBody.path("nextVisit").isObject())
+                .as("precondition: salon guest card ran the next-visit path").isTrue();
+        assertThat(imUserCardBody.path("nextVisit").isObject())
+                .as("precondition: IM user card ran the next-visit path").isTrue();
+        assertThat(imGuestCardBody.path("nextVisit").isObject())
+                .as("precondition: IM guest card ran the next-visit path").isTrue();
+        assertThat(userCardStatements).as("salon user card: 13's budget + 1 next-visit items statement")
+                .isLessThanOrEqualTo(4);
+        assertThat(guestCardStatements).as("salon guest card with next visit").isLessThanOrEqualTo(4);
+        assertThat(imUserCardStatements).as("IM user card: master lookup + aggregate + blocks + next-visit items")
+                .isLessThanOrEqualTo(4);
+        assertThat(imGuestCardStatements).as("IM guest card with next visit").isLessThanOrEqualTo(4);
     }
 
     @Test
@@ -1203,5 +1266,248 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
 
         assertNotFound(resp);
         assertThat(resp.getBody()).doesNotContain("Чужа");
+    }
+
+    // ── B530: next visit on the card (CLI-89) ────────────────────────────────
+
+    /** The card's {@code nextVisit} item booking ids, in response order. */
+    private static List<String> nextItemIds(JsonNode card) {
+        return card.path("nextVisit").path("items").findValuesAsText("bookingId");
+    }
+
+    @Test
+    @DisplayName("B530 case 1: 30 future + 10 past visits -> nextVisit = the earliest future visit, all its rows, "
+            + "in the visits-page row shape; nextVisitAt = its earliest item start")
+    void should_returnEarliestFutureVisit_when_manyFutureAndPastVisits() throws Exception {
+        // Arrange
+        Salon s = fx.salon();
+        UUID c = fx.client("Наступна", "Клієнтка");
+        for (int i = 0; i < 10; i++) {
+            fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-30 + i));
+        }
+        for (int i = 0; i < 29; i++) {
+            fx.booking(s.masterId(), s.salonId(), c, "CONFIRMED", fx.at(3 + i));
+        }
+        UUID visit = fx.appointment(c, s.salonId());
+        Instant firstStart = fx.at(1);
+        UUID row1 = fx.bookingInVisit(s.masterId(), s.salonId(), c, "CONFIRMED", firstStart, visit);
+        UUID row2 = fx.bookingInVisit(s.masterId(), s.salonId(), c, "CONFIRMED",
+                firstStart.plus(1, ChronoUnit.HOURS), visit);
+        String token = fx.token(s.ownerEmail());
+
+        // Act
+        JsonNode card = ok(fx.get(token, userCard(s.salonId(), c)));
+        List<JsonNode> history = visitRows(fx.get(token, userCard(s.salonId(), c) + "/visits?size=50"));
+
+        // Assert
+        JsonNode next = card.path("nextVisit");
+        assertThat(next.path("visitKey").asText()).isEqualTo(visit.toString());
+        assertThat(nextItemIds(card)).containsExactly(row1.toString(), row2.toString());
+        assertThat(next.path("salonId").asText()).isEqualTo(s.salonId().toString());
+        assertThat(OffsetDateTime.parse(card.path("nextVisitAt").asText()).toInstant()).isEqualTo(firstStart);
+        assertThat(OffsetDateTime.parse(next.path("startsAt").asText()).toInstant()).isEqualTo(firstStart);
+        JsonNode pageRow = history.stream().filter(v -> visit.toString().equals(v.path("visitKey").asText()))
+                .findFirst().orElseThrow();
+        assertThat(next).as("D1: identical to the visits-page row").isEqualTo(pageRow);
+        assertThat(card.path("stats").path("upcomingVisits").asInt()).isEqualTo(30);
+    }
+
+    @Test
+    @DisplayName("B530 case 2 (E3): ?masterId=A -> next visit with A only, A's rows only; no chip -> salon-wide next")
+    void should_narrowNextVisitToMaster_when_masterIdGiven() throws Exception {
+        // Arrange
+        Salon s = fx.salon();
+        UUID masterB = (UUID) fx.secondMaster(s.salonId(), "Другий")[0];
+        UUID c = fx.client("Чіпова", "Клієнтка");
+        UUID withB = fx.booking(masterB, s.salonId(), c, "CONFIRMED", fx.at(1));
+        UUID withA = fx.booking(s.masterId(), s.salonId(), c, "CONFIRMED", fx.at(2));
+        UUID guestB = fx.guestBooking(masterB, s.salonId(), GUEST_PHONE, "Гість", "Чіп", "CONFIRMED", fx.at(3));
+        UUID guestA = fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Гість", "Чіп", "CONFIRMED", fx.at(4));
+        String token = fx.token(s.ownerEmail());
+
+        // Act
+        JsonNode salonWide = ok(fx.get(token, userCard(s.salonId(), c)));
+        JsonNode onlyA = ok(fx.get(token, userCard(s.salonId(), c) + "?masterId=" + s.masterId()));
+        JsonNode guestOnlyA = ok(fx.get(token, guestCard(s.salonId(), guestB) + "?masterId=" + s.masterId()));
+
+        // Assert
+        assertThat(salonWide.path("nextVisit").path("visitKey").asText()).isEqualTo(withB.toString());
+        assertThat(onlyA.path("nextVisit").path("visitKey").asText()).isEqualTo(withA.toString());
+        assertThat(onlyA.path("nextVisit").path("items").findValuesAsText("masterId"))
+                .containsOnly(s.masterId().toString());
+        assertThat(guestOnlyA.path("nextVisit").path("visitKey").asText()).isEqualTo(guestA.toString());
+        assertThat(nextItemIds(guestOnlyA)).containsExactly(guestA.toString());
+    }
+
+    @Test
+    @DisplayName("B530 case 3 (E4): guest card, salon and masters/me -> next among that phone's rows in scope only")
+    void should_returnGuestsNextVisit_when_guestCardRead() throws Exception {
+        // Arrange
+        Salon s = fx.salon();
+        Independent indep = fx.independent();
+        UUID anchor = fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Гість", "Наступ", "COMPLETED", fx.at(-5));
+        fx.guestBooking(s.masterId(), s.salonId(), "+380509998877", "Інший", "Гість", "CONFIRMED", fx.at(1));
+        UUID salonNext = fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Гість", "Наступ", "CONFIRMED", fx.at(2));
+        fx.guestBooking(s.masterId(), s.salonId(), GUEST_PHONE, "Гість", "Наступ", "CONFIRMED", fx.at(5));
+        UUID indepAnchor = fx.guestBooking(indep.masterId(), null, GUEST_PHONE, "Гість", "Соло", "CONFIRMED", fx.at(3));
+
+        // Act
+        JsonNode salonCard = ok(fx.get(fx.token(s.ownerEmail()), guestCard(s.salonId(), anchor)));
+        JsonNode soloCard = ok(fx.get(fx.token(indep.email()), ME_URL + "/guests/" + indepAnchor));
+
+        // Assert
+        assertThat(salonCard.path("nextVisit").path("visitKey").asText()).isEqualTo(salonNext.toString());
+        assertThat(nextItemIds(salonCard)).containsExactly(salonNext.toString());
+        assertThat(soloCard.path("nextVisit").path("visitKey").asText()).isEqualTo(indepAnchor.toString());
+        assertThat(soloCard.path("nextVisit").path("salonId").isNull()).as("independent visit").isTrue();
+    }
+
+    @Test
+    @DisplayName("B530 case 4a (E1): no future CONFIRMED booking -> nextVisit and nextVisitAt both null")
+    void should_returnNullNextVisit_when_noFutureConfirmedBooking() throws Exception {
+        // Arrange
+        Salon s = fx.salon();
+        UUID c = fx.client("Без", "Майбутнього");
+        fx.booking(s.masterId(), s.salonId(), c, "COMPLETED", fx.at(-3));
+        fx.booking(s.masterId(), s.salonId(), c, "CONFIRMED", fx.at(-1));
+        fx.booking(s.masterId(), s.salonId(), c, "CANCELLED", fx.at(2));
+        String token = fx.token(s.ownerEmail());
+
+        // Act
+        JsonNode card = ok(fx.get(token, userCard(s.salonId(), c)));
+
+        // Assert
+        assertThat(card.path("nextVisit").isNull()).as("nextVisit").isTrue();
+        assertThat(card.path("nextVisitAt").isNull()).as("nextVisitAt").isTrue();
+    }
+
+    @Test
+    @DisplayName("B530 case 4b (E5): earlier DECLINED/CANCELLED future bookings skipped -> next CONFIRMED one")
+    void should_skipDeclinedAndCancelled_when_pickingNextVisit() throws Exception {
+        // Arrange
+        Salon s = fx.salon();
+        UUID c = fx.client("Пропущена", "Клієнтка");
+        fx.booking(s.masterId(), s.salonId(), c, "CANCELLED", fx.at(1));
+        fx.booking(s.masterId(), s.salonId(), c, "DECLINED", fx.at(2));
+        UUID confirmed = fx.booking(s.masterId(), s.salonId(), c, "CONFIRMED", fx.at(3));
+        String token = fx.token(s.ownerEmail());
+
+        // Act
+        JsonNode card = ok(fx.get(token, userCard(s.salonId(), c)));
+
+        // Assert
+        assertThat(card.path("nextVisit").path("visitKey").asText()).isEqualTo(confirmed.toString());
+        assertThat(nextItemIds(card)).containsExactly(confirmed.toString());
+    }
+
+    @Test
+    @DisplayName("B530 case 4c (E6): two CONFIRMED bookings at the same start -> the lowest booking id wins")
+    void should_pickLowestId_when_nextVisitStartTimesTie() throws Exception {
+        // Arrange
+        Salon s = fx.salon();
+        UUID masterB = (UUID) fx.secondMaster(s.salonId(), "Другий")[0];
+        UUID c = fx.client("Однакові", "Години");
+        Instant same = fx.at(4);
+        UUID tieA = fx.booking(s.masterId(), s.salonId(), c, "CONFIRMED", same);
+        UUID tieB = fx.booking(masterB, s.salonId(), c, "CONFIRMED", same);
+        String lowest = tieA.toString().compareTo(tieB.toString()) < 0 ? tieA.toString() : tieB.toString();
+        String token = fx.token(s.ownerEmail());
+
+        // Act
+        JsonNode card = ok(fx.get(token, userCard(s.salonId(), c)));
+
+        // Assert
+        assertThat(card.path("nextVisit").path("visitKey").asText()).isEqualTo(lowest);
+    }
+
+    @Test
+    @DisplayName("B530 case 4d (E2): visit whose first item already started, second upcoming -> nextVisit = that "
+            + "visit, both items; startsAt = the started item (MIN), nextVisitAt = the upcoming item")
+    void should_returnWholeVisit_when_firstItemStartedAndLaterItemUpcoming() throws Exception {
+        // Arrange
+        Salon s = fx.salon();
+        UUID c = fx.client("Розпочата", "Клієнтка");
+        UUID visit = fx.appointment(c, s.salonId());
+        Instant started = Instant.now().truncatedTo(ChronoUnit.MICROS).minus(30, ChronoUnit.MINUTES);
+        Instant upcoming = started.plus(2, ChronoUnit.HOURS);
+        UUID first = fx.bookingInVisit(s.masterId(), s.salonId(), c, "CONFIRMED", started, visit);
+        UUID second = fx.bookingInVisit(s.masterId(), s.salonId(), c, "CONFIRMED", upcoming, visit);
+        String token = fx.token(s.ownerEmail());
+
+        // Act
+        JsonNode card = ok(fx.get(token, userCard(s.salonId(), c)));
+
+        // Assert
+        JsonNode next = card.path("nextVisit");
+        assertThat(next.path("visitKey").asText()).isEqualTo(visit.toString());
+        assertThat(nextItemIds(card)).containsExactly(first.toString(), second.toString());
+        assertThat(OffsetDateTime.parse(next.path("startsAt").asText()).toInstant()).isEqualTo(started);
+        assertThat(OffsetDateTime.parse(card.path("nextVisitAt").asText()).toInstant()).isEqualTo(upcoming);
+    }
+
+    @Test
+    @DisplayName("B530 case 5: SALON_MASTER masters/me card -> next visit among own rows only")
+    void should_returnOwnNextVisit_when_salonMasterViews() throws Exception {
+        // Arrange
+        Salon s = fx.salon();
+        UUID masterB = (UUID) fx.secondMaster(s.salonId(), "Колега")[0];
+        UUID c = fx.client("Спільна", "Наступна");
+        UUID colleague = fx.booking(masterB, s.salonId(), c, "CONFIRMED", fx.at(1));
+        UUID own = fx.booking(s.masterId(), s.salonId(), c, "CONFIRMED", fx.at(2));
+
+        // Act
+        ResponseEntity<String> resp = fx.get(fx.token(s.masterEmail()), ME_URL + "/users/" + c);
+
+        // Assert
+        JsonNode card = ok(resp);
+        assertThat(card.path("nextVisit").path("visitKey").asText()).isEqualTo(own.toString());
+        assertThat(nextItemIds(card)).containsExactly(own.toString());
+        assertThat(resp.getBody()).doesNotContain(colleague.toString());
+    }
+
+    @Test
+    @DisplayName("B530 case 7: a card with a next visit costs exactly one statement more than one without")
+    void should_addOneStatement_when_cardHasNextVisit() throws Exception {
+        // Arrange
+        Salon s = fx.salon();
+        UUID past = fx.client("Минула", "Клієнтка");
+        fx.booking(s.masterId(), s.salonId(), past, "COMPLETED", fx.at(-4));
+        UUID future = fx.client("Майбутня", "Клієнтка");
+        fx.booking(s.masterId(), s.salonId(), future, "COMPLETED", fx.at(-4));
+        UUID visit = fx.appointment(future, s.salonId());
+        Instant start = fx.at(2);
+        for (int i = 0; i < 3; i++) {
+            fx.bookingInVisit(s.masterId(), s.salonId(), future, "CONFIRMED", start.plus(i, ChronoUnit.HOURS), visit);
+        }
+        String owner = fx.token(s.ownerEmail());
+        fx.get(owner, userCard(s.salonId(), past)); // warm one-off lookups (authz memo, query plans)
+        fx.get(owner, userCard(s.salonId(), future));
+
+        // Act
+        long withoutNext = statementsFor(owner, userCard(s.salonId(), past));
+        long withNext = statementsFor(owner, userCard(s.salonId(), future));
+
+        // Assert
+        assertThat(withNext).as("+1 = the next visit's items statement, whatever its row count")
+                .isEqualTo(withoutNext + 1);
+    }
+
+    @Test
+    @DisplayName("B530 case 8: /api-docs publishes ClientCardResponse.nextVisit as a nullable ClientVisitResponse")
+    void should_publishNullableNextVisitRef_when_specIsGenerated() throws Exception {
+        // Arrange
+        ResponseEntity<String> resp = restTemplate.getForEntity("/api-docs", String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode schema = objectMapper.readTree(resp.getBody()).path("components").path("schemas")
+                .path("ClientCardResponse");
+
+        // Act
+        JsonNode nextVisit = schema.path("properties").path("nextVisit");
+
+        // Assert
+        assertThat(nextVisit.isMissingNode()).as("nextVisit must be published").isFalse();
+        assertThat(nextVisit.toString()).as("nullable ref: %s", nextVisit)
+                .contains("#/components/schemas/ClientVisitResponse").contains("null");
+        assertThat(schema.path("required")).extracting(JsonNode::asText).doesNotContain("nextVisit");
     }
 }

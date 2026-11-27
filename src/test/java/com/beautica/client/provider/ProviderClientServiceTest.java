@@ -392,6 +392,103 @@ class ProviderClientServiceTest {
         assertThat(guest.getMessage()).isEqualTo(user.getMessage());
     }
 
+    // ── B530: next visit on the card (CLI-89) ────────────────────────────────
+
+    @Test
+    @DisplayName("B530 case 6: a next-visit key loads that visit's items once, in the card's scope, as a visit row")
+    void should_loadNextVisitItemsOnce_when_nextVisitKeyPresent() {
+        // Arrange
+        UUID visitKey = UUID.randomUUID();
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        when(repository.cardUserBySalon(salonId, userId, utc(NOW))).thenAnswer(i -> {
+            ClientCardRowProjection row = registeredRow(0, null);
+            lenient().when(row.getNextVisitKey()).thenReturn(visitKey);
+            return row;
+        });
+        when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+        when(repository.visitItemsBySalon(salonId, List.of(visitKey))).thenAnswer(i -> List.of(
+                item(visitKey, first, "COMPLETED", salonId), item(visitKey, second, "CONFIRMED", salonId)));
+
+        // Act
+        ClientCardResponse card = service.getCard(new SalonScope(salonId, null), new ClientRef.Registered(userId));
+
+        // Assert
+        verify(repository).visitItemsBySalon(salonId, List.of(visitKey));
+        verify(repository, never()).visitItemsBySalonAndMaster(any(), any(), anyCollection());
+        verify(repository, never()).visitItemsByMaster(any(), anyCollection());
+        ClientVisitResponse next = card.nextVisit();
+        assertThat(next.visitKey()).isEqualTo(visitKey);
+        assertThat(next.startsAt()).as("earliest item start").isEqualTo(utc(NOW));
+        assertThat(next.salonId()).isEqualTo(salonId);
+        assertThat(next.items()).extracting(ClientVisitResponse.Item::bookingId).containsExactly(first, second);
+        assertThat(next.items()).extracting(ClientVisitResponse.Item::status)
+                .containsExactly(BookingStatus.COMPLETED, BookingStatus.CONFIRMED);
+    }
+
+    @Test
+    @DisplayName("B530 case 6: no next-visit key -> no items statement and a null nextVisit")
+    void should_notLoadItems_when_noNextVisitKey() {
+        // Arrange
+        when(repository.cardGuestByMaster(masterId, bookingId, utc(NOW))).thenAnswer(i -> guestRow());
+
+        // Act
+        ClientCardResponse card = service.getCard(new MasterScope(masterId, salonId), new ClientRef.GuestAnchor(bookingId));
+
+        // Assert
+        assertThat(card.nextVisit()).isNull();
+        verify(repository, never()).visitItemsBySalon(any(), anyCollection());
+        verify(repository, never()).visitItemsBySalonAndMaster(any(), any(), anyCollection());
+        verify(repository, never()).visitItemsByMaster(any(), anyCollection());
+    }
+
+    @Test
+    @DisplayName("B530: the next visit's items follow the ?masterId= scope (salon narrowed to the master)")
+    void should_loadNarrowedItems_when_cardFilteredByMaster() {
+        // Arrange
+        UUID visitKey = UUID.randomUUID();
+        when(repository.cardGuestBySalonAndMaster(salonId, masterId, bookingId, utc(NOW))).thenAnswer(i -> {
+            ClientCardRowProjection row = guestRow();
+            lenient().when(row.getNextVisitKey()).thenReturn(visitKey);
+            return row;
+        });
+        when(repository.visitItemsBySalonAndMaster(salonId, masterId, List.of(visitKey)))
+                .thenAnswer(i -> List.of(item(visitKey, UUID.randomUUID(), "CONFIRMED", salonId)));
+
+        // Act
+        ClientCardResponse card = service.getCard(new SalonScope(salonId, masterId),
+                new ClientRef.GuestAnchor(bookingId));
+
+        // Assert
+        verify(repository).visitItemsBySalonAndMaster(salonId, masterId, List.of(visitKey));
+        verify(repository, never()).visitItemsBySalon(any(), anyCollection());
+        assertThat(card.nextVisit().visitKey()).isEqualTo(visitKey);
+        assertThat(card.nextVisit().items()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("B530: a next-visit key whose rows are gone from scope yields a null nextVisit, never an empty row")
+    void should_returnNullNextVisit_when_itemsEmpty() {
+        // Arrange
+        UUID visitKey = UUID.randomUUID();
+        when(repository.cardUserByMaster(masterId, userId, utc(NOW))).thenAnswer(i -> {
+            ClientCardRowProjection row = registeredRow(0, null);
+            lenient().when(row.getNextVisitKey()).thenReturn(visitKey);
+            return row;
+        });
+        when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+        when(repository.visitItemsByMaster(masterId, List.of(visitKey))).thenReturn(List.of());
+
+        // Act
+        ClientCardResponse card = service.getCard(new MasterScope(masterId, null), new ClientRef.Registered(userId));
+
+        // Assert
+        assertThat(card.nextVisit()).isNull();
+        verify(repository).visitItemsByMaster(masterId, List.of(visitKey));
+    }
+
     // ── visits ───────────────────────────────────────────────────────────────
 
     @Test
