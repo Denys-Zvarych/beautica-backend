@@ -8,6 +8,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ConflictException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
+import com.beautica.moderation.service.ModerationService;
 import com.beautica.review.config.ClientRatingProperties;
 import com.beautica.review.dto.CreateClientReviewRequest;
 import com.beautica.review.entity.ClientReview;
@@ -52,10 +53,12 @@ class ClientReviewServiceTest {
     @Mock private BookingRepository bookingRepository;
     @Mock private AuthorizationService authz;
     @Mock private ApplicationEventPublisher eventPublisher;
+    @Mock private ModerationService moderationService;
 
     private ClientReviewService service(boolean guestRatingEnabled) {
         return new ClientReviewService(clientReviewRepository, bookingRepository, authz, eventPublisher,
-                new ClientRatingEligibility(new ClientRatingProperties(guestRatingEnabled)));
+                new ClientRatingEligibility(new ClientRatingProperties(guestRatingEnabled)),
+                new ClientReviewOwnership(authz), moderationService);
     }
 
     private static Booking booking(BookingSource source, User client, String guestPhone) {

@@ -1626,11 +1626,30 @@ public class AuthorizationService {
             return false;
         }
         if (actorRole == Role.SALON_MASTER) {
-            return !independentMaster && liveSalonId != null && masterActive
-                    && actorId.equals(masterUserId) && salonActive.getAsBoolean();
+            return isLivePerformingSalonMaster(actorId, independentMaster, masterUserId, masterActive, liveSalonId,
+                    salonActive);
         }
         return (!independentMaster || masterActive)
                 && hasProviderAuthorityOverRow(independentMaster, masterUserId, liveSalonId, actorId, managementAccess);
+    }
+
+    /**
+     * The {@code SALON_MASTER} arm of {@link #canRateClient}: the actor is the master's own account, the master row is
+     * live, not independent-typed, and its salon is live. B570 also gates a salon master's client-rating delete on it
+     * ({@code ClientReviewOwnership}), so rate and delete can never drift. Static and statement-free.
+     */
+    public static boolean isLivePerformingSalonMaster(UUID actorId, Master master) {
+        Salon salon = master.getSalon();
+        return isLivePerformingSalonMaster(actorId, master.getMasterType() == MasterType.INDEPENDENT_MASTER,
+                masterUserId(master), master.isActive(), salon == null ? null : salon.getId(),
+                () -> salon != null && salon.isActive());
+    }
+
+    private static boolean isLivePerformingSalonMaster(
+            UUID actorId, boolean independentMaster, @Nullable UUID masterUserId, boolean masterActive,
+            @Nullable UUID liveSalonId, BooleanSupplier salonActive) {
+        return !independentMaster && liveSalonId != null && masterActive
+                && actorId.equals(masterUserId) && salonActive.getAsBoolean();
     }
 
     /**

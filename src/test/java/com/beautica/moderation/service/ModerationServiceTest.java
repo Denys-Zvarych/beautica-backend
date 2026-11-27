@@ -88,6 +88,34 @@ class ModerationServiceTest {
     }
 
     @Test
+    @DisplayName("B570 — a deleted target with no OPEN report returns 0 and still stamps target_gone_at")
+    void should_returnZero_when_deletedTargetHasNoOpenReport() {
+        int closed = service.closeReportsOnDeletedTarget(ReportTargetType.CLIENT_REVIEW, TARGET_ID);
+
+        assertThat(closed).isZero();
+        verify(repository).markTargetGone(ReportTargetType.CLIENT_REVIEW, TARGET_ID, NOW);
+    }
+
+    @Test
+    @DisplayName("B570 — a deleted target closes its OPEN reports as TARGET_GONE, stamps target_gone_at and revokes "
+            + "its links, in that order, with no note and no outcome notification")
+    void should_closeReportsAsTargetGone_when_targetDeletedByAuthor() {
+        InOrder order = inOrder(repository, actionTokenRepository);
+        when(repository.resolveOpenOnTarget(
+                ReportTargetType.CLIENT_REVIEW, TARGET_ID, ReportResolution.TARGET_GONE, null, NOW)).thenReturn(2);
+
+        int closed = service.closeReportsOnDeletedTarget(ReportTargetType.CLIENT_REVIEW, TARGET_ID);
+
+        assertThat(closed).as("OPEN reports closed").isEqualTo(2);
+
+        order.verify(repository).resolveOpenOnTarget(
+                ReportTargetType.CLIENT_REVIEW, TARGET_ID, ReportResolution.TARGET_GONE, null, NOW);
+        order.verify(repository).markTargetGone(ReportTargetType.CLIENT_REVIEW, TARGET_ID, NOW);
+        order.verify(actionTokenRepository).revokeAllForTarget(ReportTargetType.CLIENT_REVIEW, TARGET_ID, NOW);
+        verifyNoInteractions(inAppNotificationService, reviewModerationService, mediaService);
+    }
+
+    @Test
     @DisplayName("REVIEW REMOVE → review REMOVED, OPEN reports REMOVED with the note, every report stamped target-gone")
     void should_removeReview_and_stampGone_when_removeOnReview() {
         stubReport(ReportTargetType.REVIEW, ReportStatus.OPEN);

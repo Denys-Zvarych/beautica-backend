@@ -10,10 +10,14 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.util.UUID;
 
 /**
  * Provider-authored review of the CLIENT after a completed booking (Phase 27.5 — REVERSES the
@@ -48,5 +52,17 @@ public class ClientReviewController {
             Authentication auth) {
         ClientReviewResponse response = clientReviewService.create(AuthenticationUtils.userId(auth), request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
+    }
+
+    /**
+     * B570 (REV-45, REV-D12) — the provider deletes their own client rating, stars and comment. Role-only gate here;
+     * the {@code own} check runs in the service after its single locked load (Anti-Bug §D), and anything not own —
+     * unknown, another provider's, hidden or already deleted — is the same 404.
+     */
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER','SALON_MASTER')")
+    @DeleteMapping("/{reviewId}")
+    public ResponseEntity<Void> deleteOwn(@PathVariable UUID reviewId, Authentication auth) {
+        clientReviewService.deleteOwn(reviewId, AuthenticationUtils.userId(auth), AuthenticationUtils.role(auth));
+        return ResponseEntity.noContent().build();
     }
 }

@@ -3,6 +3,7 @@ package com.beautica.review.controller;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.review.dto.ClientReviewResponse;
@@ -10,6 +11,8 @@ import com.beautica.review.service.ClientReviewService;
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -36,12 +39,15 @@ import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
@@ -126,5 +132,53 @@ class ClientReviewControllerTest {
                 .andExpect(status().isForbidden());
 
         verifyNoInteractions(authorizationService, clientReviewService);
+    }
+
+    // ── B570: DELETE /client-reviews/{reviewId} (REV-45) ──
+
+    @ParameterizedTest
+    @EnumSource(value = Role.class, names = {"SALON_OWNER", "SALON_ADMIN", "INDEPENDENT_MASTER", "SALON_MASTER"})
+    @DisplayName("B570 — 204 for every provider role; the service gets the caller id and role, no SpEL authz lookup")
+    void should_return204_when_providerDeletesOwnRating(Role role) throws Exception {
+        UUID userId = UUID.randomUUID();
+        UUID reviewId = UUID.randomUUID();
+
+        mockMvc.perform(delete(URL + "/" + reviewId).with(as(userId, role)))
+                .andExpect(status().isNoContent());
+
+        verify(clientReviewService).deleteOwn(reviewId, userId, role);
+        verifyNoInteractions(authorizationService);
+    }
+
+    @Test
+    @DisplayName("B570 — 403 for a CLIENT by role alone; the service is never reached")
+    void should_return403_when_clientDeletesRating() throws Exception {
+        mockMvc.perform(delete(URL + "/" + UUID.randomUUID()).with(as(UUID.randomUUID(), Role.CLIENT)))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(clientReviewService);
+    }
+
+    @Test
+    @DisplayName("B570 — the service's not-own / gone 404 reaches the wire as the one generic 404 body (no echo)")
+    void should_return404_when_serviceReportsNotFound() throws Exception {
+        UUID userId = UUID.randomUUID();
+        UUID reviewId = UUID.randomUUID();
+        doThrow(new NotFoundException("Client review not found"))
+                .when(clientReviewService).deleteOwn(reviewId, userId, Role.SALON_OWNER);
+
+        mockMvc.perform(delete(URL + "/" + reviewId).with(as(userId, Role.SALON_OWNER)))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("Resource not found"));
+    }
+
+    @Test
+    @DisplayName("B570 — 400 for a malformed review id; the service is never reached")
+    void should_return400_when_reviewIdMalformed() throws Exception {
+        mockMvc.perform(delete(URL + "/not-a-uuid").with(as(UUID.randomUUID(), Role.SALON_OWNER)))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(clientReviewService);
     }
 }
