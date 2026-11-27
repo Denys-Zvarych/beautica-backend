@@ -381,7 +381,8 @@ class ProviderClientRatingIT extends AbstractIntegrationTest {
         assertThat(small).as("ratings: salon-access check + exists + page + count").isEqualTo(4);
         assertThat(large).as("page size does not change the count").isEqualTo(small);
         assertThat(masterList).as("master ratings: master lookup + exists + page + count").isEqualTo(4);
-        assertThat(guest).as("guest ratings: salon-access check + exists, no page/count").isEqualTo(2);
+        assertThat(guest).as("guest ratings: salon-access check + anchor phone + page + count").isEqualTo(4);
+        assertThat(guest).isLessThanOrEqualTo(small);
     }
 
     @Test

@@ -305,8 +305,8 @@ public class ProviderClientService {
      * B526 (CLI-59) — the viewer's own visible ratings of a client, newest visit first. The gate is the identical 404
      * for unknown / out-of-scope / anonymised (D6, same scope + anchor rules as the card). Registered: EXISTS, page,
      * count. B546 (REV-38) guest: the anchor's phone read under the card's own anchor guard (gate + identity in one
-     * statement, empty = 404), page, count — the ratings keyed to that phone in the viewer's scope. Three bounded
-     * statements either way, whatever the page size.
+     * statement, empty = 404), page, count — the ratings keyed to that phone in the viewer's scope. Four bounded
+     * statements (salon-access check + anchor/exists + page + count) either way, whatever the page size.
      */
     @Transactional(readOnly = true)
     public Page<ClientOwnRatingResponse> getOwnRatings(ClientScope scope, ClientRef ref, Pageable pageable) {
@@ -331,7 +331,6 @@ public class ProviderClientService {
     }
 
     private record OwnRatingRows(List<ClientOwnRatingProjection> rows, long total) {
-        static final OwnRatingRows EMPTY = new OwnRatingRows(List.of(), 0);
     }
 
     private OwnRatingRows registeredOwnRatings(ClientScope scope, UUID userId, int limit, long offset) {
