@@ -1,10 +1,12 @@
 package com.beautica.auth.phoneotp;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.support.SpringDocWarmup;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springdoc.webmvc.api.OpenApiWebMvcResource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpStatus;
@@ -36,7 +38,11 @@ class PhoneOtpSendApiDocsContractIT extends AbstractIntegrationTest {
     @Autowired
     private ObjectMapper objectMapper;
 
+    @Autowired
+    private OpenApiWebMvcResource openApiResource;
+
     private JsonNode schema() throws Exception {
+        SpringDocWarmup.warm(openApiResource);
         ResponseEntity<String> response = restTemplate.getForEntity("/api-docs", String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode node = objectMapper.readTree(response.getBody()).path("components").path("schemas").path(SCHEMA);

@@ -1,12 +1,14 @@
 package com.beautica.service;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.support.SpringDocWarmup;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.springdoc.webmvc.api.OpenApiWebMvcResource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpStatus;
@@ -54,6 +56,9 @@ class ServiceWriteApiDocsContractIT extends AbstractIntegrationTest {
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @Autowired
+    private OpenApiWebMvcResource openApiResource;
 
     /**
      * Every write path whose handler returns a <b>typed</b> body and that also declares at least
@@ -339,6 +344,7 @@ class ServiceWriteApiDocsContractIT extends AbstractIntegrationTest {
     }
 
     private JsonNode fetchApiDocs() throws Exception {
+        SpringDocWarmup.warm(openApiResource);
         ResponseEntity<String> resp = restTemplate.getForEntity("/api-docs", String.class);
         assertThat(resp.getStatusCode())
                 .as("/api-docs must be reachable (springdoc enabled), body=%s", resp.getBody())

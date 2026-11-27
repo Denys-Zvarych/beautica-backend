@@ -1,12 +1,14 @@
 package com.beautica.service.contract;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.support.SpringDocWarmup;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
+import org.springdoc.webmvc.api.OpenApiWebMvcResource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpStatus;
@@ -63,10 +65,14 @@ class ServiceTypeOpenApiContractTest extends AbstractIntegrationTest {
     @Autowired
     private TestRestTemplate restTemplate;
 
+    @Autowired
+    private OpenApiWebMvcResource openApiResource;
+
     private JsonNode spec;
 
     @BeforeAll
     void fetchSpec() throws Exception {
+        SpringDocWarmup.warm(openApiResource);
         ResponseEntity<String> response = restTemplate.getForEntity(API_DOCS_PATH, String.class);
 
         assertThat(response.getStatusCode())

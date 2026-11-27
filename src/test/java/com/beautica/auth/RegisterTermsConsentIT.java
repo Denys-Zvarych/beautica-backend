@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.support.SpringDocWarmup;
 import com.beautica.support.StaffInviteFixtures;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -15,6 +16,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
+import org.springdoc.webmvc.api.OpenApiWebMvcResource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -329,6 +331,9 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
         @Autowired
         private TestRestTemplate docsRestTemplate;
 
+        @Autowired
+        private OpenApiWebMvcResource docsOpenApiResource;
+
         @ParameterizedTest(name = "{0}.{1} is an optional {2}")
         @CsvSource({
                 "RegisterRequest, termsAccepted, boolean",
@@ -374,6 +379,7 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
         }
 
         private JsonNode schemas() throws Exception {
+            SpringDocWarmup.warm(docsOpenApiResource);
             ResponseEntity<String> response = docsRestTemplate.getForEntity("/api-docs", String.class);
             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
             return objectMapper.readTree(response.getBody()).path("components").path("schemas");

@@ -1,10 +1,12 @@
 package com.beautica.moderation;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.support.SpringDocWarmup;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springdoc.webmvc.api.OpenApiWebMvcResource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpStatus;
@@ -30,10 +32,12 @@ class ContentReportOpenApiContractIT extends AbstractIntegrationTest {
 
     @Autowired private TestRestTemplate restTemplate;
     @Autowired private ObjectMapper objectMapper;
+    @Autowired private OpenApiWebMvcResource openApiResource;
 
     @Test
     @DisplayName("POST /api/v1/reports is documented with the CreateReportRequest body, enums and 201/200 responses")
     void should_exposeReportEndpoint_when_specRendered() throws Exception {
+        SpringDocWarmup.warm(openApiResource);
         ResponseEntity<String> response = restTemplate.getForEntity("/api-docs", String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode spec = objectMapper.readTree(response.getBody());
@@ -60,6 +64,7 @@ class ContentReportOpenApiContractIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("phase 415 add-on: GET /api/v1/reports/mine is documented with ReportedTargetResponse {targetType, targetId}")
     void should_exposeMyReportsEndpoint_when_specRendered() throws Exception {
+        SpringDocWarmup.warm(openApiResource);
         JsonNode spec = objectMapper.readTree(restTemplate.getForEntity("/api-docs", String.class).getBody());
 
         JsonNode get = spec.path("paths").path("/api/v1/reports/mine").path("get");
