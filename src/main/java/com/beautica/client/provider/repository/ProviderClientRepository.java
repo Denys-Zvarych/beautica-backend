@@ -199,4 +199,42 @@ public interface ProviderClientRepository extends Repository<Booking, UUID> {
     @Query(value = ClientRatingSql.ANCHOR_PHONE_MASTER, nativeQuery = true)
     Optional<String> findGuestAnchorPhoneByMaster(
             @Param("masterId") UUID masterId, @Param("bookingId") UUID bookingId);
+
+    // ── B565: the anonymous cross-provider comments page (REV-44); own = per viewer kind, count shared ──
+
+    @Query(value = ClientRatingSql.COMMENTS_USER_SALON, nativeQuery = true)
+    List<ClientReviewCommentProjection> commentsOfUserForSalon(
+            @Param("userId") UUID userId, @Param("salonId") UUID salonId, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientRatingSql.COMMENTS_USER_INDEPENDENT, nativeQuery = true)
+    List<ClientReviewCommentProjection> commentsOfUserForIndependentMaster(
+            @Param("userId") UUID userId, @Param("masterId") UUID masterId, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientRatingSql.COMMENTS_USER_SALON_MASTER, nativeQuery = true)
+    List<ClientReviewCommentProjection> commentsOfUserForSalonMaster(
+            @Param("userId") UUID userId, @Param("masterId") UUID masterId, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientRatingSql.COMMENTS_GUEST_SALON, nativeQuery = true)
+    List<ClientReviewCommentProjection> commentsOfGuestForSalon(
+            @Param("phone") String phone, @Param("salonId") UUID salonId, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientRatingSql.COMMENTS_GUEST_INDEPENDENT, nativeQuery = true)
+    List<ClientReviewCommentProjection> commentsOfGuestForIndependentMaster(
+            @Param("phone") String phone, @Param("masterId") UUID masterId, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientRatingSql.COMMENTS_GUEST_SALON_MASTER, nativeQuery = true)
+    List<ClientReviewCommentProjection> commentsOfGuestForSalonMaster(
+            @Param("phone") String phone, @Param("masterId") UUID masterId, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientRatingSql.COUNT_COMMENTS_USER, nativeQuery = true)
+    long countCommentsOfUser(@Param("userId") UUID userId);
+
+    @Query(value = ClientRatingSql.COUNT_COMMENTS_GUEST, nativeQuery = true)
+    long countCommentsOfGuest(@Param("phone") String phone);
 }

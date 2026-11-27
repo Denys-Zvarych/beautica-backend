@@ -4,6 +4,7 @@ import com.beautica.client.provider.dto.ClientCardResponse;
 import com.beautica.client.provider.dto.ClientListItemResponse;
 import com.beautica.client.provider.dto.ClientListRemovalRequest;
 import com.beautica.client.provider.dto.ClientOwnRatingResponse;
+import com.beautica.client.provider.dto.ClientReviewCommentResponse;
 import com.beautica.client.provider.dto.ClientVisitResponse;
 import com.beautica.client.provider.service.ClientRef;
 import com.beautica.client.provider.service.ClientScope;
@@ -176,6 +177,39 @@ public class ProviderClientController {
         return ratings(myScope(authentication), new ClientRef.GuestAnchor(bookingId), pageable);
     }
 
+    // ── B565: anonymous comments about a client from every provider (REV-44) — same @PreAuthorize as /ratings ──
+
+    @GetMapping("/salons/{salonId}/clients/users/{userId}/comments")
+    @PreAuthorize(SALON_ACCESS)
+    public ApiResponse<PageResponse<ClientReviewCommentResponse>> getSalonUserComments(
+            @PathVariable UUID salonId, @PathVariable UUID userId, @RequestParam(required = false) UUID masterId,
+            @PageableDefault(size = 20) Pageable pageable) {
+        return comments(scopeResolver.forSalon(salonId, masterId), new ClientRef.Registered(userId), pageable);
+    }
+
+    @GetMapping("/salons/{salonId}/clients/guests/{bookingId}/comments")
+    @PreAuthorize(SALON_ACCESS)
+    public ApiResponse<PageResponse<ClientReviewCommentResponse>> getSalonGuestComments(
+            @PathVariable UUID salonId, @PathVariable UUID bookingId, @RequestParam(required = false) UUID masterId,
+            @PageableDefault(size = 20) Pageable pageable) {
+        return comments(scopeResolver.forSalon(salonId, masterId), new ClientRef.GuestAnchor(bookingId), pageable);
+    }
+
+    @GetMapping("/masters/me/clients/users/{userId}/comments")
+    @PreAuthorize(MASTER_ACCESS)
+    public ApiResponse<PageResponse<ClientReviewCommentResponse>> getMyUserComments(
+            @PathVariable UUID userId, @PageableDefault(size = 20) Pageable pageable, Authentication authentication) {
+        return comments(myScope(authentication), new ClientRef.Registered(userId), pageable);
+    }
+
+    @GetMapping("/masters/me/clients/guests/{bookingId}/comments")
+    @PreAuthorize(MASTER_ACCESS)
+    public ApiResponse<PageResponse<ClientReviewCommentResponse>> getMyGuestComments(
+            @PathVariable UUID bookingId, @PageableDefault(size = 20) Pageable pageable,
+            Authentication authentication) {
+        return comments(myScope(authentication), new ClientRef.GuestAnchor(bookingId), pageable);
+    }
+
     // ── B564: remove a client from the list / undo (CLI-82..86) — 204; same @PreAuthorize per family as the list ──
     // The salon family keys the salon list (owner + admins share it, D1): no masterId here, the narrowed view reads
     // the same salon row. /masters/me keys the caller's own master row.
@@ -257,6 +291,14 @@ public class ProviderClientController {
     private ApiResponse<PageResponse<ClientOwnRatingResponse>> ratings(
             ClientScope scope, ClientRef ref, Pageable pageable) {
         Page<ClientOwnRatingResponse> result = providerClientService.getOwnRatings(scope, ref, bound(pageable));
+        return ApiResponse.ok(PageResponse.of(
+                result.getContent(), result.getNumber(), result.getSize(), result.getTotalElements(),
+                result.getTotalPages()));
+    }
+
+    private ApiResponse<PageResponse<ClientReviewCommentResponse>> comments(
+            ClientScope scope, ClientRef ref, Pageable pageable) {
+        Page<ClientReviewCommentResponse> result = providerClientService.getComments(scope, ref, bound(pageable));
         return ApiResponse.ok(PageResponse.of(
                 result.getContent(), result.getNumber(), result.getSize(), result.getTotalElements(),
                 result.getTotalPages()));

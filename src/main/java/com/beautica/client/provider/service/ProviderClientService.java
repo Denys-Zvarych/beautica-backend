@@ -5,7 +5,9 @@ import com.beautica.client.provider.dto.ClientCardResponse;
 import com.beautica.client.provider.dto.ClientKind;
 import com.beautica.client.provider.dto.ClientListItemResponse;
 import com.beautica.client.provider.dto.ClientOwnRatingResponse;
+import com.beautica.client.provider.dto.ClientReviewCommentResponse;
 import com.beautica.client.provider.repository.ClientOwnRatingProjection;
+import com.beautica.client.provider.repository.ClientReviewCommentProjection;
 import com.beautica.common.RatingBucket;
 import com.beautica.review.service.ClientRatingSummaryService;
 import com.beautica.client.provider.dto.ClientVisitResponse;
@@ -31,6 +33,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.support.PageableExecutionUtils;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -45,6 +48,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.LongSupplier;
 import java.util.regex.Pattern;
 
 /**
@@ -360,6 +364,66 @@ public class ProviderClientService {
             case MasterScope(UUID masterId, UUID ignoredSalonId) -> new OwnRatingRows(
                     repository.guestRatingsByMaster(masterId, phone, limit, offset),
                     repository.countGuestRatingsByMaster(masterId, phone));
+        };
+    }
+
+    // ── B565: anonymous comments about a client from every provider (REV-44, REV-D10) ──
+
+    /**
+     * Every visible non-blank comment about the client from ANY provider, newest first: review id, visit month, stars,
+     * text and the viewer's {@code own} flag — never the author, salon, master, service or exact date. The gate is the
+     * own-ratings one (the card's identical 404, D6); the page itself is not narrowed to the viewer's scope. At most
+     * four bounded statements whatever the page size (salon-access check + gate/anchor + page + count, as
+     * {@code /ratings}); the count is skipped when the first page is short ({@link PageableExecutionUtils#getPage}).
+     */
+    @Transactional(readOnly = true)
+    public Page<ClientReviewCommentResponse> getComments(ClientScope scope, ClientRef ref, Pageable pageable) {
+        int limit = pageable.getPageSize();
+        long offset = pageable.getOffset();
+        List<ClientReviewCommentProjection> rows;
+        LongSupplier total;
+        switch (ref) {
+            case Registered(UUID userId) -> {
+                if (!clientInScope(scope, ref)) {
+                    throw clientNotFound();
+                }
+                rows = userComments(scope, userId, limit, offset);
+                total = () -> repository.countCommentsOfUser(userId);
+            }
+            case GuestAnchor(UUID bookingId) -> {
+                String phone = ratingsAnchorPhone(scope, bookingId).orElseThrow(ProviderClientService::clientNotFound);
+                rows = guestComments(scope, phone, limit, offset);
+                total = () -> repository.countCommentsOfGuest(phone);
+            }
+        }
+        List<ClientReviewCommentResponse> items = rows.stream()
+                .map(p -> new ClientReviewCommentResponse(p.getReviewId(), p.getVisitMonth(), p.getStars(),
+                        p.getComment(), Boolean.TRUE.equals(p.getOwn())))
+                .toList();
+        return PageableExecutionUtils.getPage(items, pageable, total);
+    }
+
+    /** {@code own}: salon viewer = the salon's; independent master = their own solo ones; salon master = authored. */
+    private List<ClientReviewCommentProjection> userComments(ClientScope scope, UUID userId, int limit, long offset) {
+        return switch (scope) {
+            case SalonScope(UUID salonId, UUID ignoredMasterId) ->
+                    repository.commentsOfUserForSalon(userId, salonId, limit, offset);
+            case MasterScope(UUID masterId, UUID salonId) when salonId == null ->
+                    repository.commentsOfUserForIndependentMaster(userId, masterId, limit, offset);
+            case MasterScope(UUID masterId, UUID ignoredSalonId) ->
+                    repository.commentsOfUserForSalonMaster(userId, masterId, limit, offset);
+        };
+    }
+
+    private List<ClientReviewCommentProjection> guestComments(ClientScope scope, String phone, int limit,
+                                                              long offset) {
+        return switch (scope) {
+            case SalonScope(UUID salonId, UUID ignoredMasterId) ->
+                    repository.commentsOfGuestForSalon(phone, salonId, limit, offset);
+            case MasterScope(UUID masterId, UUID salonId) when salonId == null ->
+                    repository.commentsOfGuestForIndependentMaster(phone, masterId, limit, offset);
+            case MasterScope(UUID masterId, UUID ignoredSalonId) ->
+                    repository.commentsOfGuestForSalonMaster(phone, masterId, limit, offset);
         };
     }
 

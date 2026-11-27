@@ -262,6 +262,22 @@ final class ProviderClientFixtures {
                 UUID.randomUUID(), bookingId, clientId, authorMasterId, salonId, rating, comment, moderation);
     }
 
+    /**
+     * B565 — one review row keyed to an account ({@code clientId}) OR a guest phone (exactly one non-null), with an
+     * explicit {@code created_at} (the comments page orders by it). Aggregates are not touched. Returns the review id.
+     */
+    UUID clientReviewAt(UUID bookingId, UUID clientId, String guestPhone, UUID authorMasterId, UUID salonId,
+                        int rating, String comment, String moderation, Instant createdAt) {
+        UUID id = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO client_reviews (id, booking_id, subject_client_id, subject_guest_phone, author_master_id, "
+                        + "salon_id, rating, comment, moderation_status, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                id, bookingId, clientId, guestPhone, authorMasterId, salonId, rating, comment, moderation,
+                Timestamp.from(createdAt), Timestamp.from(createdAt));
+        return id;
+    }
+
     /** The service name a booking was made for (booking -> master_service -> service_definition). */
     String serviceNameOf(UUID bookingId) {
         return jdbcTemplate.queryForObject(

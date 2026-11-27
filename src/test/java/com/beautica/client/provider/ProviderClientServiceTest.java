@@ -1133,4 +1133,96 @@ class ProviderClientServiceTest {
 
         verify(listRemovalService).restore(scope, new ListIdentity.User(userId));
     }
+
+    // ── B565: anonymous comments about a client (REV-44) ─────────────────────
+
+    private static com.beautica.client.provider.repository.ClientReviewCommentProjection commentRow(
+            UUID reviewId, String month, int stars, String text, Boolean own) {
+        var row = mock(com.beautica.client.provider.repository.ClientReviewCommentProjection.class);
+        when(row.getReviewId()).thenReturn(reviewId);
+        when(row.getVisitMonth()).thenReturn(month);
+        when(row.getStars()).thenReturn(stars);
+        when(row.getComment()).thenReturn(text);
+        when(row.getOwn()).thenReturn(own);
+        return row;
+    }
+
+    @Test
+    @DisplayName("B565 — registered: card gate, salon own-variant page, shared count on a full page; 5-key DTO")
+    void should_pageCommentsWithSalonOwnVariant_when_registeredClientInSalonScope() {
+        UUID reviewId = UUID.randomUUID();
+        var row = commentRow(reviewId, "2026-10", 4, "Пунктуальна", true);
+        when(repository.existsUserBySalon(salonId, userId)).thenReturn(true);
+        when(repository.commentsOfUserForSalon(userId, salonId, 1, 0L)).thenReturn(List.of(row));
+        when(repository.countCommentsOfUser(userId)).thenReturn(3L);
+
+        var page = service.getComments(new SalonScope(salonId, null), new ClientRef.Registered(userId),
+                PageRequest.of(0, 1));
+
+        assertThat(page.getContent()).containsExactly(
+                new com.beautica.client.provider.dto.ClientReviewCommentResponse(reviewId, "2026-10", 4,
+                        "Пунктуальна", true));
+        assertThat(page.getTotalElements()).isEqualTo(3L);
+    }
+
+    @Test
+    @DisplayName("B565 — ?masterId= narrowed salon view: the narrowed gate, but the page stays the salon own-variant")
+    void should_useNarrowedGateAndSalonOwn_when_salonScopeHasMasterId() {
+        when(repository.existsUserBySalonAndMaster(salonId, masterId, userId)).thenReturn(true);
+        when(repository.commentsOfUserForSalon(userId, salonId, 20, 0L)).thenReturn(List.of());
+
+        var page = service.getComments(new SalonScope(salonId, masterId), new ClientRef.Registered(userId),
+                PageRequest.of(0, 20));
+
+        assertThat(page.getContent()).isEmpty();
+        verify(repository, never()).existsUserBySalon(any(), any());
+    }
+
+    @Test
+    @DisplayName("B565 — independent master vs salon master pick their own-variant query; a null own maps to false")
+    void should_pickOwnVariantPerMasterKind_when_masterScope() {
+        UUID memberSalon = UUID.randomUUID();
+        var row = commentRow(UUID.randomUUID(), "2026-09", 2, "Спізнилась", null);
+        when(repository.existsUserByMaster(masterId, userId)).thenReturn(true);
+        when(repository.commentsOfUserForIndependentMaster(userId, masterId, 20, 0L)).thenReturn(List.of(row));
+        when(repository.commentsOfUserForSalonMaster(userId, masterId, 20, 0L)).thenReturn(List.of());
+
+        var independent = service.getComments(new MasterScope(masterId, null), new ClientRef.Registered(userId),
+                PageRequest.of(0, 20));
+        var salonMaster = service.getComments(new MasterScope(masterId, memberSalon),
+                new ClientRef.Registered(userId), PageRequest.of(0, 20));
+
+        assertThat(independent.getContent()).singleElement().satisfies(c -> assertThat(c.own()).isFalse());
+        assertThat(salonMaster.getContent()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("B565 — guest: the anchor phone keys the page; a short first page skips the count; no anchor = 404")
+    void should_keyCommentsByAnchorPhone_when_guestAnchor() {
+        UUID unknown = UUID.randomUUID();
+        when(repository.findGuestAnchorPhoneBySalon(salonId, bookingId)).thenReturn(Optional.of(GUEST_PHONE));
+        when(repository.findGuestAnchorPhoneBySalon(salonId, unknown)).thenReturn(Optional.empty());
+        when(repository.commentsOfGuestForSalon(GUEST_PHONE, salonId, 20, 0L)).thenReturn(List.of());
+
+        var page = service.getComments(new SalonScope(salonId, null), new ClientRef.GuestAnchor(bookingId),
+                PageRequest.of(0, 20));
+
+        assertThat(page.getTotalElements()).isZero();
+        assertThatThrownBy(() -> service.getComments(new SalonScope(salonId, null), new ClientRef.GuestAnchor(unknown),
+                PageRequest.of(0, 20))).isInstanceOf(NotFoundException.class).hasMessage("CLIENT_NOT_FOUND");
+        verify(repository).commentsOfGuestForSalon(GUEST_PHONE, salonId, 20, 0L);
+        verify(repository, never()).countCommentsOfGuest(any());
+    }
+
+    @Test
+    @DisplayName("B565 — registered client out of scope: the card's 404, no comments statement")
+    void should_throwNotFoundWithoutReadingComments_when_registeredClientOutOfScope() {
+        when(repository.existsUserByMaster(masterId, userId)).thenReturn(false);
+
+        assertThatThrownBy(() -> service.getComments(new MasterScope(masterId, null),
+                new ClientRef.Registered(userId), PageRequest.of(0, 20)))
+                .isInstanceOf(NotFoundException.class).hasMessage("CLIENT_NOT_FOUND");
+        verify(repository, never()).countCommentsOfUser(any());
+        verify(repository, never()).commentsOfUserForIndependentMaster(any(), any(), anyInt(), anyLong());
+    }
 }
