@@ -8,6 +8,7 @@ import org.springframework.data.jpa.domain.Specification;
 import com.beautica.review.entity.ClientReview;
 import java.time.OffsetDateTime;
 import java.util.EnumSet;
+import java.util.Objects;
 
 /**
  * Phase 29.1 — the SINGLE canonical, read-time-derived definition of "an elapsed {@code
@@ -98,22 +99,29 @@ public final class BookingClosureRule {
 
     /**
      * Phase 357 — the SQL form of the data half of {@code BookingService#computeProviderCanReviewClient}:
-     * {@code status = COMPLETED AND client IS NOT NULL AND NOT EXISTS (client_reviews row for the
-     * booking)}. That method is its twin and MUST stay in step (status via {@link
-     * #isProviderReviewEligible}, guest exclusion, one-review-per-booking); the actor-authority half
-     * lives in the scope the caller ANDs on. Backs the «Архів» badge count — never a window.
+     * {@code status = COMPLETED AND <rateable client identity> AND NOT EXISTS (client_reviews row for the
+     * booking)}. That method is its twin and MUST stay in step (status via {@link #isProviderReviewEligible},
+     * one-review-per-booking); the actor-authority half lives in the scope the caller ANDs on. Backs the «Архів»
+     * badge count — never a window.
+     *
+     * <p>The identity conjunct is NOT written here: the caller passes {@code ClientRatingEligibility#rateable()},
+     * the SQL twin of the {@code ClientRatingEligibility#isRateable} predicate every {@code providerCanReviewClient}
+     * CTA path uses (registered client, or — guest flag on — a non-anonymised guest phone). A hand-written
+     * {@code client_id IS NOT NULL} here was the badge-vs-CTA drift bug; {@code PendingCountReviewCtaParityIT}
+     * pins {@code counted <=> providerCanReviewClient} per row.
+     *
+     * @param rateable the rateable-client-identity specification from {@code ClientRatingEligibility#rateable()}
      */
-    public static Specification<Booking> awaitingProviderClientReview() {
+    public static Specification<Booking> awaitingProviderClientReview(Specification<Booking> rateable) {
         Specification<Booking> completed = BookingSpecifications.statusIn(
                 EnumSet.of(BookingStatus.COMPLETED));
-        Specification<Booking> hasClient = (root, query, cb) -> cb.isNotNull(root.get("client"));
         Specification<Booking> noReview = (root, query, cb) -> {
             var sub = query.subquery(Integer.class);
             var cr = sub.from(ClientReview.class);
             sub.select(cb.literal(1)).where(cb.equal(cr.get("booking"), root));
             return cb.not(cb.exists(sub));
         };
-        return completed.and(hasClient).and(noReview);
+        return completed.and(Objects.requireNonNull(rateable, "rateable")).and(noReview);
     }
 
     /**

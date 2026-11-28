@@ -12,6 +12,7 @@ import com.beautica.review.entity.ClientReview;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.data.jpa.domain.Specification;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
@@ -19,6 +20,7 @@ import java.time.OffsetDateTime;
 import java.util.EnumSet;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
@@ -183,22 +185,20 @@ class BookingClosureRuleTest {
     }
 
     @Test
-    @DisplayName("Phase 357 awaitingProviderClientReview() is status IN (COMPLETED) AND client IS NOT NULL "
-            + "AND NOT EXISTS (client_reviews row for the booking) — the SQL twin of providerCanReviewClient's "
-            + "data half")
+    @DisplayName("Phase 357 awaitingProviderClientReview(rateable) is status IN (COMPLETED) AND <the caller's "
+            + "rateable spec> AND NOT EXISTS (client_reviews row) — no hand-written client_id IS NOT NULL")
     @SuppressWarnings("unchecked")
-    void should_composeCompletedClientPresentAndNoReview_when_buildingAwaitingProviderClientReview() {
-        Path<Object> clientPath = mock(Path.class);
+    void should_composeCompletedRateableAndNoReview_when_buildingAwaitingProviderClientReview() {
         Predicate completedIn = mock(Predicate.class);
-        Predicate hasClient = mock(Predicate.class);
+        Predicate rateablePred = mock(Predicate.class);
         Predicate existsPred = mock(Predicate.class);
         Predicate notExists = mock(Predicate.class);
         Subquery<Integer> sub = mock(Subquery.class);
         Root<ClientReview> crRoot = mock(Root.class);
         Path<Object> crBookingPath = mock(Path.class);
-        doReturn(clientPath).when(root).get("client");
+        Specification<Booking> rateable = mock(Specification.class);
+        doReturn(rateablePred).when(rateable).toPredicate(root, query, cb);
         doReturn(completedIn).when(statusPath).in(EnumSet.of(BookingStatus.COMPLETED));
-        doReturn(hasClient).when(cb).isNotNull(clientPath);
         doReturn(sub).when(query).subquery(Integer.class);
         doReturn(crRoot).when(sub).from(ClientReview.class);
         doReturn(crBookingPath).when(crRoot).get("booking");
@@ -208,12 +208,22 @@ class BookingClosureRuleTest {
         doReturn(notExists).when(cb).not(existsPred);
         doReturn(mock(Predicate.class)).when(cb).and(any(Predicate.class), any(Predicate.class));
 
-        BookingClosureRule.awaitingProviderClientReview().toPredicate(root, query, cb);
+        BookingClosureRule.awaitingProviderClientReview(rateable).toPredicate(root, query, cb);
 
         verify(statusPath).in(EnumSet.of(BookingStatus.COMPLETED));
-        verify(cb).isNotNull(clientPath);
+        verify(rateable).toPredicate(root, query, cb);
+        verify(cb, never()).isNotNull(any());
         verify(query).subquery(Integer.class);
         verify(cb).not(existsPred);
         verify(cb, never()).or(any(Predicate.class), any(Predicate.class));
+    }
+
+    @Test
+    @DisplayName("awaitingProviderClientReview(null) fails fast — the count can never silently drop its identity "
+            + "conjunct and count every COMPLETED row")
+    void should_throwNullPointer_when_rateableSpecIsNull() {
+        assertThatThrownBy(() -> BookingClosureRule.awaitingProviderClientReview(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("rateable");
     }
 }

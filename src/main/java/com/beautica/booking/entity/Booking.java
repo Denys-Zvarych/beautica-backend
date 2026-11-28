@@ -68,10 +68,15 @@ import java.util.UUID;
                 // The master-scope sibling above is NOT redundant — there is no
                 // (master_id, status, starts_at) partial index for it to fall back to.
                 // partial indexes (V191, keyed (col) INCLUDE (id)): pending-actions toRateClient
-                // leg, WHERE status='COMPLETED' AND client_id IS NOT NULL. JPA cannot encode the
-                // predicate nor INCLUDE (§E-6, same convention as V123 note above) — mirrored by key only.
+                // leg with the guest rating flag OFF, WHERE status='COMPLETED' AND client_id IS NOT NULL.
+                // V271 (same keys): WHERE status='COMPLETED' AND (client_id IS NOT NULL OR guest_phone
+                // IS NOT NULL) — implied by BOTH forms ClientRatingEligibility#rateable() emits, so it
+                // serves the flag-ON count V191 cannot. V191 kept: smaller, exact for flag OFF. JPA cannot
+                // encode the predicate nor INCLUDE (§E-6, same convention as V123 note above) — key only.
                 @Index(name = "idx_bookings_master_completed_client", columnList = "master_id"),
                 @Index(name = "idx_bookings_salon_completed_client", columnList = "salon_id"),
+                @Index(name = "idx_bookings_master_completed_rateable", columnList = "master_id"),
+                @Index(name = "idx_bookings_salon_completed_rateable", columnList = "salon_id"),
                 // partial UNIQUE index (V206): cancel-token-HASH lookup for the public guest-cancel page.
                 // JPA cannot encode WHERE cancel_token_hash IS NOT NULL nor the partial-uniqueness —
                 // the predicate + UNIQUE live in V206 only. The V90 idx_bookings_cancel_token on the

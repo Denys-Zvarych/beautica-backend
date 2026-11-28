@@ -10,6 +10,7 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.review.service.ClientRatingEligibility;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.security.core.Authentication;
@@ -26,8 +27,9 @@ import java.util.UUID;
  *
  * <ul>
  *   <li><b>toClose</b> — {@link BookingClosureRule#awaitingClosure} (CONFIRMED, {@code ends_at < now}).</li>
- *   <li><b>toRateClient</b> — {@link BookingClosureRule#awaitingProviderClientReview}, the SQL twin of
- *       {@code BookingService#computeProviderCanReviewClient}.</li>
+ *   <li><b>toRateClient</b> — {@link BookingClosureRule#awaitingProviderClientReview} fed {@link
+ *       ClientRatingEligibility#rateable()}, the SQL twin of {@code BookingService#computeProviderCanReviewClient}
+ *       (same rateable-identity rule as the CTA, guest flag included).</li>
  * </ul>
  *
  * <p>Scope resolution reuses {@link BookingService}'s own master-scope resolvers so this can never
@@ -41,6 +43,7 @@ public class PendingBookingActionsService {
 
     private final BookingRepository bookingRepository;
     private final BookingService bookingService;
+    private final ClientRatingEligibility clientRatingEligibility;
 
     /**
      * {@code INDEPENDENT_MASTER} (own row) or {@code SALON_OWNER} with {@code asMaster=true} (own
@@ -78,7 +81,8 @@ public class PendingBookingActionsService {
         OffsetDateTime now = bookingService.resolveNow();
         long toClose = bookingRepository.count(scope.and(BookingClosureRule.awaitingClosure(now)));
         long toRate = mayRate
-                ? bookingRepository.count(scope.and(BookingClosureRule.awaitingProviderClientReview()))
+                ? bookingRepository.count(scope.and(BookingClosureRule.awaitingProviderClientReview(
+                        clientRatingEligibility.rateable())))
                 : 0L;
         return PendingBookingActionsCountResponse.of(toClose, toRate);
     }
