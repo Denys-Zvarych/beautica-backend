@@ -7,6 +7,7 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.review.service.ClientRatingEligibility;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -43,6 +44,8 @@ class PendingBookingActionsServiceTest {
     private BookingRepository bookingRepository;
     @Mock
     private BookingService bookingService;
+    @Mock
+    private ClientRatingEligibility clientRatingEligibility;
     @InjectMocks
     private PendingBookingActionsService service;
 
@@ -51,6 +54,8 @@ class PendingBookingActionsServiceTest {
     @BeforeEach
     void pinNow() {
         org.mockito.Mockito.lenient().when(bookingService.resolveNow()).thenReturn(NOW);
+        org.mockito.Mockito.lenient().when(clientRatingEligibility.rateable())
+                .thenReturn((root, query, cb) -> cb.conjunction());
     }
 
     @Test
@@ -127,6 +132,34 @@ class PendingBookingActionsServiceTest {
 
         assertThat(result).isEqualTo(new PendingBookingActionsCountResponse(12L, 7L, 5L));
         verify(bookingRepository, times(2)).count(any(Specification.class));
+    }
+
+    @Test
+    @DisplayName("toRateClient takes its identity conjunct from ClientRatingEligibility#rateable() — the CTA's "
+            + "rule — on both the /me and the salon path")
+    @SuppressWarnings("unchecked")
+    void should_askRatingEligibilityForRateableSpec_when_rateLegRuns() {
+        Master master = master(MasterType.INDEPENDENT_MASTER, true);
+        when(bookingService.resolveProviderMasterScope(Role.INDEPENDENT_MASTER, actorId)).thenReturn(master);
+        when(bookingRepository.count(any(Specification.class))).thenReturn(0L);
+
+        service.countForMe(actorId, auth(Role.INDEPENDENT_MASTER), false);
+        service.countForSalon(UUID.randomUUID());
+
+        verify(clientRatingEligibility, times(2)).rateable();
+    }
+
+    @Test
+    @DisplayName("inactive INDEPENDENT_MASTER: the rate leg is skipped before the rateable spec is even built")
+    @SuppressWarnings("unchecked")
+    void should_notBuildRateableSpec_when_independentMasterInactive() {
+        Master master = master(MasterType.INDEPENDENT_MASTER, false);
+        when(bookingService.resolveProviderMasterScope(Role.INDEPENDENT_MASTER, actorId)).thenReturn(master);
+        when(bookingRepository.count(any(Specification.class))).thenReturn(0L);
+
+        service.countForMe(actorId, auth(Role.INDEPENDENT_MASTER), false);
+
+        verify(clientRatingEligibility, never()).rateable();
     }
 
     private Master master(MasterType type, boolean active) {

@@ -2,6 +2,7 @@ package com.beautica.review.service;
 
 import com.beautica.booking.entity.Booking;
 import com.beautica.review.config.ClientRatingProperties;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Component;
 
 /**
@@ -28,6 +29,29 @@ public class ClientRatingEligibility {
             return false;
         }
         return booking.getClient() != null || isGuestRateable(booking);
+    }
+
+    /**
+     * The SQL twin of {@link #isRateable}, for a {@code COUNT(*)} that cannot load entities (the «Архів» pending
+     * badge, {@code PendingBookingActionsService}). Kept adjacent to {@link #isRateable} so the two forms change
+     * together: {@code client IS NOT NULL}, OR (guest flag on only) {@code guest_phone IS NOT NULL}.
+     * {@code Booking#isRateableByProvider} ({@code client || guestPhone}) is implied by either arm.
+     *
+     * <p>The in-memory guest gate's {@code guestPiiAnonymisedAt == null} term is deliberately NOT repeated here:
+     * {@code chk_bookings_guest_fields} (V260; relied on the same way by V263) forces {@code guest_phone IS NULL} on
+     * every anonymised row, so the term is redundant in SQL — and dropping it makes the flag-on predicate EQUAL to
+     * V271's partial-index predicate ({@code client_id IS NOT NULL OR guest_phone IS NOT NULL}), which lets Postgres
+     * strip the qual and run the count as an index-only scan. V191 serves the flag-off form.
+     * {@code PendingCountReviewCtaParityIT} (anonymised shapes included) proves agreement with the CTA per row, both
+     * flag values; changing this shape means re-checking {@code V271BookingsCompletedRateableIndexesMigrationTest}.
+     */
+    public Specification<Booking> rateable() {
+        Specification<Booking> registered = (root, query, cb) -> cb.isNotNull(root.get("client"));
+        if (!guestRatingEnabled) {
+            return registered;
+        }
+        Specification<Booking> guest = (root, query, cb) -> cb.isNotNull(root.get("guestPhone"));
+        return registered.or(guest);
     }
 
     /**
